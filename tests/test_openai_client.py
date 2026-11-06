@@ -144,6 +144,39 @@ def test_http_error_maps_to_model_error() -> None:
     assert excinfo.value.code == "http_500"
 
 
+@pytest.mark.parametrize(
+    ("status", "retryable"),
+    [(429, True), (408, True), (500, True), (503, True), (400, False), (401, False), (404, False)],
+)
+def test_only_transient_statuses_are_marked_retryable(status: int, retryable: bool) -> None:
+    """重试资格由客户端判定，执行循环只负责按预算决定是否真的重试。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, text="x")
+
+    with pytest.raises(ModelError) as excinfo:
+        client_with(handler).complete(messages=[], tools=[])
+
+    assert excinfo.value.retryable is retryable
+
+
+def test_transport_error_is_retryable_but_timeout_is_not() -> None:
+    def broken(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("reset", request=request)
+
+    def slow(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow", request=request)
+
+    with pytest.raises(ModelError) as transport:
+        client_with(broken).complete(messages=[], tools=[])
+    with pytest.raises(ModelTimeout):
+        client_with(slow).complete(messages=[], tools=[])
+
+    # 连接抖动值得再试一次；超时需要人工看，不能靠重试掩盖。
+    assert transport.value.code == "transport_error"
+    assert transport.value.retryable is True
+
+
 def test_timeout_maps_to_model_timeout() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("slow", request=request)

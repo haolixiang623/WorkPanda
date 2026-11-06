@@ -160,6 +160,8 @@ class ModelResponse(BaseModel):
 
 class EventKind(StrEnum):
     MODEL_REQUESTED = "model_requested"
+    # 瞬时失败后的一次重试。单独成事件，避免"看起来只调了一次模型"。
+    MODEL_RETRIED = "model_retried"
     MODEL_RESPONDED = "model_responded"
     TOOL_COMPLETED = "tool_completed"
     STOPPED = "stopped"

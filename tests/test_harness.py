@@ -305,6 +305,108 @@ def test_loop_maps_model_failures() -> None:
     assert error.error_code == "bad_gateway"
 
 
+# ---------- 模型调用的有界重试 ----------
+
+
+def test_retryable_model_error_is_retried_then_succeeds() -> None:
+    client = ScriptedModelClient(
+        [ModelError("http_429", "限流", retryable=True), ModelResponse(text=SUCCESS)]
+    )
+    loop = AgentLoop(client, model_retries=1, model_retry_backoff_seconds=0)
+
+    result = loop.run(
+        system_prompt="s",
+        user_prompt="u",
+        grant=ToolGrant(registry=registry_with(EchoTool()), allowed=frozenset({"test_echo"})),
+        context=context(),
+    )
+
+    assert result.stop_reason is StopReason.COMPLETED
+    # 两次尝试都要计数：否则事后看 trace 会以为"只调了一次模型"。
+    assert result.model_calls == 2
+    assert EventKind.MODEL_RETRIED in [event.kind for event in result.events]
+
+
+def test_non_retryable_model_error_is_not_retried() -> None:
+    client = ScriptedModelClient([ModelError("http_400", "参数错误")])
+    loop = AgentLoop(client, model_retries=3, model_retry_backoff_seconds=0)
+
+    result = loop.run(
+        system_prompt="s",
+        user_prompt="u",
+        grant=ToolGrant(registry=registry_with(), allowed=frozenset()),
+        context=context(),
+    )
+
+    assert result.stop_reason is StopReason.MODEL_ERROR
+    assert result.error_code == "http_400"
+    assert len(client.calls) == 1
+    assert EventKind.MODEL_RETRIED not in [event.kind for event in result.events]
+
+
+def test_model_retries_are_bounded() -> None:
+    client = ScriptedModelClient(
+        [ModelError("transport_error", "连接被重置", retryable=True) for _ in range(4)]
+    )
+    loop = AgentLoop(client, model_retries=1, model_retry_backoff_seconds=0)
+
+    result = loop.run(
+        system_prompt="s",
+        user_prompt="u",
+        grant=ToolGrant(registry=registry_with(), allowed=frozenset()),
+        context=context(),
+    )
+
+    # 1 次首调 + 1 次重试，之后不再纠缠：重试不能变成无限循环。
+    assert len(client.calls) == 2
+    assert result.stop_reason is StopReason.MODEL_ERROR
+    assert result.error_code == "transport_error"
+    assert result.model_calls == 2
+
+
+def test_model_retry_is_skipped_when_no_time_is_left() -> None:
+    client = ScriptedModelClient(
+        [ModelError("http_503", "暂不可用", retryable=True), ModelResponse(text=SUCCESS)]
+    )
+    loop = AgentLoop(client, model_retries=1, model_retry_backoff_seconds=5, deadline_seconds=0.5)
+
+    result = loop.run(
+        system_prompt="s",
+        user_prompt="u",
+        grant=ToolGrant(registry=registry_with(), allowed=frozenset()),
+        context=context(),
+    )
+
+    # 退避时间放不进剩余预算时直接上报原错误，别把整步时间耗在一次等待上。
+    assert len(client.calls) == 1
+    assert result.stop_reason is StopReason.MODEL_ERROR
+    assert result.error_code == "http_503"
+
+
+def test_model_retry_does_not_repeat_tool_calls() -> None:
+    echo = EchoTool()
+    client = ScriptedModelClient(
+        [
+            ModelResponse(tool_calls=[tool_call("test_echo", call_id="c1", text="hi")]),
+            ModelError("http_429", "限流", retryable=True),
+            ModelResponse(text=SUCCESS),
+        ]
+    )
+    loop = AgentLoop(client, model_retries=1, model_retry_backoff_seconds=0)
+
+    result = loop.run(
+        system_prompt="s",
+        user_prompt="u",
+        grant=ToolGrant(registry=registry_with(echo), allowed=frozenset({"test_echo"})),
+        context=context(),
+    )
+
+    # 重试的是"模型调用"，不是整个步骤：已发生的工具调用不会被重放。
+    assert result.stop_reason is StopReason.COMPLETED
+    assert [call["text"] for call in echo.calls] == ["hi"]
+    assert len(result.tool_calls) == 1
+
+
 def test_loop_stops_on_repeated_empty_responses() -> None:
     client = ScriptedModelClient([ModelResponse(text="  "), ModelResponse(text="")])
 

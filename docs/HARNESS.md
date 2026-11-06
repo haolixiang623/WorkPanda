@@ -49,7 +49,7 @@ Octop **不是** harness 的上层，而是它可选的一种后端：
 
 装配优先级：`harness > Octop 运行时 > 脚手架执行器`（见 `bootstrap.py`）。
 
-## 3. 十条不变式
+## 3. 十一条不变式
 
 1. **最小可见**：模型只能看到本步骤被授权的工具子集，看不到全局注册表。
 2. **四道闸**：白名单 → 限额/重复副作用 → 参数校验 → 限期执行并留痕。任一不通过一律 BLOCKED，绝不"尽力执行"。
@@ -63,6 +63,10 @@ Octop **不是** harness 的上层，而是它可选的一种后端：
    只要出现过"结果未知"（工具超时），checkpoint 即标为不可续跑，续跑请求一律拒绝。
 10. **副作用可长期核对**：非幂等调用必须落进只追加的审计归档（成功=已发生、
     超时=结果未知）；trace 会被淘汰，因此不能拿它当"那次提交发出去没有"的证据。
+11. **只重试模型调用，绝不重试工具**：模型调用的瞬时失败（429 / 5xx / 连接被重置）
+    可以有限重试，因为调用本身没有副作用；工具调用可能已经产生了副作用，只能靠
+    超时/重复提交判定拦下来，不靠"再试一次"。重试次数与退避都受剩余预算约束，
+    每次尝试都计入 `model_calls` 并留一条 `model_retried` 事件。
 
 ## 4. 三态映射
 
@@ -233,6 +237,8 @@ sqlite3 workpanda.db "DELETE FROM harness_checkpoints WHERE task_id='...' AND st
 | `WORKPANDA_MODEL_API_KEY` | 空 | 模型凭据 |
 | `WORKPANDA_MODEL_NAME` | `gpt-4o-mini` | 模型标识 |
 | `WORKPANDA_MODEL_TIMEOUT_SECONDS` | `60` | 单次模型调用超时 |
+| `WORKPANDA_MODEL_RETRIES` | `1` | 模型调用瞬时失败的额外尝试次数；`0` 为不重试 |
+| `WORKPANDA_MODEL_RETRY_BACKOFF_SECONDS` | `0.5` | 重试退避基数，第 n 次重试等 `n × 基数` 秒 |
 | `WORKPANDA_MODEL_TRUST_ENV` | `true` | 是否沿用系统代理变量；内网地址被代理拦截时置 `false` |
 | `WORKPANDA_HARNESS_MAX_STEPS` | `6` | 单步骤最多几轮模型调用 |
 | `WORKPANDA_HARNESS_MAX_TOOL_CALLS` | `8` | 单步骤最多几次工具调用 |
@@ -276,6 +282,8 @@ python scripts/smoke_harness.py     # 真实模型端到端
   传输错误）不产生耗时；拒绝续跑的路径同样记录真实耗时，不再写死为 0；
 - 工具超时按声明值掐断（0.1 秒声明、0.5 秒实际耗时，实测在 0.1 秒级返回 `TIMEOUT`）；
 - 可重试失败对幂等工具重试一次并成功；非幂等工具永不重试；
+- 模型调用瞬时失败（429 / 5xx / 传输错误）重试一次后成功；4xx 鉴权与参数错误不重试；
+  重试次数有上限，剩余预算放不下退避时间时直接上报原错误；重试不会重放已发生的工具调用；
 - 非幂等工具重复提交被拦（`duplicate_side_effect`），副作用实际只发生一次；
 - 单工具调用上限（`max_calls`）；
 - 一轮返回多个工具调用时按序执行，每条结果都回灌给模型；

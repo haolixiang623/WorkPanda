@@ -80,13 +80,18 @@ class OpenAICompatibleClient:
         except httpx.TimeoutException as exc:
             raise ModelTimeout("模型调用超时") from exc
         except httpx.HTTPError as exc:
-            raise ModelError("transport_error", f"无法连接模型服务：{type(exc).__name__}") from exc
+            # 连接被重置、TLS 抖动这类传输失败通常是瞬时的，值得再试一次；
+            # 是否真的重试由执行循环按剩余预算决定。
+            raise ModelError(
+                "transport_error", f"无法连接模型服务：{type(exc).__name__}", retryable=True
+            ) from exc
         duration_ms = int((time.monotonic() - started) * 1000)
 
         if response.status_code >= 400:
             raise ModelError(
                 f"http_{response.status_code}",
                 f"模型服务返回 {response.status_code}：{response.text[:200]}",
+                retryable=_is_retryable_status(response.status_code),
             )
 
         try:
@@ -95,6 +100,16 @@ class OpenAICompatibleClient:
             raise ModelError("invalid_response", "模型服务返回的不是 JSON") from exc
 
         return _parse_completion(data, duration_ms=duration_ms)
+
+
+def _is_retryable_status(status_code: int) -> bool:
+    """哪些 HTTP 状态值得再试一次。
+
+    只认"服务端暂时不行"这一类：限流（429）、请求超时（408）、全部 5xx。
+    鉴权、参数、余额、模型不存在这些再试一次也是一样的结果，重试只会放大问题。
+    """
+
+    return status_code in {408, 425, 429} or status_code >= 500
 
 
 def _to_wire(message: HarnessMessage) -> dict[str, Any]:
