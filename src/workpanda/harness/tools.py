@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from collections.abc import Iterable, Mapping, Sequence
@@ -448,8 +449,12 @@ _TYPE_CHECKS: dict[str, tuple[type, ...]] = {
 def validate_arguments(spec: ToolSpec, arguments: dict[str, Any]) -> list[str]:
     """按工具声明的 JSON Schema 做轻量校验。
 
-    只覆盖实际会用到的部分：required、类型、enum、长度、额外字段。
-    不做完整 JSON Schema 实现，避免引入额外依赖与语义偏差。
+    覆盖实际会用到的部分：required、类型、enum、长度、数值范围、正则、数组长度
+    与元素、嵌套对象。不做完整 JSON Schema 实现（$ref、oneOf、依赖关系等一律
+    不管），避免引入额外依赖与语义偏差。
+
+    校验只做「模型给的参数能不能进这个工具」的判断，不替工具做业务规则——
+    业务校验仍在工具内部，违反时抛 `ToolError`。
     """
 
     schema = spec.parameters or {}
@@ -470,20 +475,114 @@ def validate_arguments(spec: ToolSpec, arguments: dict[str, Any]) -> list[str]:
 
     for key, value in arguments.items():
         rule = properties.get(key)
-        if not isinstance(rule, dict):
-            continue
-        expected = rule.get("type")
-        if isinstance(expected, str) and expected in _TYPE_CHECKS:
-            if not isinstance(value, _TYPE_CHECKS[expected]):
-                problems.append(f"参数 {key} 应为 {expected}")
-                continue
-            if expected == "integer" and isinstance(value, bool):
-                problems.append(f"参数 {key} 应为 integer")
-                continue
-        if "enum" in rule and value not in rule["enum"]:
-            problems.append(f"参数 {key} 不在允许取值内")
-        max_length = rule.get("maxLength")
-        if isinstance(max_length, int) and isinstance(value, str) and len(value) > max_length:
-            problems.append(f"参数 {key} 超过最大长度 {max_length}")
+        if isinstance(rule, dict):
+            _check_value(key, value, rule, problems)
 
     return problems
+
+
+# 嵌套校验的最大深度。schema 由我们自己写，但配置写错时不该把执行拖成递归栈溢出。
+_MAX_SCHEMA_DEPTH = 4
+
+
+def _check_value(
+    label: str, value: Any, rule: Mapping[str, Any], problems: list[str], depth: int = 0
+) -> None:
+    """校验单个值。`label` 是给人看的路径（如 `meta.k`），用于定位问题字段。"""
+
+    if depth > _MAX_SCHEMA_DEPTH:
+        return
+
+    expected = rule.get("type")
+    if isinstance(expected, str) and expected in _TYPE_CHECKS:
+        # bool 是 int 的子类，`count: true` 必须当类型错误而不是整数。
+        if not isinstance(value, _TYPE_CHECKS[expected]) or (
+            expected == "integer" and isinstance(value, bool)
+        ):
+            problems.append(f"参数 {label} 应为 {expected}")
+            return
+
+    if "enum" in rule:
+        allowed = rule["enum"]
+        if isinstance(allowed, list) and value not in allowed:
+            problems.append(f"参数 {label} 不在允许取值内")
+
+    if isinstance(value, str):
+        _check_string(label, value, rule, problems)
+    elif isinstance(value, bool):
+        pass
+    elif isinstance(value, (int, float)):
+        _check_number(label, value, rule, problems)
+    elif isinstance(value, list):
+        _check_array(label, value, rule, problems, depth)
+    elif isinstance(value, dict):
+        _check_object(label, value, rule, problems, depth)
+
+
+def _check_string(label: str, value: str, rule: Mapping[str, Any], problems: list[str]) -> None:
+    max_length = rule.get("maxLength")
+    if isinstance(max_length, int) and len(value) > max_length:
+        problems.append(f"参数 {label} 超过最大长度 {max_length}")
+    min_length = rule.get("minLength")
+    if isinstance(min_length, int) and len(value) < min_length:
+        problems.append(f"参数 {label} 少于最小长度 {min_length}")
+    pattern = rule.get("pattern")
+    if isinstance(pattern, str):
+        try:
+            matched = re.search(pattern, value) is not None
+        except re.error:
+            # 声明的正则本身写错了属于工具定义问题，不能因此拒绝一次合法调用。
+            return
+        if not matched:
+            problems.append(f"参数 {label} 不匹配格式要求")
+
+
+def _check_number(label: str, value: float, rule: Mapping[str, Any], problems: list[str]) -> None:
+    minimum = rule.get("minimum")
+    if isinstance(minimum, (int, float)) and value < minimum:
+        problems.append(f"参数 {label} 小于最小值 {minimum}")
+    maximum = rule.get("maximum")
+    if isinstance(maximum, (int, float)) and value > maximum:
+        problems.append(f"参数 {label} 大于最大值 {maximum}")
+
+
+def _check_array(
+    label: str,
+    value: list,
+    rule: Mapping[str, Any],
+    problems: list[str],
+    depth: int,
+) -> None:
+    max_items = rule.get("maxItems")
+    if isinstance(max_items, int) and len(value) > max_items:
+        problems.append(f"参数 {label} 超过最大元素个数 {max_items}")
+    min_items = rule.get("minItems")
+    if isinstance(min_items, int) and len(value) < min_items:
+        problems.append(f"参数 {label} 少于最小元素个数 {min_items}")
+    items = rule.get("items")
+    if isinstance(items, dict):
+        for index, item in enumerate(value):
+            _check_value(f"{label}[{index}]", item, items, problems, depth + 1)
+
+
+def _check_object(
+    label: str,
+    value: dict,
+    rule: Mapping[str, Any],
+    problems: list[str],
+    depth: int,
+) -> None:
+    nested = rule.get("properties")
+    if not isinstance(nested, dict):
+        return
+    for name in rule.get("required") or ():
+        if name not in value:
+            problems.append(f"参数 {label}.{name} 为必填")
+    if not rule.get("additionalProperties", False):
+        for name in value:
+            if name not in nested:
+                problems.append(f"参数 {label} 不支持字段 {name}")
+    for name, item in value.items():
+        sub_rule = nested.get(name)
+        if isinstance(sub_rule, dict):
+            _check_value(f"{label}.{name}", item, sub_rule, problems, depth + 1)
