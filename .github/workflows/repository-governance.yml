@@ -52,11 +52,15 @@ jobs:
 
   python:
     name: Python 检查
-    if: ${{ hashFiles('pyproject.toml') != '' }}
     runs-on: ubuntu-latest
     steps:
       - name: 检出仓库
         uses: actions/checkout@v4
+      # 注意：不要在 job 级 if 里使用 hashFiles()，它只在步骤级可用，
+      # job 级求值会让整个工作流启动即失败（startup_failure，无任何 job 产生）。
+      - name: 检查项目元数据
+        shell: bash
+        run: test -s pyproject.toml
       - name: 配置 Python
         uses: actions/setup-python@v5
         with:
