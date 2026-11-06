@@ -58,6 +58,10 @@ class Settings(BaseSettings):
     # 因此必须先确认存储的权限与留存策略可接受。
     harness_resume_enabled: bool = False
     harness_resume_ttl_seconds: float = 900.0
+    # 步骤租约：同一 (task, step) 只允许一个执行者。多进程试点时开启；
+    # 0 表示按 deadline + 余量自动推导 TTL。
+    harness_lease_enabled: bool = False
+    harness_lease_ttl_seconds: float = 0.0
     # 逗号分隔的域名白名单；为空则不注册 http 工具（默认关闭比默认全开安全）。
     harness_allowed_hosts: str = ""
     # 审计归档路径。为空则不归档（默认关闭）。归档只追加、按大小滚动，

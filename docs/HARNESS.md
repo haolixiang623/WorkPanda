@@ -97,6 +97,7 @@ Octop **不是** harness 的上层，而是它可选的一种后端：
 | 只有推理内容、没有最终答复 | `unconfirmed` | `empty_model_response` |
 | 步数 / 调用次数 / token / 耗时超限 | `unconfirmed` | `budget_max_steps` / `budget_max_tool_calls` / `budget_max_tokens` / `budget_deadline` |
 | 存在断点但不允许续跑 | `unconfirmed` | `checkpoint_not_resumable` / `checkpoint_expired` / `checkpoint_mismatch` |
+| 步骤已被另一执行者占用（或占用状态不明） | `unconfirmed` | `checkpoint_busy`（`stop_reason=refused`，不调模型/工具） |
 | 模型超时 | `unconfirmed` | `model_timeout` |
 | 模型服务错误（4xx/5xx、传输失败） | `unconfirmed` | `http_xxx` / `transport_error` |
 | 连续空回复 | `unconfirmed` | `empty_model_response` |
@@ -323,6 +324,8 @@ sqlite3 workpanda.db "DELETE FROM harness_checkpoints WHERE task_id='...' AND st
 | `WORKPANDA_HARNESS_TRACE_BACKEND` | `auto` | `memory` / `sqlite` / `auto`（跟随 store_backend） |
 | `WORKPANDA_HARNESS_RESUME_ENABLED` | `false` | 断点续跑；开启后每个工具调用都会落 checkpoint |
 | `WORKPANDA_HARNESS_RESUME_TTL_SECONDS` | `900` | 断点保留时限，超时拒绝续跑 |
+| `WORKPANDA_HARNESS_LEASE_ENABLED` | `false` | 启用步骤租约（同一 task+step 同时只允许一个执行者） |
+| `WORKPANDA_HARNESS_LEASE_TTL_SECONDS` | `0` | 租约时长；`0` 表示按 `deadline + 90s` 自动推导 |
 | `WORKPANDA_HARNESS_ALLOWED_HOSTS` | 空 | 逗号分隔的 http 工具域名白名单 |
 | `WORKPANDA_HARNESS_AUDIT_PATH` | 空 | 审计归档文件路径；为空则不归档 |
 | `WORKPANDA_HARNESS_AUDIT_MAX_BYTES` | `5000000` | 单个归档文件大小上限，超过即滚动 |
@@ -379,6 +382,9 @@ python scripts/smoke_harness.py     # 真实模型端到端
 - 断点在工具超时后标为不可续跑，续跑请求直接拒绝且不调用模型或工具；
 - 授权工具集合不一致、超过 TTL 的断点同样拒绝；续跑不重置步数/调用/token 预算；
 - 正常结束后断点被清理；未开启续跑时不产生任何断点落盘；
+- 步骤租约：同键第二个执行者被拒（`checkpoint_busy`）且不调模型/工具；
+  SQLite 实现跨连接互斥、TTL 过期可接管；成功与未确认结束都释放租约；
+  租约存储异常时按拒绝处理（fail-closed）；取消先于租约；
 - 运维接口 `/api/ops/traces` 与 `/summary`：未配置 404、无凭据 401；
 - 审计归档：成功提交记为 `applied`、超时记为 `unknown` 并置 `requires_manual_check`，
   敏感入参不出现在归档文件里（只留 16 位参数指纹）；
@@ -395,7 +401,8 @@ python scripts/smoke_harness.py     # 真实模型端到端
 
 - 真实业务系统工具（尚未接入任何外部 API）；
 - 超时后遗留线程在真实长任务下的资源影响；
-- 多实例部署下的预算、限流与断点单写者假设。
+- 跨主机多实例下的预算与限流（预算仍在单进程内累计）；
+- 跨主机多实例下的步骤租约：本实现只覆盖同机多进程（SQLite）与同进程并发。
 
 ## 12. 已知限制
 
@@ -406,8 +413,8 @@ python scripts/smoke_harness.py     # 真实模型端到端
 - token 预算依赖上游返回 `usage`；网关不返回时该项不生效，也不会用字符数估算；
 - 耗时上限按**每次尝试**计，步数/调用次数/token 按整个步骤累计：否则一次中断会让
   剩余时间永久不足，步骤再也跑不完；
-- checkpoint 假设同一 (task, step) 只有一个写者；并发执行同一步骤会互相覆盖，
-  横向扩容前需要加分布式锁；
+- checkpoint 假设同一 (task, step) 只有一个写者；开启第 15 节的步骤租约后可挡住
+  同机多进程并发，跨主机部署仍需共享锁；
 - checkpoint 保存未脱敏的对话原文，只应与任务槽位同库同权限存放；
 - 被拒绝的断点会保留，需要人工核实后按第 8 节清理，否则该步骤持续被拒绝；
 - 事件总线与限流器仍在单进程内，横向扩容前需外部化；
@@ -537,3 +544,28 @@ registry.cancel_task(task_id, "user_cancelled")   # 从 HTTP 线程调用
 - 没有真正跑过"执行进行中收到 HTTP 取消"的端到端场景（同步执行会先占住事件循环，
   见上文"并发前提"）；
 - Octop 运行时与脚手架执行器不读这个信号，取消对它们仍是纯状态翻转。
+
+## 15. 步骤租约（单写者保护）
+
+checkpoint 假设"同一 (task_id, step_id) 只有一个写者"。两个执行者同时读到同一份
+断点时，防重复副作用的指纹是各自内存里的 `ToolGrant` 状态，彼此看不见；只要这一步
+有非幂等工具，外部动作就可能真的发生两次。`harness/lease.py` 在断点之外补一层
+极小的互斥：
+
+- `execute()` 开始时抢一个占位租约（随机 owner + TTL），**抢不到或状态不明一律拒绝**：
+  结果 `unconfirmed`、`checkpoint_busy`、`stop_reason=refused`，不调模型、不调工具、
+  不留断点，但仍写 trace 与审计；
+- 执行结束（成功、未确认、异常）在 `finally` 里释放。未确认时释放是刻意的——
+  断点还在，后续那一次执行本就应该能接着跑；
+- 取消先于租约：一步都不跑时不需要占用身份；
+- 租约**默认关闭**，多进程试点时由 `WORKPANDA_HARNESS_LEASE_ENABLED=true` 开启，
+  后端跟随任务存储（SQLite 与任务库同文件，同机跨进程互斥；内存后端只挡同进程并发）。
+
+TTL 必须长于一次执行的最坏耗时（步骤 deadline 之外还有模型/工具超时与重试退避），
+否则租约会在执行中途过期，等于没保护。默认按 `deadline + 90s` 推导，实际部署应
+按真实超时显式设置 `WORKPANDA_HARNESS_LEASE_TTL_SECONDS`。进程崩溃时租约靠 TTL
+过期，人工重试才不会被永久挡住。
+
+边界要说清楚：**跨主机多实例部署仍需把这里的 SQLite/内存实现换成共享锁**
+（Redis、数据库 advisory lock 等），单写者假设本身不变。开启后仍保留的其他
+限制：预算与限流仍在单进程内、事件总线未外部化。

@@ -44,6 +44,7 @@ from workpanda.harness.checkpoint import (
 from workpanda.harness.clients import ModelClient
 from workpanda.harness.contract import OUTCOME_CONTRACT, parse_contract
 from workpanda.harness.effects import build_effects, summarize_effects
+from workpanda.harness.lease import StepLeaseStore
 from workpanda.harness.loop import AgentLoop, LoopResult, StopReason
 from workpanda.harness.models import ToolCallRecord, ToolOutcome, max_risk
 from workpanda.harness.redaction import DEFAULT_REDACTOR, Redactor, mask_values
@@ -101,6 +102,8 @@ class HarnessExecutor(Executor):
         checkpoints: CheckpointStore | None = None,
         resume_enabled: bool = False,
         resume_ttl_seconds: float = 900.0,
+        leases: StepLeaseStore | None = None,
+        lease_ttl_seconds: float = 0.0,
         cancellations: CancelRegistry | None = None,
         prompt_builder: Callable[[ExecutionRequest, ToolGrant], tuple[str, str]] | None = None,
     ) -> None:
@@ -118,6 +121,9 @@ class HarnessExecutor(Executor):
         # 默认关闭：续跑会让"一次执行的中间状态"留存下来，属于需要显式开启的能力。
         self._resume_enabled = resume_enabled and checkpoints is not None
         self._resume_ttl_seconds = resume_ttl_seconds
+        # 租约默认不装配（None）：单进程顺序执行不需要它，多进程试点显式开启。
+        self._leases = leases
+        self._lease_ttl_seconds = max(0.0, lease_ttl_seconds)
         # 取消登记表由装配层持有：取消方（HTTP 线程）与执行方（执行线程）
         # 必须看到同一个对象，否则取消只是账面上的一句话。
         self._cancellations = cancellations
@@ -134,16 +140,52 @@ class HarnessExecutor(Executor):
         )
 
     def execute(self, request: ExecutionRequest) -> ExecutionResult:
-        """执行一个步骤。令牌的取用与释放都在这里，保证不会漏放。"""
+        """执行一个步骤。取消令牌与步骤租约的取用/释放都在这里，保证不漏放。"""
 
         token = self._begin_cancel(request)
+        owner = uuid4().hex if self._leases is not None else None
+        held = False
         try:
             if token is not None and token.cancelled:
                 # 取消先于执行到达：一步都不跑，连模型都不调。
                 return self._cancelled_before_start(request, token)
+            if owner is not None:
+                held = self._acquire_lease(request, owner)
+                if not held:
+                    return self._lease_busy(request)
             return self._execute_step(request, token)
         finally:
+            if held and owner is not None and self._leases is not None:
+                try:
+                    self._leases.release(request.task_id, request.step_id, owner)
+                except Exception:  # noqa: BLE001 - 释放失败只影响下一次执行，不改变本次结论
+                    pass
             self._end_cancel(request)
+
+    def _acquire_lease(self, request: ExecutionRequest, owner: str) -> bool:
+        """抢占本次执行的写者身份。任何异常都按"抢不到"处理，绝不带着疑问开跑。"""
+
+        if self._leases is None:
+            return False
+        # 默认 TTL 要盖住一次执行的最坏耗时：步骤 deadline 之外，模型/工具超时
+        # 与退避还可能再吃掉一段时间。部署方可按真实超时显式配更大的值。
+        ttl = self._lease_ttl_seconds or (self._deadline_seconds + 90.0)
+        try:
+            return self._leases.acquire(request.task_id, request.step_id, owner, ttl)
+        except Exception:  # noqa: BLE001 - 占用状态不明时必须停，不能赌另一边没在跑
+            return False
+
+    def _lease_busy(self, request: ExecutionRequest) -> ExecutionResult:
+        """已有执行者占用，或占用状态无法确认：拒绝且不产生任何副作用。"""
+
+        return self._refuse(
+            request,
+            self._grant(request),
+            uuid4().hex,
+            "checkpoint_busy",
+            "该步骤正由另一次执行占用，或占用状态无法确认；已拒绝并发执行，请稍后重试或人工核实。",
+            started=time.monotonic(),
+        )
 
     def _execute_step(
         self, request: ExecutionRequest, token: CancelToken | None
