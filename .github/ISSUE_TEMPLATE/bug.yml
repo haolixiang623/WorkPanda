@@ -1,0 +1,46 @@
+name: 缺陷报告
+description: 报告可复现的行为错误或安全问题
+title: "[缺陷] "
+labels:
+  - type:bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        不要在公开 Issue 中填写个人信息、密钥、生产数据或未修复的安全细节。安全问题请使用私有授权渠道。
+  - type: textarea
+    id: symptom
+    attributes:
+      label: 实际现象与期望行为
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤与最小复现输入
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: 影响与风险
+      description: 是否涉及权限、个人信息、重复副作用、虚假成功或结果待确认？
+    validations:
+      required: true
+  - type: textarea
+    id: regression
+    attributes:
+      label: 防复发方案
+      description: 修复后应新增哪项测试、CI 门禁、运行时保护或文档约束？
+    validations:
+      required: true
+  - type: dropdown
+    id: risk
+    attributes:
+      label: 风险等级
+      options:
+        - 低
+        - 中
+        - 高
+    validations:
+      required: true

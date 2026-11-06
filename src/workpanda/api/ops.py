@@ -1,0 +1,65 @@
+"""运维只读接口，供 Octop 控制台读取任务与事件。
+
+控制台替代自建运维界面，但不持有业务状态写入权：
+这里只提供查询，流程推进、确认和副作用仍只能通过群众侧接口完成。
+
+接口默认关闭；必须配置 `WORKPANDA_OPS_TOKEN` 才能访问，避免开放内部数据。
+"""
+
+import hmac
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+
+from workpanda.api.dependencies import get_container
+from workpanda.bootstrap import Container
+from workpanda.domain.models import TaskEvent, TaskStatus, TaskView
+
+router = APIRouter(prefix="/api/ops", tags=["ops"])
+
+
+def require_ops_token(
+    x_workpanda_ops_token: str | None = Header(default=None),
+    container: Container = Depends(get_container),
+) -> None:
+    expected = container.settings.ops_token
+    if not expected:
+        # 未启用时按不存在处理，避免暴露内部接口存在性。
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+    if not x_workpanda_ops_token or not hmac.compare_digest(x_workpanda_ops_token, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "ops_token_invalid", "detail": "运维凭据无效。"},
+        )
+
+
+@router.get("/tasks", response_model=list[TaskView], dependencies=[Depends(require_ops_token)])
+async def list_tasks(
+    limit: int = Query(default=50, ge=1, le=200),
+    task_status: TaskStatus | None = Query(default=None, alias="status"),
+    container: Container = Depends(get_container),
+) -> list[TaskView]:
+    return [
+        TaskView.from_task(task)
+        for task in container.tasks.list_tasks(limit=limit, status=task_status)
+    ]
+
+
+@router.get(
+    "/tasks/{task_id}", response_model=TaskView, dependencies=[Depends(require_ops_token)]
+)
+async def get_task(task_id: UUID, container: Container = Depends(get_container)) -> TaskView:
+    return TaskView.from_task(container.tasks.ops_task(task_id))
+
+
+@router.get(
+    "/tasks/{task_id}/events",
+    response_model=list[TaskEvent],
+    dependencies=[Depends(require_ops_token)],
+)
+async def list_events(
+    task_id: UUID,
+    after: int = Query(default=0, ge=0),
+    container: Container = Depends(get_container),
+) -> list[TaskEvent]:
+    return list(container.tasks.ops_events(task_id, after_sequence=after))
