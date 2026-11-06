@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from typing import Any
 
@@ -19,10 +20,13 @@ from workpanda.harness.models import (
     MessageRole,
     ModelResponse,
     RiskLevel,
+    TokenUsage,
     ToolCall,
+    ToolOutcome,
     ToolSpec,
     max_risk,
 )
+from workpanda.harness.redaction import MASK
 from workpanda.harness.tools import (
     ToolContext,
     ToolError,
@@ -30,6 +34,7 @@ from workpanda.harness.tools import (
     ToolRegistry,
     validate_arguments,
 )
+from workpanda.harness.trace import InMemoryTraceStore
 
 SUCCESS = json.dumps(
     {"outcome": "succeeded", "summary": "已获取时间", "evidence": "utc=2026-01-01T00:00:00+00:00"},
@@ -446,3 +451,256 @@ def test_http_fetch_returns_body_without_following_redirects(
     with pytest.raises(ToolError) as excinfo:
         redirect.invoke({"url": "https://example.com/p"}, context())
     assert excinfo.value.code == "redirect_not_allowed"
+
+
+# ---------- 执行硬化：超时、重试、重复副作用、调用上限 ----------
+
+
+class SleepTool:
+    """模拟卡死的上游：invoke 会阻塞，必须被超时掐断。"""
+
+    spec = ToolSpec(
+        name="test_sleep",
+        description="慢工具",
+        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        timeout_seconds=0.1,
+    )
+
+    def invoke(self, arguments: dict[str, Any], context: ToolContext) -> str:
+        time.sleep(0.5)
+        return "done"
+
+
+class FlakyTool:
+    """第一次可重试失败，第二次成功。"""
+
+    spec = ToolSpec(
+        name="test_flaky",
+        description="不稳定工具",
+        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+    )
+
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    def invoke(self, arguments: dict[str, Any], context: ToolContext) -> str:
+        self.attempts += 1
+        if self.attempts == 1:
+            raise ToolError("upstream_busy", "上游繁忙", retryable=True)
+        return "ok"
+
+
+class FlakySubmitTool:
+    """非幂等的提交类工具，第一次就失败。"""
+
+    spec = ToolSpec(
+        name="test_submit_flaky",
+        description="提交单据",
+        parameters={
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+        idempotent=False,
+    )
+
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    def invoke(self, arguments: dict[str, Any], context: ToolContext) -> str:
+        self.attempts += 1
+        raise ToolError("upstream_busy", "上游繁忙", retryable=True)
+
+
+class SubmitTool:
+    spec = ToolSpec(
+        name="test_submit",
+        description="提交单据",
+        parameters={
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+        idempotent=False,
+    )
+
+    def __init__(self) -> None:
+        self.invocations = 0
+
+    def invoke(self, arguments: dict[str, Any], context: ToolContext) -> str:
+        self.invocations += 1
+        return f"submitted:{arguments['value']}"
+
+
+class SecretEchoTool:
+    """回显令牌：用于验证"敏感参数落盘前必须脱敏"。"""
+
+    spec = ToolSpec(
+        name="test_secret",
+        description="回显令牌",
+        parameters={
+            "type": "object",
+            "properties": {"token": {"type": "string"}},
+            "required": ["token"],
+            "additionalProperties": False,
+        },
+        sensitive_fields=["token"],
+    )
+
+    def invoke(self, arguments: dict[str, Any], context: ToolContext) -> str:
+        return f"echo:{arguments['token']}"
+
+
+def test_tool_timeout_is_reported_as_unknown_not_failed() -> None:
+    grant = ToolGrant(registry=registry_with(SleepTool()), allowed=frozenset({"test_sleep"}))
+
+    started = time.monotonic()
+    result = grant.call(ToolCall(call_id="1", name="test_sleep", arguments={}), context())
+    elapsed = time.monotonic() - started
+
+    assert result.outcome is ToolOutcome.TIMEOUT
+    assert result.error_code == "tool_timeout"
+    # 必须真的按声明的超时掐断，而不是陪工具跑完。
+    assert elapsed < 0.4
+
+
+def test_retryable_error_is_retried_for_idempotent_tool() -> None:
+    flaky = FlakyTool()
+    grant = ToolGrant(
+        registry=registry_with(flaky),
+        allowed=frozenset({"test_flaky"}),
+        max_attempts=2,
+        retry_backoff_seconds=0,
+    )
+
+    result = grant.call(ToolCall(call_id="1", name="test_flaky", arguments={}), context())
+
+    assert result.outcome is ToolOutcome.OK
+    assert result.attempts == 2
+    assert flaky.attempts == 2
+
+
+def test_non_idempotent_tool_is_never_retried() -> None:
+    tool = FlakySubmitTool()
+    grant = ToolGrant(
+        registry=registry_with(tool),
+        allowed=frozenset({"test_submit_flaky"}),
+        max_attempts=3,
+        retry_backoff_seconds=0,
+    )
+
+    result = grant.call(
+        ToolCall(call_id="1", name="test_submit_flaky", arguments={"value": "x"}), context()
+    )
+
+    assert result.outcome is ToolOutcome.ERROR
+    assert result.attempts == 1
+    assert tool.attempts == 1
+
+
+def test_duplicate_non_idempotent_call_is_blocked() -> None:
+    submit = SubmitTool()
+    grant = ToolGrant(registry=registry_with(submit), allowed=frozenset({"test_submit"}))
+
+    first = grant.call(
+        ToolCall(call_id="1", name="test_submit", arguments={"value": "x"}), context()
+    )
+    repeated = grant.call(
+        ToolCall(call_id="2", name="test_submit", arguments={"value": "x"}), context()
+    )
+    different = grant.call(
+        ToolCall(call_id="3", name="test_submit", arguments={"value": "y"}), context()
+    )
+
+    assert first.outcome is ToolOutcome.OK
+    assert repeated.error_code == "duplicate_side_effect"
+    assert different.error_code == "tool_call_limit"
+    # 关键断言：副作用只发生了一次。
+    assert submit.invocations == 1
+
+
+def test_per_tool_max_calls_is_enforced() -> None:
+    tool = EchoTool()
+    tool.spec = tool.spec.model_copy(update={"max_calls": 1})
+    grant = ToolGrant(registry=registry_with(tool), allowed=frozenset({"test_echo"}))
+
+    grant.call(ToolCall(call_id="1", name="test_echo", arguments={"text": "a"}), context())
+    blocked = grant.call(
+        ToolCall(call_id="2", name="test_echo", arguments={"text": "b"}), context()
+    )
+
+    assert blocked.error_code == "tool_call_limit"
+    assert len(tool.calls) == 1
+
+
+def test_token_budget_exhaustion_maps_to_unconfirmed() -> None:
+    client = ScriptedModelClient(
+        [ModelResponse(text=SUCCESS, usage=TokenUsage(total_tokens=100))]
+    )
+    executor = HarnessExecutor(
+        client,
+        registry=registry_with(EchoTool()),
+        max_tokens=50,
+        deadline_seconds=30,
+        require_tool_call=False,
+    )
+
+    result = executor.execute(request_for())
+
+    assert result.outcome is ExecutionOutcome.UNCONFIRMED
+    assert result.error_code == "budget_max_tokens"
+
+
+def test_sensitive_arguments_are_masked_on_disk_but_not_for_the_model() -> None:
+    """落盘/对外必须脱敏；回灌给模型必须保持原值，否则模型无法继续推理。"""
+
+    client = ScriptedModelClient(
+        [
+            ModelResponse(
+                tool_calls=[tool_call("test_secret", call_id="c1", token="tok-123456")]
+            ),
+            ModelResponse(text=SUCCESS),
+        ]
+    )
+
+    result = make_executor(client, SecretEchoTool()).execute(request_for(tool="test_secret"))
+
+    assert result.outcome is ExecutionOutcome.SUCCEEDED
+    dumped = json.dumps(result.output, ensure_ascii=False)
+    assert "tok-123456" not in dumped
+    assert result.output["tool_calls"][0]["arguments"]["token"] == MASK
+
+    tool_messages = [
+        message for message in client.calls[1]["messages"] if message.role is MessageRole.TOOL
+    ]
+    assert "tok-123456" in tool_messages[0].content
+
+
+def test_executor_writes_trace_for_both_success_and_unconfirmed() -> None:
+    traces = InMemoryTraceStore()
+
+    ok_executor = make_executor(
+        ScriptedModelClient(
+            [
+                ModelResponse(tool_calls=[tool_call("test_echo", call_id="c1", text="hi")]),
+                ModelResponse(text=SUCCESS),
+            ]
+        ),
+        EchoTool(),
+        traces=traces,
+    )
+    ok_executor.execute(request_for())
+
+    unconfirmed_executor = make_executor(
+        ScriptedModelClient([ModelResponse(text=SUCCESS)]), EchoTool(), traces=traces
+    )
+    unconfirmed_executor.execute(request_for())
+
+    items = traces.list()
+    assert [item.outcome for item in items] == ["unconfirmed", "succeeded"]
+    assert items[0].error_code == "unverified_success"
+    assert items[1].error_code is None
+    assert items[0].blocked_tool_calls == 0
+    assert traces.summary().unconfirmed_rate == 0.5

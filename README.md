@@ -12,8 +12,11 @@ WorkPanda 是面向群众的自然语言公共服务入口。当前仓库处于*
 - 槽位收集与多轮澄清；
 - 关键动作的服务端一次性确认凭证（绑定任务、流程版本、步骤和参数摘要）；
 - 签名会话令牌、任务归属隔离与按会话限流；
-- **通用 harness 受控执行层**：工具白名单、参数校验、三重预算、逐次留痕；
+- **通用 harness 受控执行层**：工具白名单、参数校验、四重预算（步数/调用/token/耗时）、
+  工具限期执行与有界重试、非幂等操作防重复提交、逐次留痕；
 - 结构化结果契约：没有可核验依据不得报成功，工具不可用不伪装完成；
+- 落盘脱敏：敏感入参、手机号/身份证/银行卡/令牌在留痕与运维接口中统一掩码；
+- 执行留痕独立存储与聚合指标（未确认占比、被拦/超时调用数）；
 - Octop-Harness 运行时适配器（备选后端，可选启用）；
 - 运维只读接口 `/api/ops/*`，供 Octop 控制台读取；
 - 执行器、意图路由、事件发布的可替换端口；
@@ -70,6 +73,8 @@ uvicorn workpanda.main:app --app-dir src --reload
 | GET | `/api/ops/tasks` | 列出任务，支持 `limit`、`status` |
 | GET | `/api/ops/tasks/{task_id}` | 任务详情 |
 | GET | `/api/ops/tasks/{task_id}/events` | 事件列表 |
+| GET | `/api/ops/traces` | 执行留痕，支持 `task_id`、`limit` |
+| GET | `/api/ops/traces/summary` | 执行指标聚合，支持 `task_id` |
 
 任务按会话隔离：访问不属于自己的任务返回 404，不暴露任务是否存在。超限返回 429 并带 `Retry-After`。
 
@@ -97,7 +102,11 @@ uvicorn workpanda.main:app --app-dir src --reload
 | `WORKPANDA_MODEL_TRUST_ENV` | `true` | 是否沿用系统代理变量 |
 | `WORKPANDA_HARNESS_MAX_STEPS` | `6` | 单步骤最多模型轮次 |
 | `WORKPANDA_HARNESS_MAX_TOOL_CALLS` | `8` | 单步骤最多工具调用次数 |
-| `WORKPANDA_HARNESS_DEADLINE_SECONDS` | `45` | 单步骤总耗时上限 |
+| `WORKPANDA_HARNESS_MAX_TOKENS` | `0` | 单步骤 token 上限；0 不限，仅在上游上报 usage 时生效 |
+| `WORKPANDA_HARNESS_DEADLINE_SECONDS` | `45` | 单步骤总耗时上限（兼作单次工具兜底超时） |
+| `WORKPANDA_HARNESS_TOOL_RETRIES` | `1` | 可重试失败的额外尝试次数，仅对幂等工具生效 |
+| `WORKPANDA_HARNESS_REDACT` | `true` | 落盘脱敏开关 |
+| `WORKPANDA_HARNESS_TRACE_CAPACITY` | `500` | 进程内 trace 保留条数 |
 | `WORKPANDA_HARNESS_ALLOWED_HOSTS` | 空 | 逗号分隔的 http 工具域名白名单；为空则不注册 |
 | `WORKPANDA_OCTOP_ENABLED` | `false` | 启用 Octop-Harness 运行时执行器 |
 | `WORKPANDA_OCTOP_API_KEY` | 空 | 模型凭据；启用时必填 |
@@ -130,7 +139,7 @@ src/workpanda/
 ├── api/             路由、错误映射、依赖
 ├── application/     任务服务、流程推进器、端口协议
 ├── domain/          状态机、流程定义、确认凭证、存储协议
-├── harness/         通用受控执行层（工具循环、预算、留痕、契约）
+├── harness/         通用受控执行层（工具循环、预算、脱敏、留痕、契约）
 ├── infrastructure/  内存/SQLite 存储、事件总线、Octop 适配器
 ├── bootstrap.py     依赖装配
 ├── config.py        配置
