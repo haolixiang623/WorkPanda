@@ -172,6 +172,93 @@ def test_validate_arguments_checks_types_and_enum() -> None:
     assert validate_arguments(spec, {"count": True})
 
 
+def _constrained_spec() -> ToolSpec:
+    return ToolSpec(
+        name="test_constrained",
+        description="约束校验",
+        parameters={
+            "type": "object",
+            "properties": {
+                "code": {"type": "string", "pattern": "^[A-Z]{3}$"},
+                "note": {"type": "string", "minLength": 2, "maxLength": 4},
+                "count": {"type": "integer", "minimum": 1, "maximum": 5},
+                "ratio": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "tags": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 2,
+                    "items": {"type": "string", "maxLength": 3},
+                },
+                "meta": {
+                    "type": "object",
+                    "properties": {"k": {"type": "string"}},
+                    "required": ["k"],
+                    "additionalProperties": False,
+                },
+            },
+            "additionalProperties": False,
+        },
+    )
+
+
+def test_validate_arguments_accepts_values_within_constraints() -> None:
+    spec = _constrained_spec()
+
+    assert (
+        validate_arguments(
+            spec,
+            {
+                "code": "ABC",
+                "note": "ab",
+                "count": 3,
+                "ratio": 0.5,
+                "tags": ["ab"],
+                "meta": {"k": "v"},
+            },
+        )
+        == []
+    )
+
+
+def test_validate_arguments_rejects_out_of_range_values() -> None:
+    spec = _constrained_spec()
+
+    def problems(**overrides: Any) -> list[str]:
+        base: dict[str, Any] = {"count": 3}
+        return validate_arguments(spec, {**base, **overrides})
+
+    # 字符串：格式与长度
+    assert any("不匹配格式要求" in item for item in problems(code="abc"))
+    assert any("少于最小长度 2" in item for item in problems(note="a"))
+    assert any("超过最大长度 4" in item for item in problems(note="abcdef"))
+    # 数值：上下界
+    assert any("小于最小值 1" in item for item in problems(count=0))
+    assert any("大于最大值 5" in item for item in problems(count=9))
+    assert any("大于最大值 1.0" in item for item in problems(ratio=1.5))
+    # 数组：元素个数与元素本身
+    assert any("少于最小元素个数 1" in item for item in problems(tags=[]))
+    assert any("超过最大元素个数 2" in item for item in problems(tags=["a", "b", "c"]))
+    assert any("tags[0]" in item and "最大长度 3" in item for item in problems(tags=["abcd"]))
+    # 嵌套对象：必填字段与多余字段
+    assert any("meta.k 为必填" in item for item in problems(meta={}))
+    assert any("meta 不支持字段 extra" in item for item in problems(meta={"k": "v", "extra": 1}))
+
+
+def test_invalid_pattern_in_schema_does_not_reject_valid_calls() -> None:
+    spec = ToolSpec(
+        name="test_bad_pattern",
+        description="正则写错",
+        parameters={
+            "type": "object",
+            "properties": {"name": {"type": "string", "pattern": "([A-Z"}},
+            "additionalProperties": False,
+        },
+    )
+
+    # schema 里的正则写错是工具定义的 bug，不该把合法调用连坐拒绝。
+    assert validate_arguments(spec, {"name": "任意值"}) == []
+
+
 def test_risk_merges_to_highest() -> None:
     assert max_risk([]) is RiskLevel.LOW
     assert max_risk([RiskLevel.LOW, RiskLevel.HIGH, RiskLevel.MEDIUM]) is RiskLevel.HIGH
