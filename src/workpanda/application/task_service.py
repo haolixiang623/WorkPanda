@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from uuid import UUID
 
 from workpanda.application.errors import IntentUnresolved, RequestRejected, TaskConflict
-from workpanda.application.ports import IntentRouter
+from workpanda.application.ports import IntentRouter, StepCancellation
 from workpanda.application.runner import FlowRunner
 from workpanda.domain.flow import FlowDefinition, FlowNotFound, FlowNotRunnable, FlowRegistry
 from workpanda.domain.models import (
@@ -44,6 +44,7 @@ class TaskService:
         flows: FlowRegistry,
         router: IntentRouter,
         confidence_threshold: float = 0.6,
+        cancellations: StepCancellation | None = None,
     ) -> None:
         self.store = store
         self.confirmations = confirmations
@@ -51,6 +52,8 @@ class TaskService:
         self.flows = flows
         self.router = router
         self.confidence_threshold = confidence_threshold
+        # 没有在跑的执行时可以不给：取消仍然只做状态翻转，与之前行为一致。
+        self.cancellations = cancellations
 
     # ---------- 命令 ----------
 
@@ -114,6 +117,10 @@ class TaskService:
 
         if task.current_step:
             self.confirmations.revoke(task.task_id, task.current_step)
+        if self.cancellations is not None:
+            # 状态翻转只是账面上的。正在跑的执行必须收到信号，否则它会把剩下的
+            # 模型轮次和工具调用做完——包括那笔用户刚说"不要了"的提交。
+            self.cancellations.cancel_task(task.task_id, "user_cancelled")
         task.status = TaskStatus.CANCELLED
         task.updated_at = utc_now()
         self.store.save(task)

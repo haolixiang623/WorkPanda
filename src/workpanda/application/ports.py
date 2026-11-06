@@ -52,5 +52,15 @@ class Executor(Protocol):
     def execute(self, request: ExecutionRequest) -> ExecutionResult: ...
 
 
+class StepCancellation(Protocol):
+    """取消某任务正在执行的步骤，返回被置位的执行数（0 表示当前没有在跑的）。
+
+    应用层只声明"我要取消"，怎么把信号送到执行线程由执行侧决定；
+    因此这里不放任何 harness 类型，避免应用层反向依赖执行层。
+    """
+
+    def cancel_task(self, task_id: UUID, reason: str = "user_cancelled") -> int: ...
+
+
 class EventPublisher(Protocol):
     def publish(self, task_id: UUID, sequence: int) -> None: ...

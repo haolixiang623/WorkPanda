@@ -7,7 +7,8 @@
 - 每一次模型调用和工具调用都写进 trace，事后必须能完整重放发生了什么；
 - 每次工具调用落账后回调进度快照，使中断后可以从最近一次已知状态续跑；
 - 模型调用的瞬时失败可以有限重试，但绝不重试工具：模型调用没有副作用，
-  工具调用可能有。
+  工具调用可能有；
+- 取消只在边界生效，已提交的调用跑完并留痕，取消同样是"未确认"而不是"失败"。
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 from workpanda.harness.budget import Budget, BudgetExhausted
+from workpanda.harness.cancel import Cancelled, CancelToken
 from workpanda.harness.checkpoint import ExecutionSnapshot
 from workpanda.harness.clients import ModelClient, ModelError, ModelTimeout
 from workpanda.harness.models import (
@@ -45,6 +47,8 @@ class StopReason(StrEnum):
     MODEL_ERROR = "model_error"
     MODEL_TIMEOUT = "model_timeout"
     NO_PROGRESS = "no_progress"
+    # 人取消了这次执行。既不是成功也不是失败：此前可能已经发生过副作用。
+    CANCELLED = "cancelled"
 
 
 _BUDGET_REASON: dict[str, tuple[StopReason, str]] = {
@@ -81,6 +85,12 @@ class LoopResult:
             StopReason.DEADLINE,
         }
 
+    @property
+    def cancelled(self) -> bool:
+        """被人取消。与"失败""超预算"并列的第三种非结论收尾。"""
+
+        return self.stop_reason is StopReason.CANCELLED
+
 
 class AgentLoop:
     def __init__(
@@ -116,12 +126,17 @@ class AgentLoop:
         context: ToolContext,
         resume: ExecutionSnapshot | None = None,
         on_progress: Callable[[ExecutionSnapshot], None] | None = None,
+        cancel: CancelToken | None = None,
     ) -> LoopResult:
         """执行一次有界循环。
 
         `resume` 不为空时从断点继续：对话、已发生的工具调用与预算用量都接着算，
         不重新发一次"从头开始"的请求；`on_progress` 在每个工具调用落账后回调，
         供调用方落 checkpoint——回调失败不得击穿执行。
+
+        `cancel` 是外部（通常来自另一个线程的用户请求）的取消信号。它只在边界上
+        生效——下一轮模型调用之前、下一条工具调用之前、重试退避等待中。已经提交
+        的调用不会被中断也不会被假装成没发生：结果照常落账，结论是"未确认"。
         """
 
         started = time.monotonic()
@@ -152,6 +167,25 @@ class AgentLoop:
 
         def emit(kind: EventKind, data: dict) -> None:
             events.append(HarnessEvent(sequence=len(events) + 1, kind=kind, data=data))
+
+        def check_cancel(stage: str, skipped: Sequence[str] = ()) -> None:
+            """边界检查：已取消就留痕并中止。
+
+            `stage` 说明停在哪一步，`skipped` 是被这一停省下的调用（如果此时已经
+            知道有哪几条）——事后核对"取消之后还有没有发出去什么"全靠这两个字段。
+            """
+
+            if cancel is None or not cancel.cancelled:
+                return
+            emit(
+                EventKind.CANCELLED,
+                {
+                    "stage": stage,
+                    "reason": cancel.reason,
+                    "skipped_calls": list(skipped),
+                },
+            )
+            raise Cancelled(cancel.reason or "cancelled", stage)
 
         def count_model_call() -> None:
             # 失败的尝试同样是一次真实调用，必须计入：否则"重试了 3 次"在 trace 上看不出来。
@@ -202,6 +236,8 @@ class AgentLoop:
 
         try:
             while True:
+                # 取消优先于预算：用户已经不要这个结果了，没必要再消耗配额。
+                check_cancel("before_model")
                 budget.consume_step()
                 specs = grant.specs
                 emit(
@@ -214,6 +250,8 @@ class AgentLoop:
                     budget=budget,
                     emit=emit,
                     on_attempt=count_model_call,
+                    check_cancel=check_cancel,
+                    cancel=cancel,
                 )
                 emit(EventKind.MODEL_RESPONDED, _describe_response(response))
 
@@ -222,6 +260,11 @@ class AgentLoop:
                     budget.consume_tokens(response.usage.total_tokens)
 
                 if response.tool_calls:
+                    # 模型刚给出调用清单、工具还没动：取消赶在这时到达，一条都不执行。
+                    # 这正是"点了取消却还是提交了"最容易发生的窗口。
+                    check_cancel(
+                        "before_tool", skipped=[call.name for call in response.tool_calls]
+                    )
                     messages.append(
                         HarnessMessage(
                             role=MessageRole.ASSISTANT,
@@ -236,6 +279,7 @@ class AgentLoop:
                         budget=budget,
                         accept=accept,
                         emit=emit,
+                        check_cancel=check_cancel,
                     )
                     continue
 
@@ -258,6 +302,21 @@ class AgentLoop:
                         error_code="empty_model_response",
                     )
 
+        except Cancelled as exc:
+            # 取消不是失败：此前可能已经发生过副作用，只能交给人工核对。
+            return finish(
+                "",
+                StopReason.CANCELLED,
+                records,
+                events,
+                model_calls,
+                started,
+                error_code="cancelled",
+                error_message=(
+                    f"执行已取消（原因 {exc.reason}，边界 {exc.stage}），"
+                    "此前的动作可能已经生效，须人工核实。"
+                ),
+            )
         except BudgetExhausted as exc:
             reason, error_code = _BUDGET_REASON.get(
                 exc.reason, (StopReason.MAX_STEPS, f"budget_{exc.reason}")
@@ -297,6 +356,7 @@ class AgentLoop:
         budget: Budget,
         accept: Callable[[ToolCall, ToolCallRecord], None],
         emit: Callable[[EventKind, dict], None],
+        check_cancel: Callable[..., None] | None = None,
     ) -> None:
         """执行同一轮的多个工具调用，逐条交给 `accept` 落账。
 
@@ -308,15 +368,22 @@ class AgentLoop:
         - 并行只改变等待方式，不改变顺序：记录、事件、回灌消息都按模型给出的顺序。
 
         单条调用抛出任何异常都不能击穿整轮：记录成 `tool_crashed` 继续走。
+
+        取消的边界在这里最窄：串行时每条调用之前检查一次，被省下的就是后面那几条；
+        并行批次一旦提交就整批跑完（它们都是幂等工具，重放安全），结果照常落账，
+        真正的停发生在下一轮模型调用之前。
         """
 
+        guard = check_cancel or _no_cancel
         workers = self._parallel_workers(calls, grant, budget)
         if workers <= 0:
-            for call in calls:
+            for index, call in enumerate(calls):
+                guard("before_tool", [pending.name for pending in calls[index:]])
                 budget.consume_tool_call()
                 accept(call, grant.call(call, self._tool_context(context, budget)))
             return
 
+        guard("before_tool", [call.name for call in calls])
         emit(
             EventKind.TOOLS_PARALLEL,
             {
@@ -367,6 +434,8 @@ class AgentLoop:
         budget: Budget,
         emit: Callable[[EventKind, dict], None],
         on_attempt: Callable[[], None],
+        check_cancel: Callable[..., None] | None = None,
+        cancel: CancelToken | None = None,
     ) -> ModelResponse:
         """调用模型，对"瞬时失败"做有界重试。
 
@@ -381,8 +450,11 @@ class AgentLoop:
         每次**尝试**都会先回调 `on_attempt`（失败的尝试同样是真实发生的调用，
         必须计入 `model_calls`），重试另留一条 `model_retried` 事件，
         避免事后看成"只调了一次模型"。
+
+        退避等待可被取消打断：用户点了取消却还要等 2 秒退避，等于点了没反应。
         """
 
+        guard = check_cancel or _no_cancel
         attempts = 0
         while True:
             attempts += 1
@@ -404,7 +476,12 @@ class AgentLoop:
                         "delay_ms": int(delay * 1000),
                     },
                 )
-                time.sleep(delay)
+                if cancel is not None and cancel.wait(delay):
+                    # 用户已经不要结果了：不必把退避时间耗完。
+                    guard("retry_backoff")
+                    raise Cancelled(cancel.reason or "cancelled", "retry_backoff") from exc
+                if cancel is None:
+                    time.sleep(delay)
 
     def _finish(
         self,
@@ -439,6 +516,12 @@ class AgentLoop:
             error_code=error_code,
             error_message=error_message,
         )
+
+
+def _no_cancel(stage: str, skipped: Sequence[str] = ()) -> None:
+    """未启用取消时的空闸门，免得每个调用点都判一次 None。"""
+
+    return None
 
 
 def _crashed(call: ToolCall, exc: BaseException) -> ToolCallRecord:

@@ -15,6 +15,7 @@ from workpanda.domain.identity import SessionSigner, new_secret
 from workpanda.domain.repository import ConfirmationStore, TaskStore
 from workpanda.harness.audit import AuditJournal, JsonlAuditJournal, NullAuditJournal
 from workpanda.harness.builtin import default_registry
+from workpanda.harness.cancel import CancelRegistry
 from workpanda.harness.checkpoint import CheckpointStore, InMemoryCheckpointStore
 from workpanda.harness.executor import HarnessExecutor
 from workpanda.harness.openai_client import OpenAICompatibleClient
@@ -45,6 +46,8 @@ class Container:
     limiter: TokenBucketLimiter
     traces: TraceStore
     audit: AuditJournal
+    # 取消登记表由容器持有：取消方与执行方看到的必须是同一个对象。
+    cancellations: CancelRegistry
     closers: list = field(default_factory=list)
 
     def close(self) -> None:
@@ -125,6 +128,8 @@ def build_container(
     registered = flows if flows is not None else (demo_flows() if settings.enable_demo_flow else [])
     registry = FlowRegistry(registered)
     broker = EventBroker()
+    # 取消是执行期信号，不落盘：进程重启后本来就没有"正在跑的执行"可取消。
+    cancellations = CancelRegistry()
     # trace 独立于任务结果存放：既能覆盖成功执行，也能做跨任务的聚合指标。
     traces, trace_closers = build_trace_store(settings)
     closers.extend(trace_closers)
@@ -163,6 +168,7 @@ def build_container(
                 checkpoints=checkpoints,
                 resume_enabled=settings.harness_resume_enabled,
                 resume_ttl_seconds=settings.harness_resume_ttl_seconds,
+                cancellations=cancellations,
             )
             closers.append(model_client.close)
             closers.extend(tool_closers)
@@ -203,6 +209,7 @@ def build_container(
         flows=registry,
         router=router_instance,
         confidence_threshold=settings.intent_confidence_threshold,
+        cancellations=cancellations,
     )
 
     return Container(
@@ -222,5 +229,6 @@ def build_container(
         ),
         traces=traces,
         audit=audit,
+        cancellations=cancellations,
         closers=closers,
     )
