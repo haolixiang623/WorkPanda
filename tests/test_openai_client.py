@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import httpx
@@ -158,3 +159,31 @@ def test_empty_choices_is_an_error() -> None:
     with pytest.raises(ModelError) as excinfo:
         client_with(handler).complete(messages=[], tools=[])
     assert excinfo.value.code == "empty_choices"
+
+
+def test_duration_ms_reflects_model_latency() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        time.sleep(0.03)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    result = client_with(handler).complete(messages=[], tools=[])
+
+    # 留痕要靠这个值区分"模型慢"还是"工具慢"，恒为 0 等于没有观测。
+    assert isinstance(result.duration_ms, int)
+    assert result.duration_ms >= 20
+
+
+def test_duration_ms_is_measured_per_call_not_accumulated() -> None:
+    """慢的第一次调用不得把耗时带进第二次。"""
+    delays = [0.05, 0.0]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        time.sleep(delays.pop(0))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    client = client_with(handler)
+    slow = client.complete(messages=[], tools=[])
+    fast = client.complete(messages=[], tools=[])
+
+    assert slow.duration_ms >= 40
+    assert fast.duration_ms < slow.duration_ms
