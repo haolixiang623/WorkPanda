@@ -1,11 +1,10 @@
-"""API 依赖和应用级服务容器。"""
+"""HTTP 依赖：从应用状态中取容器，便于测试替换。"""
 
-from functools import lru_cache
+from fastapi import Request
 
-from workpanda.application.task_service import TaskService
-from workpanda.infrastructure.memory_store import InMemoryTaskStore
+from workpanda.bootstrap import Container
 
 
-@lru_cache
-def get_task_service() -> TaskService:
-    return TaskService(InMemoryTaskStore())
+def get_container(request: Request) -> Container:
+    container: Container = request.app.state.container
+    return container

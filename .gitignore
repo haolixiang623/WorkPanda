@@ -27,3 +27,6 @@ out/
 .env
 .env.local
 .env.*.local
+
+# 测试临时目录
+.pytest-tmp/

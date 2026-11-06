@@ -1,72 +1,95 @@
-"""任务 API 路由。"""
+"""任务 API：群众侧只通过这些接口与业务后端交互。"""
 
 import asyncio
 import json
 from collections.abc import AsyncIterator
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Query, status
 from sse_starlette.sse import EventSourceResponse
 
-from workpanda.api.dependencies import get_task_service
-from workpanda.application.task_service import InvalidTaskTransition, TaskService
-from workpanda.domain.models import Task, TaskCreate
-from workpanda.domain.repository import TaskNotFoundError
+from workpanda.api.dependencies import get_container
+from workpanda.bootstrap import Container
+from workpanda.domain.models import (
+    TaskAnswerRequest,
+    TaskConfirmRequest,
+    TaskCreateRequest,
+    TaskEvent,
+    TaskView,
+)
 
 router = APIRouter(prefix="/api")
 
 
-def _not_found() -> HTTPException:
-    return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="task not found")
+def _sse(event: TaskEvent) -> dict[str, str]:
+    return {
+        "id": str(event.sequence),
+        "event": event.type.value,
+        "data": event.model_dump_json(),
+    }
 
 
-@router.post("/tasks", response_model=Task, status_code=status.HTTP_201_CREATED)
-def create_task(command: TaskCreate, service: TaskService = Depends(get_task_service)) -> Task:
-    return service.create_task(command)
+@router.post("/tasks", response_model=TaskView, status_code=status.HTTP_201_CREATED)
+async def create_task(
+    request: TaskCreateRequest, container: Container = Depends(get_container)
+) -> TaskView:
+    return TaskView.from_task(container.tasks.create_task(request))
 
 
-@router.get("/tasks/{task_id}", response_model=Task)
-def get_task(task_id: UUID, service: TaskService = Depends(get_task_service)) -> Task:
-    try:
-        return service.get_task(task_id)
-    except TaskNotFoundError as exc:
-        raise _not_found() from exc
+@router.get("/tasks/{task_id}", response_model=TaskView)
+async def get_task(task_id: UUID, container: Container = Depends(get_container)) -> TaskView:
+    return TaskView.from_task(container.tasks.get_task(task_id))
 
 
-@router.post("/tasks/{task_id}/cancel", response_model=Task)
-def cancel_task(task_id: UUID, service: TaskService = Depends(get_task_service)) -> Task:
-    try:
-        return service.cancel_task(task_id)
-    except TaskNotFoundError as exc:
-        raise _not_found() from exc
-    except InvalidTaskTransition as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+@router.post("/tasks/{task_id}/answers", response_model=TaskView)
+async def answer_task(
+    task_id: UUID,
+    request: TaskAnswerRequest,
+    container: Container = Depends(get_container),
+) -> TaskView:
+    return TaskView.from_task(container.tasks.answer(task_id, request))
+
+
+@router.post("/tasks/{task_id}/confirm", response_model=TaskView)
+async def confirm_task(
+    task_id: UUID,
+    request: TaskConfirmRequest,
+    container: Container = Depends(get_container),
+) -> TaskView:
+    return TaskView.from_task(container.tasks.confirm(task_id, request))
+
+
+@router.post("/tasks/{task_id}/cancel", response_model=TaskView)
+async def cancel_task(task_id: UUID, container: Container = Depends(get_container)) -> TaskView:
+    return TaskView.from_task(container.tasks.cancel(task_id))
 
 
 @router.get("/tasks/{task_id}/events")
 async def task_events(
     task_id: UUID,
     after: int = Query(default=0, ge=0),
-    service: TaskService = Depends(get_task_service),
+    container: Container = Depends(get_container),
 ) -> EventSourceResponse:
-    try:
-        service.get_task(task_id)
-    except TaskNotFoundError as exc:
-        raise _not_found() from exc
+    container.tasks.get_task(task_id)
+    keepalive = container.settings.event_keepalive_seconds
 
     async def stream() -> AsyncIterator[dict[str, str]]:
-        sent = after
-        idle_rounds = 0
-        while idle_rounds < 2:
-            events = service.events(task_id, after_sequence=sent)
-            if events:
-                for event in events:
-                    sent = event.sequence
-                    yield {"id": str(event.sequence), "event": event.type, "data": event.model_dump_json()}
-                idle_rounds = 0
-            else:
-                idle_rounds += 1
-                yield {"event": "keepalive", "data": json.dumps({"sequence": sent})}
-            await asyncio.sleep(0.01)
+        last_sent = after
+        async with container.broker.subscribe(task_id) as queue:
+            for event in container.tasks.events(task_id, after_sequence=after):
+                last_sent = event.sequence
+                yield _sse(event)
+
+            while True:
+                try:
+                    sequence = await asyncio.wait_for(queue.get(), timeout=keepalive)
+                except TimeoutError:
+                    yield {"event": "keepalive", "data": json.dumps({"sequence": last_sent})}
+                    continue
+                if sequence <= last_sent:
+                    continue
+                for event in container.tasks.events(task_id, after_sequence=last_sent):
+                    last_sent = event.sequence
+                    yield _sse(event)
 
     return EventSourceResponse(stream())
