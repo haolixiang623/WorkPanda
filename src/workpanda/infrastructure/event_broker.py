@@ -2,33 +2,66 @@
 
 用于把任务事件即时推送给在线订阅者。它只做通知，不承担持久化：
 断线重连仍以 Task Store 中的事件流为准，避免"推送丢了就丢了"。
+
+线程模型：任务执行放在工作线程里（见 `api/routes.py` 的 `asyncio.to_thread`），
+因此 `publish` 可能从**非事件循环线程**调用。`asyncio.Queue.put_nowait` 不是
+线程安全的，这里按订阅时记下的事件循环把投递排回它自己的线程；推送丢了也不会
+丢事件——SSE 断线重连会从 Task Store 补齐。
 """
 
 import asyncio
 from collections import defaultdict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from threading import Lock
 from uuid import UUID
 
 
 class EventBroker:
     def __init__(self) -> None:
-        self._subscribers: dict[UUID, set[asyncio.Queue[int]]] = defaultdict(set)
+        # 队列 -> 订阅者所在的事件循环。记住循环才能安全地跨线程投递。
+        self._subscribers: dict[UUID, dict[asyncio.Queue[int], asyncio.AbstractEventLoop]] = (
+            defaultdict(dict)
+        )
+        self._lock = Lock()
 
     def publish(self, task_id: UUID, sequence: int) -> None:
-        for queue in tuple(self._subscribers.get(task_id, ())):
-            queue.put_nowait(sequence)
+        try:
+            caller_loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            # 同步代码或工作线程：没有"当前循环"，全部走线程安全投递。
+            caller_loop = None
+
+        with self._lock:
+            targets = tuple(self._subscribers.get(task_id, {}).items())
+
+        for queue, loop in targets:
+            if loop is caller_loop:
+                # 同一个循环里直接放，保序且没有调度延迟。
+                queue.put_nowait(sequence)
+                continue
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, sequence)
+            except RuntimeError:
+                # 订阅者所在循环已关闭：通知丢了，但 Task Store 仍是权威事件流。
+                pass
 
     @asynccontextmanager
     async def subscribe(self, task_id: UUID) -> AsyncIterator[asyncio.Queue[int]]:
         queue: asyncio.Queue[int] = asyncio.Queue()
-        self._subscribers[task_id].add(queue)
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            self._subscribers[task_id][queue] = loop
         try:
             yield queue
         finally:
-            self._subscribers[task_id].discard(queue)
-            if not self._subscribers[task_id]:
-                self._subscribers.pop(task_id, None)
+            with self._lock:
+                subscribers = self._subscribers.get(task_id)
+                if subscribers is not None:
+                    subscribers.pop(queue, None)
+                    if not subscribers:
+                        self._subscribers.pop(task_id, None)
 
     def subscriber_count(self, task_id: UUID) -> int:
-        return len(self._subscribers.get(task_id, ()))
+        with self._lock:
+            return len(self._subscribers.get(task_id, ()))

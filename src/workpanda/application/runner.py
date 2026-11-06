@@ -163,6 +163,13 @@ class FlowRunner:
                 arguments=dict(task.slots),
             )
         )
+        # 执行期间用户可能已经点了取消。执行离环之后这是真实并发，不是理论情况：
+        # store 里的状态才是权威的，一次迟到的执行结果不能把 CANCELLED 覆盖回
+        # COMPLETED / FAILED / OUTCOME_UNCONFIRMED。此时也不再写结果事件——
+        # 取消请求已经写过一条 CANCELLED，流程就此停下。
+        current = self.store.get(task.task_id)
+        if current.status is TaskStatus.CANCELLED:
+            return current
         return self._apply_result(task, step, result)
 
     def _usable_credential(
