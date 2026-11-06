@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     harness_deadline_seconds: float = 45.0
     # 可重试失败的额外尝试次数（仅对幂等工具生效）。
     harness_tool_retries: int = 1
+    # 同一轮里最多几个工具并发执行。1 表示串行（默认）。
+    # 只有整批都是幂等工具、且整批放得进剩余调用预算时才会真的并发；
+    # 工具本身必须线程安全，第三方工具有共享状态时保持 1。
+    harness_tool_concurrency: int = 1
     # 落盘与运维接口的脱敏开关。默认开启；除非有明确理由，否则不要关。
     harness_redact: bool = True
     # 进程内 trace 保留条数上限，避免留痕变成无限增长的内存占用。

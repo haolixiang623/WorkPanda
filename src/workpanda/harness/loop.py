@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -26,7 +27,9 @@ from workpanda.harness.models import (
     HarnessMessage,
     MessageRole,
     ModelResponse,
+    ToolCall,
     ToolCallRecord,
+    ToolOutcome,
     ToolSpec,
 )
 from workpanda.harness.tools import ToolContext, ToolGrant
@@ -91,6 +94,7 @@ class AgentLoop:
         max_empty_responses: int = 2,
         model_retries: int = 0,
         model_retry_backoff_seconds: float = 0.5,
+        tool_concurrency: int = 1,
     ) -> None:
         self._client = client
         self._max_steps = max_steps
@@ -100,6 +104,8 @@ class AgentLoop:
         self._max_empty_responses = max_empty_responses
         self._model_retries = max(0, model_retries)
         self._model_retry_backoff_seconds = max(0.0, model_retry_backoff_seconds)
+        # 1 表示串行（默认）。并发只对幂等工具组生效，见 `_dispatch_tools`。
+        self._tool_concurrency = max(1, tool_concurrency)
 
     def run(
         self,
@@ -167,6 +173,25 @@ class AgentLoop:
             except Exception:  # noqa: BLE001 - 落盘失败只影响恢复能力，不该中断真实执行
                 return
 
+        def accept(call: ToolCall, record: ToolCallRecord) -> None:
+            """一条调用落账：先留痕，再回灌模型，最后写进度快照。
+
+            顺序固定，串行与并行两条路径共用：并行的只是等待，顺序语义不变。
+            """
+
+            records.append(record)
+            emit(EventKind.TOOL_COMPLETED, _describe_record(record))
+            messages.append(
+                HarnessMessage(
+                    role=MessageRole.TOOL,
+                    tool_call_id=call.call_id,
+                    name=call.name,
+                    content=_tool_content(record),
+                )
+            )
+            # 工具调用一旦落账就可能是副作用，必须立刻可恢复。
+            report_progress()
+
         def finish(*args, **kwargs) -> LoopResult:
             """统一收尾：把预算用量补进 stopped 事件，事后能判断是否被预算掐断。"""
 
@@ -204,26 +229,14 @@ class AgentLoop:
                             tool_calls=response.tool_calls,
                         )
                     )
-                    for call in response.tool_calls:
-                        budget.consume_tool_call()
-                        record = grant.call(
-                            call,
-                            context.model_copy(
-                                update={"remaining_seconds": budget.remaining_seconds}
-                            ),
-                        )
-                        records.append(record)
-                        emit(EventKind.TOOL_COMPLETED, _describe_record(record))
-                        messages.append(
-                            HarnessMessage(
-                                role=MessageRole.TOOL,
-                                tool_call_id=call.call_id,
-                                name=call.name,
-                                content=_tool_content(record),
-                            )
-                        )
-                        # 工具调用一旦落账就可能是副作用，必须立刻可恢复。
-                        report_progress()
+                    self._dispatch_tools(
+                        response.tool_calls,
+                        grant=grant,
+                        context=context,
+                        budget=budget,
+                        accept=accept,
+                        emit=emit,
+                    )
                     continue
 
                 text = response.text.strip()
@@ -274,6 +287,77 @@ class AgentLoop:
                 error_code=exc.code,
                 error_message=exc.message,
             )
+
+    def _dispatch_tools(
+        self,
+        calls: Sequence[ToolCall],
+        *,
+        grant: ToolGrant,
+        context: ToolContext,
+        budget: Budget,
+        accept: Callable[[ToolCall, ToolCallRecord], None],
+        emit: Callable[[EventKind, dict], None],
+    ) -> None:
+        """执行同一轮的多个工具调用，逐条交给 `accept` 落账。
+
+        并行只在**整批都是幂等工具、且整批放得进剩余调用预算**时开启：
+
+        - 非幂等工具不能并行——两个线程会同时通过"重复副作用"判定，等于把
+          「同一副作用只发生一次」这条不变式交给调度碰运气；
+        - 预算放不下整批时退回串行——先执行的调用仍然留痕，与原有语义一致；
+        - 并行只改变等待方式，不改变顺序：记录、事件、回灌消息都按模型给出的顺序。
+
+        单条调用抛出任何异常都不能击穿整轮：记录成 `tool_crashed` 继续走。
+        """
+
+        workers = self._parallel_workers(calls, grant, budget)
+        if workers <= 0:
+            for call in calls:
+                budget.consume_tool_call()
+                accept(call, grant.call(call, self._tool_context(context, budget)))
+            return
+
+        emit(
+            EventKind.TOOLS_PARALLEL,
+            {
+                "count": len(calls),
+                "names": [call.name for call in calls],
+                "workers": workers,
+            },
+        )
+        # 先把整批预算扣掉：并发执行中途才发现预算不够，等于让部分调用"白跑"。
+        for _ in calls:
+            budget.consume_tool_call()
+
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="wp-tool") as pool:
+            futures = [
+                pool.submit(grant.call, call, self._tool_context(context, budget))
+                for call in calls
+            ]
+            for call, future in zip(calls, futures, strict=True):
+                try:
+                    record = future.result()
+                except Exception as exc:  # noqa: BLE001 - 单条异常不能击穿整轮
+                    record = _crashed(call, exc)
+                accept(call, record)
+
+    def _parallel_workers(
+        self, calls: Sequence[ToolCall], grant: ToolGrant, budget: Budget
+    ) -> int:
+        """返回可用的并发度；0 表示这批调用只能串行。"""
+
+        if self._tool_concurrency <= 1 or len(calls) < 2:
+            return 0
+        if budget.remaining_tool_calls < len(calls):
+            return 0
+        for call in calls:
+            spec = grant.spec_for(call.name)
+            if spec is None or not spec.idempotent:
+                return 0
+        return min(self._tool_concurrency, len(calls))
+
+    def _tool_context(self, context: ToolContext, budget: Budget) -> ToolContext:
+        return context.model_copy(update={"remaining_seconds": budget.remaining_seconds})
 
     def _complete(
         self,
@@ -355,6 +439,22 @@ class AgentLoop:
             error_code=error_code,
             error_message=error_message,
         )
+
+
+def _crashed(call: ToolCall, exc: BaseException) -> ToolCallRecord:
+    """并行调度里单条调用抛出未预期异常时的兜底记录。
+
+    宁可留下一条"执行异常"，也不能让整轮带着"有条调用不知去向"继续跑。
+    """
+
+    return ToolCallRecord(
+        call_id=call.call_id,
+        name=call.name,
+        arguments=call.arguments,
+        outcome=ToolOutcome.ERROR,
+        content=f"工具执行异常：{type(exc).__name__}",
+        error_code="tool_crashed",
+    )
 
 
 def _describe_response(response: ModelResponse) -> dict:

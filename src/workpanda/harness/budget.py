@@ -68,6 +68,12 @@ class Budget:
             return None
         return max(0, self.max_tokens - self._tokens)
 
+    @property
+    def remaining_tool_calls(self) -> int:
+        """还剩几次工具调用额度。并发调度用它判断"整批放不放得下"。"""
+
+        return max(0, self.max_tool_calls - self._tool_calls)
+
     def check_deadline(self) -> None:
         if self.remaining_seconds <= 0:
             raise BudgetExhausted("deadline")

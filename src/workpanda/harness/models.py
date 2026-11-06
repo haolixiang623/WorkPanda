@@ -163,6 +163,9 @@ class EventKind(StrEnum):
     # 瞬时失败后的一次重试。单独成事件，避免"看起来只调了一次模型"。
     MODEL_RETRIED = "model_retried"
     MODEL_RESPONDED = "model_responded"
+    # 一轮里有多个工具并发执行。留痕里必须能看出"这几条是同时在跑"，
+    # 否则事后按耗时排查会以为它们串行。
+    TOOLS_PARALLEL = "tools_parallel"
     TOOL_COMPLETED = "tool_completed"
     STOPPED = "stopped"
 

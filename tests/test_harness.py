@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import httpx
@@ -864,3 +866,215 @@ def test_executor_writes_trace_for_both_success_and_unconfirmed() -> None:
     assert items[1].error_code is None
     assert items[0].blocked_tool_calls == 0
     assert traces.summary().unconfirmed_rate == 0.5
+
+
+# ---------- 并行工具调用 ----------
+
+
+class TimedTool:
+    """可控耗时的幂等工具：记录每次执行的起止时刻，用于判断是否真的并发。"""
+
+    def __init__(
+        self, name: str, *, idempotent: bool = True, max_calls: int | None = None
+    ) -> None:
+        self.windows: list[tuple[float, float]] = []
+        self._lock = threading.Lock()
+        self.spec = ToolSpec(
+            name=name,
+            description="按参数睡一会儿",
+            parameters={
+                "type": "object",
+                "properties": {"seconds": {"type": "number"}},
+                "required": ["seconds"],
+                "additionalProperties": False,
+            },
+            risk=RiskLevel.LOW,
+            idempotent=idempotent,
+            max_calls=max_calls,
+            timeout_seconds=5.0,
+        )
+
+    def invoke(self, arguments: dict[str, Any], context: ToolContext) -> str:
+        started = time.monotonic()
+        time.sleep(float(arguments["seconds"]))
+        with self._lock:
+            self.windows.append((started, time.monotonic()))
+        return f"slept:{arguments['seconds']}"
+
+
+def test_idempotent_tool_calls_run_in_parallel() -> None:
+    first = TimedTool("test_sleep_a")
+    second = TimedTool("test_sleep_b")
+    client = ScriptedModelClient(
+        [
+            ModelResponse(
+                tool_calls=[
+                    tool_call("test_sleep_a", call_id="a", seconds=0.3),
+                    tool_call("test_sleep_b", call_id="b", seconds=0.3),
+                ]
+            ),
+            ModelResponse(text=SUCCESS),
+        ]
+    )
+    loop = AgentLoop(client, tool_concurrency=2)
+
+    result = loop.run(
+        system_prompt="s",
+        user_prompt="u",
+        grant=ToolGrant(
+            registry=registry_with(first, second),
+            allowed=frozenset({"test_sleep_a", "test_sleep_b"}),
+        ),
+        context=context(),
+    )
+
+    assert result.stop_reason is StopReason.COMPLETED
+    # 两条调用的执行窗口必须重叠：串行时后一条一定晚于前一条结束。
+    ((a_start, a_end),) = first.windows
+    ((b_start, b_end),) = second.windows
+    assert b_start < a_end
+    assert a_start < b_end
+    # 并发事实要留痕，否则事后按耗时排查会以为它们串行。
+    assert EventKind.TOOLS_PARALLEL in [event.kind for event in result.events]
+
+
+def test_parallel_calls_keep_model_order() -> None:
+    slow = TimedTool("test_sleep_a")
+    fast = TimedTool("test_sleep_b")
+    client = ScriptedModelClient(
+        [
+            ModelResponse(
+                tool_calls=[
+                    tool_call("test_sleep_a", call_id="a", seconds=0.25),
+                    tool_call("test_sleep_b", call_id="b", seconds=0.01),
+                ]
+            ),
+            ModelResponse(text=SUCCESS),
+        ]
+    )
+    loop = AgentLoop(client, tool_concurrency=2)
+
+    result = loop.run(
+        system_prompt="s",
+        user_prompt="u",
+        grant=ToolGrant(
+            registry=registry_with(slow, fast),
+            allowed=frozenset({"test_sleep_a", "test_sleep_b"}),
+        ),
+        context=context(),
+    )
+
+    # 先完成的是 b，但记录与回灌顺序必须与模型给出的顺序一致。
+    assert [record.call_id for record in result.tool_calls] == ["a", "b"]
+    tool_messages = [
+        message for message in client.calls[1]["messages"] if message.role is MessageRole.TOOL
+    ]
+    assert [message.content for message in tool_messages] == ["slept:0.25", "slept:0.01"]
+
+
+def test_non_idempotent_tool_keeps_whole_round_serial() -> None:
+    reader = TimedTool("test_sleep_a")
+    writer = TimedTool("test_sleep_b", idempotent=False)
+    client = ScriptedModelClient(
+        [
+            ModelResponse(
+                tool_calls=[
+                    tool_call("test_sleep_a", call_id="a", seconds=0.15),
+                    tool_call("test_sleep_b", call_id="b", seconds=0.15),
+                ]
+            ),
+            ModelResponse(text=SUCCESS),
+        ]
+    )
+    loop = AgentLoop(client, tool_concurrency=4)
+
+    result = loop.run(
+        system_prompt="s",
+        user_prompt="u",
+        grant=ToolGrant(
+            registry=registry_with(reader, writer),
+            allowed=frozenset({"test_sleep_a", "test_sleep_b"}),
+        ),
+        context=context(),
+    )
+
+    assert result.stop_reason is StopReason.COMPLETED
+    # 只要这批里有一条非幂等，整批退回串行：并发会让两条同时通过重复副作用判定。
+    assert EventKind.TOOLS_PARALLEL not in [event.kind for event in result.events]
+    ((a_start, a_end),) = reader.windows
+    ((b_start, _),) = writer.windows
+    assert b_start >= a_end
+
+
+def test_parallel_falls_back_when_budget_cannot_fit_batch() -> None:
+    tool = TimedTool("test_sleep_a")
+    batch = ModelResponse(
+        tool_calls=[
+            tool_call("test_sleep_a", call_id="a", seconds=0.01),
+            tool_call("test_sleep_a", call_id="b", seconds=0.01),
+        ]
+    )
+    client = ScriptedModelClient([batch] * 3)
+    loop = AgentLoop(client, max_steps=4, max_tool_calls=1, tool_concurrency=4)
+
+    result = loop.run(
+        system_prompt="s",
+        user_prompt="u",
+        grant=ToolGrant(registry=registry_with(tool), allowed=frozenset({"test_sleep_a"})),
+        context=context(),
+    )
+
+    # 预算放不下整批时退回串行，保持"已执行的调用仍然留痕"的既有语义。
+    assert result.stop_reason is StopReason.MAX_TOOL_CALLS
+    assert len(result.tool_calls) == 1
+    assert len(tool.windows) == 1
+    assert EventKind.TOOLS_PARALLEL not in [event.kind for event in result.events]
+
+
+def test_parallel_call_failure_does_not_break_the_batch() -> None:
+    ok = TimedTool("test_sleep_a")
+    client = ScriptedModelClient(
+        [
+            ModelResponse(
+                tool_calls=[
+                    tool_call("test_sleep_a", call_id="a", seconds=0.01),
+                    tool_call("test_boom", call_id="b"),
+                ]
+            ),
+            ModelResponse(text=SUCCESS),
+        ]
+    )
+    loop = AgentLoop(client, tool_concurrency=2)
+
+    result = loop.run(
+        system_prompt="s",
+        user_prompt="u",
+        grant=ToolGrant(
+            registry=registry_with(ok, BoomTool()),
+            allowed=frozenset({"test_sleep_a", "test_boom"}),
+        ),
+        context=context(),
+    )
+
+    assert [record.outcome for record in result.tool_calls] == [ToolOutcome.OK, ToolOutcome.ERROR]
+    assert result.tool_calls[1].error_code == "upstream_down"
+    assert result.stop_reason is StopReason.COMPLETED
+
+
+def test_tool_call_limit_holds_under_concurrency() -> None:
+    tool = TimedTool("test_sleep_a", max_calls=1)
+    grant = ToolGrant(registry=registry_with(tool), allowed=frozenset({"test_sleep_a"}))
+    calls = [
+        ToolCall(call_id="a", name="test_sleep_a", arguments={"seconds": 0.15}),
+        ToolCall(call_id="b", name="test_sleep_a", arguments={"seconds": 0.15}),
+    ]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        records = list(pool.map(lambda call: grant.call(call, context()), calls))
+
+    # "检查限额"和"记一次尝试"必须原子，否则并发下 max_calls 只是建议值。
+    assert sorted(record.outcome for record in records) == [
+        ToolOutcome.BLOCKED,
+        ToolOutcome.OK,
+    ]
+    assert len(tool.windows) == 1
