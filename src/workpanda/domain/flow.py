@@ -27,6 +27,8 @@ class StepDefinition(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     required_fields: tuple[str, ...] = ()
     prompt: str | None = Field(default=None, max_length=1000)
+    # 执行步骤的明确指令；由流程定义给出，模型不得自行改写。
+    instruction: str | None = Field(default=None, max_length=1000)
     tool: str | None = Field(default=None, max_length=128)
     # 需要群众确认的执行节点：暂停、签发一次性凭证、执行前二次校验。
     requires_confirmation: bool = False

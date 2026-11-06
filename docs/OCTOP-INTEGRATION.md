@@ -1,7 +1,7 @@
 # Octop 集成说明
 
 > 范围：说明 WorkPanda 如何接入 Octop-Harness 运行时，以及 Octop 控制台与 WorkPanda 的职责划分。
-> 现状：运行时适配已实现并通过 SDK 构造验证；控制台对接只完成服务端只读接口，**插件尚未实现**。
+> 现状：运行时适配已实现，真实模型端到端已跑通（含结构化结果契约）；控制台对接只完成服务端只读接口，**插件尚未实现**。
 
 ## 1. 相关上游项目
 
@@ -31,22 +31,63 @@ WorkPanda 只依赖 **Octop-Harness SDK**，不整体部署 Octop 产品。控�
 - `OctopHarnessGateway`：封装 SDK。SDK 是异步 API，适配器用独立事件循环线程承载，避免阻塞 Web 事件循环。
 - `OctopHarnessExecutor`：实现应用层 `Executor` 协议，把一次步骤执行转成一次受控调用。
 
-### 3.2 结果映射
+### 3.2 结构化结果契约
+
+**"模型有回复"不等于"业务成功"**。早期实现把任何非空回复都当成成功，在内网模型上实测时出现过这样的情形：模型明确回复"当前运行时没有注册名为 `demo.echo` 的工具，无法执行"，任务却仍被标记为 `completed`。这是本项目最危险的一类缺陷——群众看到"办理成功"，实际什么都没发生。
+
+因此执行步骤强制采用结构化契约。提示词要求模型只返回一个 JSON 对象：
+
+```json
+{"outcome": "succeeded|failed|unconfirmed", "summary": "做了什么", "evidence": "可核验依据"}
+```
+
+`parse_contract` 的判定规则：
+
+| 模型输出 | 映射结果 | 错误码 |
+|---|---|---|
+| `succeeded` 且有 `evidence` | `succeeded` | — |
+| `succeeded` 但 `evidence` 为空 | `unconfirmed` | `missing_evidence` |
+| `failed` | `failed` | `failed` |
+| 其他取值 / `unconfirmed` | `unconfirmed` | 原值或 `unspecified_outcome` |
+| 不是合法 JSON（如白话拒绝） | `unconfirmed` | `unparsable_output` |
+
+允许 ```json 代码块围栏。**没有例外路径可以绕过 evidence 检查**。
+
+### 3.3 结果映射
 
 | 上游情况 | 映射结果 | 理由 |
 |---|---|---|
-| 正常返回 | `succeeded` | 有结构化输出 |
+| 契约为 `succeeded` 且有依据 | `succeeded` | 有可核验输出 |
+| 契约缺失依据 / 无法解析 / 自述无法完成 | `unconfirmed` | 不得默认成功 |
 | 超时 | `unconfirmed` | 可能已产生副作用，不得当失败重试 |
 | 运行时异常 | `unconfirmed` | 无法判定是否执行 |
 | SDK 未安装 / 缺少凭据 | `failed` | 明确是配置问题，未接触外部系统 |
 
 映射原则：**只有确定成功才报成功；不确定一律"待确认"并转人工**。
 
-### 3.3 提示词边界
+失败与未确认同样要留痕：`ExecutionResult.output` 始终携带模型原文与契约解析结果，`FlowRunner` 把它们写入 `execution_failed` / `outcome_unconfirmed` 事件的 `model_text`、`verification` 字段。否则事后无法复盘，也无法向群众解释为什么转人工。
 
-`default_prompt` 只放当前步骤的流程标识、步骤、工具名和该步骤参数，并显式要求不得改变流程或调用其他工具。不把完整流程定义、其他用户数据或历史会话交给运行时。
+### 3.4 提示词边界
 
-### 3.4 启用方式
+`default_prompt` 只放当前步骤标识、该步骤的执行要求（来自流程定义的 `instruction`）和参数，并附带结果契约。不把完整流程定义、其他用户数据或历史会话交给运行时。
+
+一个容易踩的坑：步骤的 `tool` 是**服务端**为该步骤选定的能力标识（用于记录、审计、决定由哪个执行器执行），不是要求模型调用的工具。早期提示词写成"任务步骤：x（工具 model.echo）"，模型会去找同名工具，找不到就误报失败。现在提示词显式说明这一点，模型只按执行要求完成并如实报告。
+
+步骤意图由流程定义的 `instruction` 决定，**模型不得自行改写或猜测该做什么**。
+
+### 3.5 端到端冒烟
+
+`scripts/smoke_octop.py` 用真实模型跑两个场景并做硬断言：
+
+1. 可完成的步骤 → 必须 `completed` 且带 `evidence`；
+2. 模型无法真正完成的步骤 → 必须落到 `outcome_unconfirmed` / `handoff_required`，**绝不能是 `completed`**，且事件里必须留下模型原文。
+
+```bash
+python -m pip install -e '.[octop]'
+python scripts/smoke_octop.py    # 依赖 .env 中的 Octop 配置
+```
+
+### 3.6 启用方式
 
 ```bash
 python -m pip install -e '.[octop]'
@@ -93,18 +134,19 @@ Octop 控制台支持通过插件注入自定义 UI 与 Hook/Tool/Skill。推荐
 
 - `octop-harness 1.0.8` 可安装；
 - 适配器能按其真实签名构造 `HarnessAgent`（`tests/test_octop_runtime.py::test_real_sdk_builds_harness_agent`）；
-- 三态映射、缺少凭据、未安装 SDK 的降级行为有单元测试覆盖。
+- 三态映射、缺少凭据、未安装 SDK 的降级行为有单元测试覆盖；
+- **真实模型端到端已跑通**：内网 OpenAI 兼容接口（`deepseek-v4-1-flash`）下，可完成步骤得到 `completed` + `evidence`；模型无法执行的步骤得到 `handoff_required` + `failed`，且事件中保留了模型原文，不再出现虚假成功（`scripts/smoke_octop.py`）。
 
 未验证：
 
-- **真实模型调用**：没有可用 API Key，未跑通端到端推理；
 - **Octop 控制台插件**：未实现，也未在真实 Octop 实例上验证；
 - **并发与多实例**：运行时每个进程各建一个 Agent，多实例的会话与限流一致性未验证；
-- **浏览器类工具**：`octop-browser` 随 SDK 安装，但 WorkPanda 尚未启用，也未做域白名单与用户隔离验证。
+- **浏览器类工具**：`octop-browser` 随 SDK 安装，但 WorkPanda 尚未启用，也未做域白名单与用户隔离验证；
+- **真实业务工具**：当前步骤由模型按 `instruction` 直接完成，尚未接入任何外部业务系统；接入时需补工具白名单与幂等设计。
 
 ## 6. 风险与后续
 
-1. 模型输出不可信：运行时返回内容仍需按步骤校验，不能直接当业务结果；
+1. 模型输出不可信：结构化契约已经杜绝"有回复即成功"，但契约只保证模型自述与依据一致，**业务正确性仍需按步骤做服务端校验**；
 2. 工具越权：启用浏览器或 MCP 工具前，必须先做工具白名单与目标域名限制；
 3. 成本与时延：单步骤超时独立配置，避免长任务拖垮请求；
 4. 数据边界：只传当前步骤所需字段，敏感字段需脱敏后再进入提示词；

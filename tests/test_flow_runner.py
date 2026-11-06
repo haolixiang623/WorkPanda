@@ -136,6 +136,33 @@ def test_failed_execution_hands_off(container, executor) -> None:
     assert handoff and handoff[0].data["completed_steps"] == ["collect"]
 
 
+def test_failed_execution_keeps_model_output_for_audit(container, executor) -> None:
+    """失败也要留痕：必须能事后回答"模型当时说了什么"。"""
+
+    executor.results.append(
+        ExecutionResult(
+            outcome=ExecutionOutcome.FAILED,
+            error_code="failed",
+            message="当前运行时未注册该工具。",
+            output={
+                "text": '{"outcome": "failed", "summary": "未注册工具"}',
+                "verification": {"summary": "未注册工具", "evidence": ""},
+            },
+        )
+    )
+    task = start(container, slots={"subject": "测试主题", "contact": "12345"})
+    task = container.tasks.confirm(task.task_id, TaskConfirmRequest(step_id="submit"), SUBJECT)
+
+    failed = [
+        event
+        for event in container.tasks.events(task.task_id, SUBJECT)
+        if event.type is EventType.EXECUTION_FAILED
+    ]
+    assert failed, "失败必须产生 execution_failed 事件"
+    assert failed[0].data["failure_code"] == "failed"
+    assert "未注册工具" in failed[0].data["model_text"]
+
+
 def test_unexpected_answer_field_is_rejected(container) -> None:
     task = start(container)
 

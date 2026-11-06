@@ -10,6 +10,7 @@
 """
 
 import asyncio
+import json
 import logging
 import threading
 from collections.abc import Callable
@@ -41,6 +42,17 @@ class HarnessGateway(Protocol):
         ...
 
     def close(self) -> None: ...
+
+
+OUTCOME_CONTRACT = (
+    "只执行该步骤，不要改变流程、不要调用其他工具、不要编造结果。\n"
+    "必须只返回一个 JSON 对象，不要输出其他文字或代码块标记，字段如下：\n"
+    '{"outcome": "succeeded|failed|unconfirmed",'
+    ' "summary": "一句话说明做了什么",'
+    ' "evidence": "判断该结果的依据，例如实际返回值或明确的外部响应"}\n'
+    "无法真正完成该步骤时，outcome 必须为 failed 或 unconfirmed；"
+    "没有可核验依据时不得填 succeeded。"
+)
 
 
 class OctopHarnessGateway:
@@ -95,6 +107,10 @@ class OctopHarnessGateway:
         if not self._api_key:
             raise HarnessUnavailable("缺少模型凭据：请配置 WORKPANDA_OCTOP_API_KEY")
 
+        workspace = Path(self._workspace or ".octop/workpanda").expanduser().resolve()
+        # 预先创建技能目录，避免运行时反复提示路径不存在。
+        (workspace / "skills").mkdir(parents=True, exist_ok=True)
+
         provider = ProviderConfig(
             id=self._provider,
             name=self._provider,
@@ -104,7 +120,7 @@ class OctopHarnessGateway:
         )
         config = HarnessAgentConfig(
             name=self._agent_name,
-            workspace_dir=str(Path(self._workspace or ".octop/workpanda").expanduser().resolve()),
+            workspace_dir=str(workspace),
             providers=[provider],
             default_model=f"{provider.id}/{self._model}",
             # 工具与沙箱由本服务的流程编排决定，这里不再叠加额外自动化能力。
@@ -121,9 +137,7 @@ class OctopHarnessGateway:
         request = ChatRequest(messages=prompt, thread_id=thread_id, source="workpanda")
         future = asyncio.run_coroutine_threadsafe(agent.call(request), self._loop)
         result = future.result(timeout=timeout_seconds)
-        if not isinstance(result, dict):
-            return {"raw": result}
-        return result
+        return normalize_result(result)
 
     def close(self) -> None:
         try:
@@ -179,18 +193,124 @@ class OctopHarnessExecutor(Executor):
                 message=f"执行异常，结果无法确认：{type(exc).__name__}",
             )
 
+        # 网关可能返回原始 SDK 结构（含 messages），也可能是已归一化的文本；
+        # 两种都要能处理，否则会把"有回复"误读成"空回复"。
+        normalized = _as_normalized(output)
+        text = str(normalized.get("text", ""))
+        outcome, detail = parse_contract(text)
+        succeeded = outcome is ExecutionOutcome.SUCCEEDED
         return ExecutionResult(
-            outcome=ExecutionOutcome.SUCCEEDED,
-            output={"tool": request.tool, "step_id": request.step_id, "runtime": output},
+            outcome=outcome,
+            output={
+                "tool": request.tool,
+                "step_id": request.step_id,
+                "text": text[:2000],
+                "verification": detail,
+                "message_count": normalized.get("message_count", 0),
+            },
+            # 未成功时错误码必须可读：优先用具体原因，否则退回三态本身。
+            error_code=None if succeeded else str(detail.get("reason") or outcome.value),
+            message=None if succeeded else str(detail.get("summary") or "模型未给出可核验结果"),
         )
+
+
+def _as_normalized(output: Any) -> dict[str, Any]:
+    """统一网关返回形状，便于后续取值。"""
+
+    if isinstance(output, dict) and isinstance(output.get("messages"), list):
+        return normalize_result(output)
+    if isinstance(output, dict):
+        return output
+    return normalize_result(output)
+
+
+def normalize_result(result: Any) -> dict[str, Any]:
+    """把 SDK 返回归一化成可持久化的 JSON。
+
+    Octop 的 `call` 返回 LangChain 消息对象，不能直接 json 序列化，
+    这里只保留最后一条助手回复文本和消息条数，避免把内部对象写进数据库。
+    """
+
+    if not isinstance(result, dict):
+        return {"text": str(result)[:4000], "message_count": 0}
+
+    messages = result.get("messages")
+    if not isinstance(messages, list):
+        return {"text": str(result.get("content") or result)[:4000], "message_count": 0}
+
+    text = ""
+    for message in reversed(messages):
+        if getattr(message, "type", "") == "ai" or type(message).__name__ == "AIMessage":
+            content = getattr(message, "content", "")
+            text = content if isinstance(content, str) else str(content)
+            break
+    return {"text": text[:4000], "message_count": len(messages)}
 
 
 def default_prompt(request: ExecutionRequest) -> str:
     """只把当前步骤需要的信息交给运行时，避免整体流程与无关数据外泄。"""
 
     arguments = ", ".join(f"{key}={value}" for key, value in sorted(request.arguments.items()))
+    instruction = request.instruction or "执行该步骤并如实报告结果。"
     return (
-        f"流程 {request.flow_id}@{request.flow_version} 的步骤 {request.step_id}，"
-        f"工具 {request.tool}。参数：{arguments or '无'}。"
-        "请只执行该步骤并获得结果，不要自行改变流程或调用其他工具。"
+        f"任务步骤：{request.step_id}\n"
+        f"执行要求：{instruction}\n"
+        f"参数：{arguments or '无'}\n"
+        # tool 是服务端为该步骤选定的能力标识，仅用于记录与审计；
+        # 模型若把它当成"必须调用的工具"就会在找不到时误报失败。
+        f"说明：{request.tool} 是本服务为该步骤选定的能力标识，仅用于服务端记录与审计，"
+        "你不需要在运行时调用同名工具；请直接按执行要求完成本步骤。\n"
+        f"{OUTCOME_CONTRACT}"
     )
+
+
+def parse_contract(text: str) -> tuple[ExecutionOutcome, dict[str, Any]]:
+    """解析模型返回的结构化契约。
+
+    只有明确声明 succeeded 且给出可核验依据时才认为成功；
+    解析失败、缺少依据或自述无法完成，一律按"未确认"处理，绝不默认成功。
+    """
+
+    payload = _extract_json(text)
+    if payload is None:
+        return ExecutionOutcome.UNCONFIRMED, {
+            "reason": "unparsable_output",
+            "summary": text[:300],
+        }
+
+    raw_outcome = str(payload.get("outcome", "")).strip().lower()
+    evidence = str(payload.get("evidence", "")).strip()
+    summary = str(payload.get("summary", "")).strip()
+
+    if raw_outcome == ExecutionOutcome.SUCCEEDED.value:
+        if not evidence:
+            return ExecutionOutcome.UNCONFIRMED, {
+                "reason": "missing_evidence",
+                "summary": summary,
+            }
+        return ExecutionOutcome.SUCCEEDED, {"summary": summary, "evidence": evidence}
+
+    if raw_outcome == ExecutionOutcome.FAILED.value:
+        return ExecutionOutcome.FAILED, {"summary": summary, "evidence": evidence}
+
+    return ExecutionOutcome.UNCONFIRMED, {
+        "reason": raw_outcome or "unspecified_outcome",
+        "summary": summary,
+    }
+
+
+def _extract_json(text: str) -> dict[str, Any] | None:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.lstrip().lower().startswith("json"):
+            cleaned = cleaned.lstrip()[4:]
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        parsed = json.loads(cleaned[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None

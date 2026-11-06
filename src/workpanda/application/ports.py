@@ -34,6 +34,8 @@ class ExecutionRequest(BaseModel):
     flow_version: str
     step_id: str
     tool: str
+    # 由流程定义给出的本步骤指令，运行时只能照做，不能自行改写。
+    instruction: str | None = None
     arguments: dict[str, str] = Field(default_factory=dict)
 
 

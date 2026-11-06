@@ -159,6 +159,7 @@ class FlowRunner:
                 flow_version=flow.version,
                 step_id=step.step_id,
                 tool=step.tool or "",
+                instruction=step.instruction,
                 arguments=dict(task.slots),
             )
         )
@@ -184,17 +185,25 @@ class FlowRunner:
             task.result = result.output
             return None
 
+        # 失败与未确认同样要留痕：事后必须能回答"当时模型说了什么、依据是什么"，
+        # 否则无法复盘，也无法向群众解释为什么要转人工。
+        diagnostics = _diagnostics(result)
+
         if result.outcome is ExecutionOutcome.UNCONFIRMED:
             # 外部结果未知：不得重试，保留为待确认并引导人工核实。
             task.failure_code = result.error_code or "outcome_unconfirmed"
             task.failure_message = result.message
             self._move(task, TaskStatus.OUTCOME_UNCONFIRMED)
-            self.emit(task, EventType.OUTCOME_UNCONFIRMED, {"step_id": step.step_id})
+            self.emit(
+                task,
+                EventType.OUTCOME_UNCONFIRMED,
+                {"step_id": step.step_id, **diagnostics},
+            )
             return self._persist(task)
 
         task.failure_code = result.error_code or "execution_failed"
         task.failure_message = result.message
-        self.emit(task, EventType.EXECUTION_FAILED, {"step_id": step.step_id})
+        self.emit(task, EventType.EXECUTION_FAILED, {"step_id": step.step_id, **diagnostics})
         if step.fail_to_handoff:
             return self._handoff(task, step, reason="execution_failed")
 
@@ -225,3 +234,16 @@ class FlowRunner:
     def _persist(self, task: Task) -> Task:
         task.updated_at = utc_now()
         return self.store.save(task)
+
+
+def _diagnostics(result: ExecutionResult) -> dict[str, Any]:
+    """从执行结果里提取可留痕的诊断信息（只保留便于复盘的最小集合）。"""
+
+    output = result.output or {}
+    verification = output.get("verification") or {}
+    return {
+        "failure_code": result.error_code,
+        "message": result.message,
+        "model_text": str(output.get("text", ""))[:1000],
+        "verification": verification if isinstance(verification, dict) else {},
+    }

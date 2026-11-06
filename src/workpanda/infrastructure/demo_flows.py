@@ -22,8 +22,12 @@ DEMO_FLOW = FlowDefinition(
         StepDefinition(
             step_id="execute_demo",
             kind=StepKind.EXECUTE,
-            title="执行自检动作",
-            tool="demo.echo",
+            title="模型回显自检",
+            tool="model.echo",
+            instruction=(
+                "把参数 subject 的值原样返回，不要改写；"
+                "并在 evidence 中给出你实际返回的内容，作为可核验依据。"
+            ),
             requires_confirmation=True,
             confirm_message="即将提交以下信息，请确认。",
         ),
