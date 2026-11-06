@@ -18,6 +18,11 @@ from workpanda.harness.builtin import default_registry
 from workpanda.harness.cancel import CancelRegistry
 from workpanda.harness.checkpoint import CheckpointStore, InMemoryCheckpointStore
 from workpanda.harness.executor import HarnessExecutor
+from workpanda.harness.lease import (
+    InMemoryStepLeaseStore,
+    SqliteStepLeaseStore,
+    StepLeaseStore,
+)
 from workpanda.harness.openai_client import OpenAICompatibleClient
 from workpanda.harness.redaction import DEFAULT_REDACTOR, NO_REDACTION
 from workpanda.harness.trace import InMemoryTraceStore, TraceStore
@@ -103,6 +108,23 @@ def build_checkpoint_store(
     return InMemoryCheckpointStore(), []
 
 
+def build_lease_store(
+    settings: Settings,
+) -> tuple[StepLeaseStore | None, list[Callable[[], None]]]:
+    """步骤租约。默认关闭：单进程顺序执行不需要，多进程试点显式开启。
+
+    开启时后端跟随任务存储：SQLite 与任务库同文件，因此同机跨进程互斥；
+    内存后端只挡同一进程内的并发。跨主机多实例仍需换共享锁。
+    """
+
+    if not settings.harness_lease_enabled:
+        return None, []
+    if settings.store_backend == "sqlite":
+        store = SqliteStepLeaseStore(settings.sqlite_path)
+        return store, [store.close]
+    return InMemoryStepLeaseStore(), []
+
+
 def build_container(
     settings: Settings | None = None,
     *,
@@ -151,6 +173,7 @@ def build_container(
                 trust_env=settings.model_trust_env,
             )
             checkpoints, checkpoint_closers = build_checkpoint_store(settings)
+            leases, lease_closers = build_lease_store(settings)
             executor_instance: Executor = HarnessExecutor(
                 model_client,
                 registry=tool_registry,
@@ -168,11 +191,14 @@ def build_container(
                 checkpoints=checkpoints,
                 resume_enabled=settings.harness_resume_enabled,
                 resume_ttl_seconds=settings.harness_resume_ttl_seconds,
+                leases=leases,
+                lease_ttl_seconds=settings.harness_lease_ttl_seconds,
                 cancellations=cancellations,
             )
             closers.append(model_client.close)
             closers.extend(tool_closers)
             closers.extend(checkpoint_closers)
+            closers.extend(lease_closers)
         elif settings.octop_enabled:
             gateway = OctopHarnessGateway(
                 agent_name=settings.octop_agent_name,
