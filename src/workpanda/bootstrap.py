@@ -14,6 +14,7 @@ from workpanda.domain.flow import FlowDefinition, FlowRegistry
 from workpanda.domain.identity import SessionSigner, new_secret
 from workpanda.domain.repository import ConfirmationStore, TaskStore
 from workpanda.harness.builtin import default_registry
+from workpanda.harness.checkpoint import CheckpointStore, InMemoryCheckpointStore
 from workpanda.harness.executor import HarnessExecutor
 from workpanda.harness.openai_client import OpenAICompatibleClient
 from workpanda.harness.redaction import DEFAULT_REDACTOR, NO_REDACTION
@@ -24,6 +25,7 @@ from workpanda.infrastructure.event_broker import EventBroker
 from workpanda.infrastructure.memory_store import InMemoryConfirmationStore, InMemoryTaskStore
 from workpanda.infrastructure.octop_runtime import OctopHarnessExecutor, OctopHarnessGateway
 from workpanda.infrastructure.rate_limit import TokenBucketLimiter
+from workpanda.infrastructure.sqlite_checkpoint_store import SqliteCheckpointStore
 from workpanda.infrastructure.sqlite_store import SqliteStore
 from workpanda.infrastructure.sqlite_trace_store import SqliteTraceStore
 
@@ -65,6 +67,19 @@ def build_trace_store(settings: Settings) -> tuple[TraceStore, list[Callable[[],
         store = SqliteTraceStore(settings.sqlite_path, capacity=settings.harness_trace_capacity)
         return store, [store.close]
     return InMemoryTraceStore(capacity=max(1, settings.harness_trace_capacity)), []
+
+
+def build_checkpoint_store(
+    settings: Settings,
+) -> tuple[CheckpointStore | None, list[Callable[[], None]]]:
+    """断点存储。未开启续跑时既不建库也不落盘，避免留下无人使用的会话原文。"""
+
+    if not settings.harness_resume_enabled:
+        return None, []
+    if settings.store_backend == "sqlite":
+        store = SqliteCheckpointStore(settings.sqlite_path)
+        return store, [store.close]
+    return InMemoryCheckpointStore(), []
 
 
 def build_container(
@@ -109,6 +124,7 @@ def build_container(
                 timeout_seconds=settings.model_timeout_seconds,
                 trust_env=settings.model_trust_env,
             )
+            checkpoints, checkpoint_closers = build_checkpoint_store(settings)
             executor_instance: Executor = HarnessExecutor(
                 model_client,
                 registry=tool_registry,
@@ -119,9 +135,13 @@ def build_container(
                 tool_retries=settings.harness_tool_retries,
                 redactor=DEFAULT_REDACTOR if settings.harness_redact else NO_REDACTION,
                 traces=traces,
+                checkpoints=checkpoints,
+                resume_enabled=settings.harness_resume_enabled,
+                resume_ttl_seconds=settings.harness_resume_ttl_seconds,
             )
             closers.append(model_client.close)
             closers.extend(tool_closers)
+            closers.extend(checkpoint_closers)
         elif settings.octop_enabled:
             gateway = OctopHarnessGateway(
                 agent_name=settings.octop_agent_name,

@@ -202,6 +202,34 @@ def test_loop_executes_tool_then_returns_final_text() -> None:
     assert tool_messages and "echo:hi" in tool_messages[0].content
 
 
+def test_multiple_tool_calls_in_one_response_run_in_order() -> None:
+    """模型一轮里要多个工具时，必须按序执行并把每一条结果都回灌。"""
+
+    echo = EchoTool()
+    client = ScriptedModelClient(
+        [
+            ModelResponse(
+                tool_calls=[
+                    tool_call("test_echo", call_id="a", text="1"),
+                    tool_call("test_echo", call_id="b", text="2"),
+                ]
+            ),
+            ModelResponse(text=SUCCESS),
+        ]
+    )
+    loop = AgentLoop(client, max_steps=4, max_tool_calls=4)
+    grant = ToolGrant(registry=registry_with(echo), allowed=frozenset({"test_echo"}))
+
+    result = loop.run(system_prompt="s", user_prompt="u", grant=grant, context=context())
+
+    assert echo.calls == [{"text": "1"}, {"text": "2"}]
+    assert [record.call_id for record in result.tool_calls] == ["a", "b"]
+    tool_messages = [
+        message for message in client.calls[1]["messages"] if message.role is MessageRole.TOOL
+    ]
+    assert [message.content for message in tool_messages] == ["echo:1", "echo:2"]
+
+
 def test_loop_stops_on_max_steps_and_reports_budget() -> None:
     endless = ModelResponse(tool_calls=[tool_call("test_echo", call_id="c", text="hi")])
     client = ScriptedModelClient([endless] * 5)

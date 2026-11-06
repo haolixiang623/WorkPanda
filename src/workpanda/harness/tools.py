@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 from uuid import UUID
@@ -120,6 +120,34 @@ class ToolGrant:
     @property
     def risks(self) -> list[RiskLevel]:
         return [spec.risk for spec in self.specs]
+
+    def state(self) -> dict[str, Any]:
+        """导出执行期状态，供断点续跑时原样恢复。
+
+        必须包含"已成功副作用指纹"：少了它，续跑就会把已经提交过的
+        非幂等操作再提交一次。
+        """
+
+        return {
+            "attempts": dict(self._attempts),
+            "succeeded_effects": dict(self._succeeded_effects),
+        }
+
+    def restore(self, state: Mapping[str, Any]) -> None:
+        """恢复执行期状态。只接受可解析的键值，异常数据一律忽略而不是击穿执行。"""
+
+        attempts = state.get("attempts")
+        if isinstance(attempts, dict):
+            self._attempts = {
+                str(name): int(count)
+                for name, count in attempts.items()
+                if isinstance(count, int) and count >= 0
+            }
+        effects = state.get("succeeded_effects")
+        if isinstance(effects, dict):
+            self._succeeded_effects = {
+                str(fingerprint): str(call_id) for fingerprint, call_id in effects.items()
+            }
 
     def call(self, call: ToolCall, context: ToolContext) -> ToolCallRecord:
         """执行一次调用。无论成功失败都返回可留痕记录，不向调用方抛异常。"""

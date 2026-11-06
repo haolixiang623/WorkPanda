@@ -49,6 +49,8 @@ class TraceRecord(BaseModel):
     timed_out_tool_calls: int = Field(default=0, ge=0)
     tokens: int = Field(default=0, ge=0)
     duration_ms: int = Field(default=0, ge=0)
+    # 这次执行是从哪个 trace 续跑来的。为空表示从零开始，事后据此判断"重试了几次"。
+    resumed_from: str | None = None
     created_at: datetime = Field(default_factory=_utc_now)
 
 

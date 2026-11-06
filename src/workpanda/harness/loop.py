@@ -4,17 +4,19 @@
 
 - 循环必须可终止：步数、工具调用次数、总耗时三重上限；
 - 超预算不是"失败"，而是"未确认"——此刻可能已经调用过有副作用的工具；
-- 每一次模型调用和工具调用都写进 trace，事后必须能完整重放发生了什么。
+- 每一次模型调用和工具调用都写进 trace，事后必须能完整重放发生了什么；
+- 每次工具调用落账后回调进度快照，使中断后可以从最近一次已知状态续跑。
 """
 
 from __future__ import annotations
 
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 
 from workpanda.harness.budget import Budget, BudgetExhausted
+from workpanda.harness.checkpoint import ExecutionSnapshot
 from workpanda.harness.clients import ModelClient, ModelError, ModelTimeout
 from workpanda.harness.models import (
     EventKind,
@@ -99,25 +101,59 @@ class AgentLoop:
         user_prompt: str,
         grant: ToolGrant,
         context: ToolContext,
+        resume: ExecutionSnapshot | None = None,
+        on_progress: Callable[[ExecutionSnapshot], None] | None = None,
     ) -> LoopResult:
+        """执行一次有界循环。
+
+        `resume` 不为空时从断点继续：对话、已发生的工具调用与预算用量都接着算，
+        不重新发一次"从头开始"的请求；`on_progress` 在每个工具调用落账后回调，
+        供调用方落 checkpoint——回调失败不得击穿执行。
+        """
+
         started = time.monotonic()
         budget = Budget(
             max_steps=self._max_steps,
             max_tool_calls=self._max_tool_calls,
             max_tokens=self._max_tokens,
             deadline_seconds=self._deadline_seconds,
+            initial_steps=resume.steps if resume is not None else 0,
+            initial_tool_calls=resume.tool_call_count if resume is not None else 0,
+            initial_tokens=resume.tokens if resume is not None else 0,
         )
-        messages: list[HarnessMessage] = [
-            HarnessMessage(role=MessageRole.SYSTEM, content=system_prompt),
-            HarnessMessage(role=MessageRole.USER, content=user_prompt),
-        ]
+        if resume is not None:
+            messages = [message.model_copy(deep=True) for message in resume.messages]
+        else:
+            messages = [
+                HarnessMessage(role=MessageRole.SYSTEM, content=system_prompt),
+                HarnessMessage(role=MessageRole.USER, content=user_prompt),
+            ]
         events: list[HarnessEvent] = []
-        records: list[ToolCallRecord] = []
+        records: list[ToolCallRecord] = (
+            [record.model_copy(deep=True) for record in resume.tool_calls]
+            if resume is not None
+            else []
+        )
         model_calls = 0
         empty_responses = 0
 
         def emit(kind: EventKind, data: dict) -> None:
             events.append(HarnessEvent(sequence=len(events) + 1, kind=kind, data=data))
+
+        def report_progress() -> None:
+            if on_progress is None:
+                return
+            snapshot = ExecutionSnapshot(
+                messages=[message.model_copy(deep=True) for message in messages],
+                tool_calls=[record.model_copy(deep=True) for record in records],
+                steps=budget.steps,
+                tool_call_count=budget.tool_calls,
+                tokens=budget.tokens,
+            )
+            try:
+                on_progress(snapshot)
+            except Exception:  # noqa: BLE001 - 落盘失败只影响恢复能力，不该中断真实执行
+                return
 
         def finish(*args, **kwargs) -> LoopResult:
             """统一收尾：把预算用量补进 stopped 事件，事后能判断是否被预算掐断。"""
@@ -169,6 +205,8 @@ class AgentLoop:
                                 content=_tool_content(record),
                             )
                         )
+                        # 工具调用一旦落账就可能是副作用，必须立刻可恢复。
+                        report_progress()
                     continue
 
                 text = response.text.strip()

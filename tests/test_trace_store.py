@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import uuid
 from pathlib import Path
 
@@ -118,6 +119,38 @@ def test_zero_capacity_keeps_everything(workdir: Path) -> None:
         assert len(store) == 3
     finally:
         store.close()
+
+
+def test_existing_table_is_migrated_for_resume_lineage(workdir: Path) -> None:
+    """老库没有 resumed_from 列，升级后必须自动补列而不是启动即失败。"""
+
+    path = workdir / "old.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE harness_traces (
+            trace_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, flow_id TEXT NOT NULL,
+            flow_version TEXT NOT NULL, step_id TEXT NOT NULL, outcome TEXT NOT NULL,
+            stop_reason TEXT NOT NULL, error_code TEXT, risk TEXT NOT NULL,
+            model_calls INTEGER NOT NULL, tool_calls INTEGER NOT NULL,
+            successful_tool_calls INTEGER NOT NULL, blocked_tool_calls INTEGER NOT NULL,
+            failed_tool_calls INTEGER NOT NULL, timed_out_tool_calls INTEGER NOT NULL,
+            tokens INTEGER NOT NULL, duration_ms INTEGER NOT NULL, created_at TEXT NOT NULL
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = SqliteTraceStore(path)
+    try:
+        store.save(record(trace_id="after-migration"))
+        items = store.list()
+    finally:
+        store.close()
+
+    assert [item.trace_id for item in items] == ["after-migration"]
+    assert items[0].resumed_from is None
 
 
 def test_trace_backend_resolution() -> None:

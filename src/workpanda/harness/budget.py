@@ -26,6 +26,11 @@ class Budget:
     deadline_seconds: float = 45.0
     # 0 表示不限制。仅在模型服务上报 usage 时才生效——不上报就无从统计。
     max_tokens: int = 0
+    # 续跑时带入的已用量：预算按"整个步骤"计，不按"每次尝试"计，
+    # 否则断点续跑等于凭空多出一份配额。
+    initial_steps: int = 0
+    initial_tool_calls: int = 0
+    initial_tokens: int = 0
     _started: float = field(default=0.0, init=False, repr=False)
     _steps: int = field(default=0, init=False, repr=False)
     _tool_calls: int = field(default=0, init=False, repr=False)
@@ -33,6 +38,9 @@ class Budget:
 
     def __post_init__(self) -> None:
         self._started = time.monotonic()
+        self._steps = max(0, self.initial_steps)
+        self._tool_calls = max(0, self.initial_tool_calls)
+        self._tokens = max(0, self.initial_tokens)
 
     @property
     def steps(self) -> int:

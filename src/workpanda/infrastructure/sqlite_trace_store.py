@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS harness_traces (
     timed_out_tool_calls INTEGER NOT NULL,
     tokens INTEGER NOT NULL,
     duration_ms INTEGER NOT NULL,
+    resumed_from TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -75,8 +76,16 @@ FROM harness_traces
 _COLUMNS = (
     "trace_id, task_id, flow_id, flow_version, step_id, outcome, stop_reason, error_code,"
     " risk, model_calls, tool_calls, successful_tool_calls, blocked_tool_calls,"
-    " failed_tool_calls, timed_out_tool_calls, tokens, duration_ms, created_at"
+    " failed_tool_calls, timed_out_tool_calls, tokens, duration_ms, resumed_from, created_at"
 )
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    """老库补列。CREATE TABLE IF NOT EXISTS 不会修改已存在的表。"""
+
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(harness_traces)")}
+    if "resumed_from" not in existing:
+        conn.execute("ALTER TABLE harness_traces ADD COLUMN resumed_from TEXT")
 
 
 class SqliteTraceStore:
@@ -92,7 +101,10 @@ class SqliteTraceStore:
         self._lock = Lock()
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # 与任务库共用文件时，短暂写冲突应等待而不是直接抛 locked。
+        self._conn.execute("PRAGMA busy_timeout = 3000")
         self._conn.executescript(SCHEMA)
+        _ensure_columns(self._conn)
         self._conn.commit()
 
     def close(self) -> None:
@@ -103,7 +115,7 @@ class SqliteTraceStore:
         with self._lock:
             self._conn.execute(
                 f"INSERT OR REPLACE INTO harness_traces ({_COLUMNS})"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     record.trace_id,
                     str(record.task_id),
@@ -122,6 +134,7 @@ class SqliteTraceStore:
                     record.timed_out_tool_calls,
                     record.tokens,
                     record.duration_ms,
+                    record.resumed_from,
                     record.created_at.isoformat(),
                 ),
             )
@@ -198,5 +211,6 @@ class SqliteTraceStore:
             timed_out_tool_calls=int(row["timed_out_tool_calls"]),
             tokens=int(row["tokens"]),
             duration_ms=int(row["duration_ms"]),
+            resumed_from=row["resumed_from"],
             created_at=datetime.fromisoformat(row["created_at"]),
         )
