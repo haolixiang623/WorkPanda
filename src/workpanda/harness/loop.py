@@ -482,11 +482,11 @@ class AgentLoop:
             },
         )
         # 先把整批预算扣掉：并发执行中途才发现预算不够，等于让部分调用"白跑"。
-        # 扣不动时（只可能是截止时间已经耗尽）这一批一条都没提交，同样要留痕：
-        # 助手消息已经在历史里，不补回执就会留下畸形对话，续跑必被网关 400 拒。
+        # 预扣是原子的（全成或全不成）：半途失败会留下"扣了两条、只提交一条"的错账。
+        # 扣不动时这一批一条都没提交，同样要留痕——助手消息已经在历史里，
+        # 不补回执就会留下畸形对话，续跑必被网关 400 拒。
         try:
-            for _ in calls:
-                budget.consume_tool_call()
+            budget.reserve_tool_calls(len(calls))
         except BudgetExhausted as exc:
             on_skip(calls, exc, mirror_messages=True)
             raise

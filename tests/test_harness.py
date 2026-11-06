@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from workpanda.application.ports import ExecutionOutcome, ExecutionRequest
+from workpanda.harness.budget import Budget, BudgetExhausted
 from workpanda.harness.builtin import HttpFetchTool, SystemClockTool
 from workpanda.harness.clients import ModelError, ModelTimeout, ScriptedModelClient, tool_call
 from workpanda.harness.contract import parse_contract
@@ -1245,3 +1246,101 @@ def test_tool_call_limit_holds_under_concurrency() -> None:
         ToolOutcome.OK,
     ]
     assert len(tool.windows) == 1
+
+
+def test_parallel_batch_that_loses_the_deadline_is_recorded_and_stays_resumable() -> None:
+    """并发批次已提交、却在扣预算那一步撞上截止时间：不能凭空消失。
+
+    这条路径比串行更隐蔽：`tools_parallel` 事件已经写下、助手消息已经进了对话历史，
+    但预算预扣抛出的异常没人接住。结果是两条调用既没执行、也不在留痕里，而且
+    断点里留下"assistant 带两条 tool_calls、却一条 tool 回执都没有"的畸形对话——
+    续跑时拿它去请求模型会被网关直接 400 拒掉。
+    """
+
+    tool = TimedTool("test_sleep_a")
+    batch = ModelResponse(
+        tool_calls=[
+            tool_call("test_sleep_a", call_id="a", seconds=0.01),
+            tool_call("test_sleep_a", call_id="b", seconds=0.01),
+        ]
+    )
+
+    class DeadlineEatingClient:
+        """模型往返先把剩余时间吃掉，让整批调用卡在预算预扣上。"""
+
+        def __init__(self) -> None:
+            self.calls: list[Any] = []
+
+        def complete(self, **kwargs: Any) -> ModelResponse:
+            self.calls.append(kwargs)
+            time.sleep(0.05)
+            return batch
+
+    client = DeadlineEatingClient()
+    snapshots: list[Any] = []
+    loop = AgentLoop(
+        client, max_steps=4, max_tool_calls=8, deadline_seconds=0.01, tool_concurrency=4
+    )
+
+    result = loop.run(
+        system_prompt="s",
+        user_prompt="u",
+        grant=ToolGrant(registry=registry_with(tool), allowed=frozenset({"test_sleep_a"})),
+        context=ToolContext(
+            task_id=__import__("uuid").uuid4(), flow_id="f", step_id="s", remaining_seconds=0.01
+        ),
+        on_progress=snapshots.append,
+    )
+
+    assert result.stop_reason is StopReason.DEADLINE
+    # 一条都没轮到时也要留下记录，否则事后答不出"模型还要求了什么"。
+    assert [record.outcome for record in result.tool_calls] == [
+        ToolOutcome.SKIPPED,
+        ToolOutcome.SKIPPED,
+    ]
+    assert result.tool_calls[0].error_code == "budget_deadline"
+    assert EventKind.TOOL_SKIPPED in [event.kind for event in result.events]
+    assert tool.windows == [], "预算不足时一条都不能真的执行"
+    # 断点里的对话必须合法：assistant 的每条 tool_calls 都要有对应 tool 回执。
+    last = snapshots[-1]
+    assistant = next(
+        message for message in reversed(last.messages) if message.role is MessageRole.ASSISTANT
+    )
+    tool_ids = [
+        message.tool_call_id for message in last.messages if message.role is MessageRole.TOOL
+    ]
+    assert [call.call_id for call in assistant.tool_calls] == tool_ids == ["a", "b"]
+
+
+def test_reserve_tool_calls_is_all_or_nothing() -> None:
+    """整批预约必须全成或全不成。
+
+    逐条 `consume_tool_call` 在半途失败时，会留下"预算已扣 N 条、实际一条都没
+    提交"的错账——事后按预算用量核对"做了几次"就对不上了。
+    """
+
+    budget = Budget(max_steps=1, max_tool_calls=3, deadline_seconds=30)
+
+    budget.reserve_tool_calls(3)
+    assert budget.tool_calls == 3
+
+    # 再要一条就超上限：整批不扣，一条都不加。
+    with pytest.raises(BudgetExhausted):
+        budget.reserve_tool_calls(1)
+    assert budget.tool_calls == 3
+
+    # 一次要 4 条同样整批失败，而不是先扣掉能扣的那部分。
+    short = Budget(max_steps=1, max_tool_calls=3, deadline_seconds=30)
+    with pytest.raises(BudgetExhausted):
+        short.reserve_tool_calls(4)
+    assert short.tool_calls == 0
+
+
+def test_reserve_tool_calls_refuses_when_deadline_already_passed() -> None:
+    budget = Budget(max_steps=1, max_tool_calls=8, deadline_seconds=0.0)
+
+    with pytest.raises(BudgetExhausted) as excinfo:
+        budget.reserve_tool_calls(2)
+
+    assert excinfo.value.reason == "deadline"
+    assert budget.tool_calls == 0, "扣不动就不该扣"

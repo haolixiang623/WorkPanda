@@ -90,6 +90,21 @@ class Budget:
             raise BudgetExhausted("max_tool_calls")
         self._tool_calls += 1
 
+    def reserve_tool_calls(self, count: int) -> None:
+        """一次性预约整批调用，全成或全不成。
+
+        并发批次必须要么整批扣下、要么一条都不扣：逐条 `consume_tool_call` 在半途
+        失败时会留下"预算已扣了两条、实际只提交了一条"的错账，事后按用量排查会
+        对不上。只可能是截止时间或次数上限让它失败，两种情况都先判后扣。
+        """
+
+        if count <= 0:
+            return
+        self.check_deadline()
+        if self._tool_calls + count > self.max_tool_calls:
+            raise BudgetExhausted("max_tool_calls")
+        self._tool_calls += count
+
     def consume_tokens(self, tokens: int) -> None:
         """累计模型用量。超出上限时立即中止，不再发起下一轮调用。"""
 
