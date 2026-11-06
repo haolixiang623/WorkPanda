@@ -77,6 +77,8 @@ class SqliteStore:
         self._lock = Lock()
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # trace / checkpoint 与任务数据共用同一个文件，短暂写冲突应等待而不是直接抛 locked。
+        self._conn.execute("PRAGMA busy_timeout = 3000")
         self._conn.executescript(SCHEMA)
         self._conn.commit()
 
