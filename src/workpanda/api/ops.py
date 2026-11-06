@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from workpanda.api.dependencies import get_container
 from workpanda.bootstrap import Container
 from workpanda.domain.models import TaskEvent, TaskStatus, TaskView
+from workpanda.harness.trace import TraceRecord, TraceSummary
 
 router = APIRouter(prefix="/api/ops", tags=["ops"])
 
@@ -63,3 +64,30 @@ async def list_events(
     container: Container = Depends(get_container),
 ) -> list[TaskEvent]:
     return list(container.tasks.ops_events(task_id, after_sequence=after))
+
+
+@router.get(
+    "/traces/summary",
+    response_model=TraceSummary,
+    dependencies=[Depends(require_ops_token)],
+)
+async def trace_summary(
+    task_id: UUID | None = Query(default=None),
+    container: Container = Depends(get_container),
+) -> TraceSummary:
+    """聚合指标：未确认占比是最关键的健康信号，不是任务数量。"""
+
+    return container.traces.summary(task_id=task_id)
+
+
+@router.get(
+    "/traces",
+    response_model=list[TraceRecord],
+    dependencies=[Depends(require_ops_token)],
+)
+async def list_traces(
+    task_id: UUID | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    container: Container = Depends(get_container),
+) -> list[TraceRecord]:
+    return container.traces.list(task_id=task_id, limit=limit)

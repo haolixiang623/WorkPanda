@@ -1,27 +1,13 @@
 """SQLite 存储：持久化、事件顺序和凭证一次性。"""
 
-import shutil
 from collections.abc import Iterator
 from pathlib import Path
-from uuid import uuid4
 
 import pytest
 
 from workpanda.domain.confirmation import Confirmation, ConfirmationError, parameter_digest
 from workpanda.domain.models import EventType, Task, TaskStatus
 from workpanda.infrastructure.sqlite_store import SqliteStore
-
-
-@pytest.fixture
-def workdir() -> Iterator[Path]:
-    """在仓库内创建临时目录，避免依赖系统临时目录的权限与清理策略。"""
-
-    root = Path(".pytest-tmp") / uuid4().hex
-    root.mkdir(parents=True, exist_ok=True)
-    try:
-        yield root
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
 
 
 @pytest.fixture

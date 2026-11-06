@@ -17,6 +17,7 @@ from workpanda.harness.models import (
     HarnessMessage,
     MessageRole,
     ModelResponse,
+    TokenUsage,
     ToolCall,
     ToolSpec,
 )
@@ -142,6 +143,8 @@ def _parse_completion(data: dict[str, Any]) -> ModelResponse:
         text=content if isinstance(content, str) else "",
         tool_calls=[call for call in tool_calls if call is not None],
         finish_reason=choices[0].get("finish_reason"),
+        # 有的网关不返回 usage；拿不到就不统计，绝不用字符数估算。
+        usage=TokenUsage.from_payload(data.get("usage")),
     )
 
 

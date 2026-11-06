@@ -2,13 +2,23 @@
 
 映射原则与 Octop 适配器一致：只有确定成功才报成功。
 额外多一道守卫：本步骤有可用工具、模型却一次都没成功调用，却声称 succeeded，
-一律降为"未确认"——这类"口头成功"是最容易被当成办理完成的假象。
+一律降为"未确认"——这类"口头成功"最容易被当成办理完成的假象。
+
+四条与"落盘"有关的约定：
+
+1. 回灌给模型的内容保持原样，落盘/对外的一律脱敏（见 `redaction.py`）；
+2. 每次执行生成一个 `trace_id`，并把摘要写入 TraceStore，供运维检索与聚合；
+3. 每个工具调用落账后写 checkpoint，中断后可续跑；续跑成功时新 trace 记为
+   `resumed_from`，事后能看出"这一次是从哪一次接着跑的"；
+4. checkpoint 遇到"结果未知"（工具超时）即标为不可续跑，续跑请求一律拒绝，
+   不做盲目重试。
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
+from uuid import uuid4
 
 from workpanda.application.ports import (
     ExecutionOutcome,
@@ -16,15 +26,28 @@ from workpanda.application.ports import (
     ExecutionResult,
     Executor,
 )
+from workpanda.harness.checkpoint import (
+    CheckpointStore,
+    ExecutionSnapshot,
+    HarnessCheckpoint,
+)
 from workpanda.harness.clients import ModelClient
 from workpanda.harness.contract import OUTCOME_CONTRACT, parse_contract
 from workpanda.harness.loop import AgentLoop, LoopResult, StopReason
-from workpanda.harness.models import max_risk
-from workpanda.harness.tools import ToolContext, ToolGrant, ToolRegistry
+from workpanda.harness.models import ToolCallRecord, ToolOutcome, max_risk
+from workpanda.harness.redaction import DEFAULT_REDACTOR, Redactor, mask_values
+from workpanda.harness.tools import (
+    ToolContext,
+    ToolGrant,
+    ToolRegistry,
+    ToolResultSummary,
+)
+from workpanda.harness.trace import TraceRecord, TraceStore
 
 STOP_ERROR_CODES: dict[StopReason, str] = {
     StopReason.MAX_STEPS: "budget_max_steps",
     StopReason.MAX_TOOL_CALLS: "budget_max_tool_calls",
+    StopReason.MAX_TOKENS: "budget_max_tokens",
     StopReason.DEADLINE: "budget_deadline",
     StopReason.MODEL_TIMEOUT: "model_timeout",
     StopReason.MODEL_ERROR: "model_error",
@@ -34,6 +57,7 @@ STOP_ERROR_CODES: dict[StopReason, str] = {
 STOP_MESSAGES: dict[StopReason, str] = {
     StopReason.MAX_STEPS: "步骤数超出上限，结果无法确认。",
     StopReason.MAX_TOOL_CALLS: "工具调用次数超出上限，结果无法确认。",
+    StopReason.MAX_TOKENS: "模型用量超出上限，结果无法确认。",
     StopReason.DEADLINE: "执行超出时间上限，结果无法确认。",
     StopReason.MODEL_TIMEOUT: "模型调用超时，结果无法确认。",
     StopReason.MODEL_ERROR: "模型调用失败，结果无法确认。",
@@ -51,8 +75,15 @@ class HarnessExecutor(Executor):
         step_tools: Mapping[str, Sequence[str]] | None = None,
         max_steps: int = 6,
         max_tool_calls: int = 8,
+        max_tokens: int = 0,
         deadline_seconds: float = 45.0,
         require_tool_call: bool = True,
+        tool_retries: int = 1,
+        redactor: Redactor | None = None,
+        traces: TraceStore | None = None,
+        checkpoints: CheckpointStore | None = None,
+        resume_enabled: bool = False,
+        resume_ttl_seconds: float = 900.0,
         prompt_builder: Callable[[ExecutionRequest, ToolGrant], tuple[str, str]] | None = None,
     ) -> None:
         self._registry = registry
@@ -60,16 +91,29 @@ class HarnessExecutor(Executor):
         self._step_tools = step_tools or {}
         self._deadline_seconds = deadline_seconds
         self._require_tool_call = require_tool_call
+        self._tool_retries = max(0, tool_retries)
+        self._redactor = redactor or DEFAULT_REDACTOR
+        self._traces = traces
+        self._checkpoints = checkpoints
+        # 默认关闭：续跑会让"一次执行的中间状态"留存下来，属于需要显式开启的能力。
+        self._resume_enabled = resume_enabled and checkpoints is not None
+        self._resume_ttl_seconds = resume_ttl_seconds
         self._prompt_builder = prompt_builder or default_step_prompt
         self._loop = AgentLoop(
             client,
             max_steps=max_steps,
             max_tool_calls=max_tool_calls,
+            max_tokens=max_tokens,
             deadline_seconds=deadline_seconds,
         )
 
     def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        trace_id = uuid4().hex
         grant = self._grant(request)
+        snapshot, resumed_from, refusal = self._resume_state(request, grant)
+        if refusal is not None:
+            return self._refuse(request, grant, trace_id, *refusal)
+
         system_prompt, user_prompt = self._prompt_builder(request, grant)
         result = self._loop.run(
             system_prompt=system_prompt,
@@ -81,17 +125,43 @@ class HarnessExecutor(Executor):
                 step_id=request.step_id,
                 remaining_seconds=self._deadline_seconds,
             ),
+            resume=snapshot,
+            on_progress=self._progress_recorder(request, grant, trace_id),
         )
-        output = self._output(request, grant, result)
+        output = self._output(request, grant, result, trace_id, resumed_from)
+        # trace 只统计"这次尝试"发生的调用；断点里带过来的记录仍然算依据，但不重复计数。
+        executed = (
+            result.tool_calls[len(snapshot.tool_calls) :]
+            if snapshot is not None
+            else result.tool_calls
+        )
 
         if result.stop_reason is not StopReason.COMPLETED:
-            # 预算耗尽或模型异常：可能已经调用过有副作用的工具，不能报失败后重试。
-            return ExecutionResult(
-                outcome=ExecutionOutcome.UNCONFIRMED,
-                output=output,
-                error_code=result.error_code or STOP_ERROR_CODES[result.stop_reason],
-                message=result.error_message or STOP_MESSAGES[result.stop_reason],
+            # 预算耗尽或模型异常：这次执行没有结论，断点保留——后续要么接着跑，
+            # 要么被明确拒绝，绝不能当"没发生过"重新执行一遍。
+            outcome = ExecutionOutcome.UNCONFIRMED
+            error_code = result.error_code or STOP_ERROR_CODES[result.stop_reason]
+            message = result.error_message or STOP_MESSAGES[result.stop_reason]
+            output["verification"] = {"reason": error_code, "summary": message}
+            self._save_trace(
+                request,
+                grant,
+                trace_id=trace_id,
+                outcome=outcome,
+                error_code=error_code,
+                stop_reason=result.stop_reason.value,
+                records=executed,
+                model_calls=result.model_calls,
+                tokens=result.tokens,
+                duration_ms=result.duration_ms,
+                resumed_from=resumed_from,
             )
+            return ExecutionResult(
+                outcome=outcome, output=output, error_code=error_code, message=message
+            )
+
+        # 模型给出了结论（成功/失败/未确认），本步骤已闭环，断点不再有意义。
+        self._discard_checkpoint(request)
 
         outcome, detail = parse_contract(result.text)
 
@@ -103,18 +173,162 @@ class HarnessExecutor(Executor):
             }
 
         if outcome is ExecutionOutcome.SUCCEEDED:
-            detail = {**detail, "tool_evidence": _tool_evidence(result)}
+            detail = {**detail, "tool_evidence": self._tool_evidence(result)}
 
-        output["verification"] = detail
+        output["verification"] = self._redact(detail)
         succeeded = outcome is ExecutionOutcome.SUCCEEDED
+        error_code = None if succeeded else str(detail.get("reason") or outcome.value)
+        message = None if succeeded else str(detail.get("summary") or "模型未给出可核验结果")
+        self._save_trace(
+            request,
+            grant,
+            trace_id=trace_id,
+            outcome=outcome,
+            error_code=error_code,
+            stop_reason=result.stop_reason.value,
+            records=executed,
+            model_calls=result.model_calls,
+            tokens=result.tokens,
+            duration_ms=result.duration_ms,
+            resumed_from=resumed_from,
+        )
+
         return ExecutionResult(
             outcome=outcome,
             output=output,
-            error_code=None if succeeded else str(detail.get("reason") or outcome.value),
-            message=None if succeeded else str(detail.get("summary") or "模型未给出可核验结果"),
+            error_code=error_code,
+            message=message,
         )
 
     # ---------- 内部 ----------
+
+    def _refuse(
+        self,
+        request: ExecutionRequest,
+        grant: ToolGrant,
+        trace_id: str,
+        error_code: str,
+        message: str,
+    ) -> ExecutionResult:
+        """存在断点但不允许续跑：拒绝执行，交人工核实，绝不盲目重来。"""
+
+        output = {
+            "trace_id": trace_id,
+            "tool": request.tool,
+            "step_id": request.step_id,
+            "text": "",
+            "verification": {"reason": error_code, "summary": message},
+            "tool_calls": [],
+            "trace": [],
+            "model_calls": 0,
+            "tokens": 0,
+            "duration_ms": 0,
+            "stop_reason": "refused",
+            "risk": max_risk(grant.risks).value,
+        }
+        self._save_trace(
+            request,
+            grant,
+            trace_id=trace_id,
+            outcome=ExecutionOutcome.UNCONFIRMED,
+            error_code=error_code,
+            stop_reason="refused",
+        )
+        return ExecutionResult(
+            outcome=ExecutionOutcome.UNCONFIRMED,
+            output=output,
+            error_code=error_code,
+            message=message,
+        )
+
+    def _resume_state(
+        self, request: ExecutionRequest, grant: ToolGrant
+    ) -> tuple[ExecutionSnapshot | None, str | None, tuple[str, str] | None]:
+        """决定能否续跑。返回 (快照, 来源 trace_id, 拒绝原因)。"""
+
+        store = self._checkpoints
+        if not self._resume_enabled or store is None:
+            return None, None, None
+
+        checkpoint = store.load(request.task_id, request.step_id)
+        if checkpoint is None:
+            return None, None, None
+
+        if (
+            checkpoint.flow_id != request.flow_id
+            or checkpoint.flow_version != request.flow_version
+            or checkpoint.step_id != request.step_id
+            or tuple(checkpoint.allowed_tools) != grant.names
+        ):
+            return (
+                None,
+                None,
+                (
+                    "checkpoint_mismatch",
+                    "断点与本次执行的流程版本或授权工具不一致，已拒绝续跑，请人工核实。",
+                ),
+            )
+        if not checkpoint.resumable:
+            return (
+                None,
+                None,
+                (
+                    "checkpoint_not_resumable",
+                    "上次执行存在结果未知的工具调用，不能续跑；请人工确认外部系统状态。",
+                ),
+            )
+        if checkpoint.is_expired(self._resume_ttl_seconds):
+            return (
+                None,
+                None,
+                (
+                    "checkpoint_expired",
+                    "断点已超过保留时限，可能已被其他操作影响，请人工核实后再处理。",
+                ),
+            )
+
+        grant.restore(checkpoint.grant_state)
+        return checkpoint.snapshot, checkpoint.trace_id, None
+
+    def _progress_recorder(
+        self, request: ExecutionRequest, grant: ToolGrant, trace_id: str
+    ) -> Callable[[ExecutionSnapshot], None] | None:
+        """每个工具调用落账后写一次 checkpoint。未开启续跑时不产生任何落盘。"""
+
+        store = self._checkpoints
+        if not self._resume_enabled or store is None:
+            return None
+
+        def save(snapshot: ExecutionSnapshot) -> None:
+            # 任何一个工具出现"结果未知"，整次执行都不可续跑：外部可能已经执行。
+            timed_out = any(
+                record.outcome is ToolOutcome.TIMEOUT for record in snapshot.tool_calls
+            )
+            store.save(
+                HarnessCheckpoint(
+                    trace_id=trace_id,
+                    task_id=request.task_id,
+                    flow_id=request.flow_id,
+                    flow_version=request.flow_version,
+                    step_id=request.step_id,
+                    allowed_tools=list(grant.names),
+                    snapshot=snapshot,
+                    grant_state=grant.state(),
+                    resumable=not timed_out,
+                    blocked_reason="tool_timeout" if timed_out else None,
+                )
+            )
+
+        return save
+
+    def _discard_checkpoint(self, request: ExecutionRequest) -> None:
+        store = self._checkpoints
+        if store is None:
+            return
+        try:
+            store.delete(request.task_id, request.step_id)
+        except Exception:  # noqa: BLE001 - 清理失败不应影响已经得出的结论
+            return
 
     def _unverified_success(self, grant: ToolGrant, result: LoopResult) -> bool:
         if not self._require_tool_call:
@@ -130,40 +344,150 @@ class HarnessExecutor(Executor):
         if self._allow_request_tool and request.tool:
             names.add(request.tool)
         allowed = frozenset(name for name in names if self._registry.get(name) is not None)
-        return ToolGrant(registry=self._registry, allowed=allowed)
+        return ToolGrant(
+            registry=self._registry,
+            allowed=allowed,
+            max_attempts=self._tool_retries + 1,
+            call_timeout_seconds=self._deadline_seconds,
+        )
 
     def _output(
-        self, request: ExecutionRequest, grant: ToolGrant, result: LoopResult
+        self,
+        request: ExecutionRequest,
+        grant: ToolGrant,
+        result: LoopResult,
+        trace_id: str,
+        resumed_from: str | None = None,
     ) -> dict[str, Any]:
-        return {
+        output = {
+            "trace_id": trace_id,
             "tool": request.tool,
             "step_id": request.step_id,
-            "text": result.text[:2000],
+            # 模型原文只保留摘要；完整原文在事件里，且同样脱敏。
+            "text": self._redact(result.text[:2000]),
             "verification": {},
-            "tool_calls": [record.model_dump(mode="json") for record in result.tool_calls],
-            "trace": [event.model_dump(mode="json") for event in result.events],
+            "tool_calls": [self._redact_record(record) for record in result.tool_calls],
+            "trace": [self._redact_event(event.model_dump(mode="json")) for event in result.events],
             "model_calls": result.model_calls,
+            "tokens": result.tokens,
             "duration_ms": result.duration_ms,
             "stop_reason": result.stop_reason.value,
             "risk": max_risk(grant.risks).value,
         }
+        if resumed_from:
+            output["resumed_from"] = resumed_from
+        return output
+
+    def _redact(self, value: Any) -> Any:
+        return self._redactor.redact(value)
+
+    def _redact_event(self, payload: dict[str, Any]) -> dict[str, Any]:
+        # 敏感值必须从**未脱敏**的原始事件里取，否则拿到的是已经变成掩码的入参。
+        raw_data = payload.get("data")
+        data: dict[str, Any] = raw_data if isinstance(raw_data, dict) else {}
+        secrets = self._sensitive_values(data.get("name"), data.get("arguments"))
+
+        masked = self._redactor.redact(payload)
+        masked_data = masked.get("data")
+        # 工具返回值可能原样回显敏感入参，事件里的 content 也要按值再遮一道。
+        if (
+            secrets
+            and isinstance(masked_data, dict)
+            and isinstance(masked_data.get("content"), str)
+        ):
+            masked_data["content"] = mask_values(masked_data["content"], secrets)
+        return masked
+
+    def _redact_record(self, record: ToolCallRecord) -> dict[str, Any]:
+        """按工具声明的敏感参数名叠加脱敏，再序列化。"""
+
+        tool = self._registry.get(record.name)
+        spec = tool.spec if tool is not None else None
+        redactor = self._redactor
+        if spec is not None and spec.sensitive_fields:
+            redactor = redactor.with_extra(spec.sensitive_fields)
+        payload = redactor.redact(record.model_dump(mode="json"))
+
+        # 工具可能把敏感入参原样回显；按键名遮不住返回值，这里按值再遮一次。
+        secrets = self._sensitive_values(record.name, record.arguments)
+        if secrets and isinstance(payload.get("content"), str):
+            payload["content"] = mask_values(payload["content"], secrets)
+        return payload
+
+    def _sensitive_values(self, name: Any, arguments: Any) -> list[str]:
+        """取出某工具声明为敏感的入参值。必须在按字段名脱敏之前调用。"""
+
+        if not isinstance(name, str) or not isinstance(arguments, dict):
+            return []
+        tool = self._registry.get(name)
+        spec = tool.spec if tool is not None else None
+        if spec is None or not spec.sensitive_fields:
+            return []
+        return [
+            str(arguments[field])
+            for field in spec.sensitive_fields
+            if field in arguments and arguments[field] is not None
+        ]
+
+    def _tool_evidence(self, result: LoopResult) -> list[dict[str, str]]:
+        evidence: list[dict[str, str]] = []
+        for record in result.tool_calls:
+            if not record.succeeded:
+                continue
+            masked = self._redact_record(record)
+            evidence.append(
+                {
+                    "tool": record.name,
+                    "outcome": record.outcome.value,
+                    "content": str(masked.get("content", ""))[:300],
+                }
+            )
+        return evidence
+
+    def _save_trace(
+        self,
+        request: ExecutionRequest,
+        grant: ToolGrant,
+        *,
+        trace_id: str,
+        outcome: ExecutionOutcome,
+        error_code: str | None,
+        stop_reason: str,
+        records: Sequence[ToolCallRecord] = (),
+        model_calls: int = 0,
+        tokens: int = 0,
+        duration_ms: int = 0,
+        resumed_from: str | None = None,
+    ) -> None:
+        if self._traces is None:
+            return
+        counts = ToolResultSummary.from_records(list(records))
+        self._traces.save(
+            TraceRecord(
+                trace_id=trace_id,
+                task_id=request.task_id,
+                flow_id=request.flow_id,
+                flow_version=request.flow_version,
+                step_id=request.step_id,
+                outcome=outcome.value,
+                stop_reason=stop_reason,
+                # 记最终错误码（含 unverified_success 这类契约降级），不是循环的原始错误码。
+                error_code=error_code,
+                risk=max_risk(grant.risks).value,
+                model_calls=model_calls,
+                tool_calls=counts.total,
+                successful_tool_calls=counts.succeeded,
+                blocked_tool_calls=counts.blocked,
+                failed_tool_calls=counts.failed,
+                timed_out_tool_calls=counts.timed_out,
+                tokens=tokens,
+                duration_ms=duration_ms,
+                resumed_from=resumed_from,
+            )
+        )
 
 
-def _tool_evidence(result: LoopResult) -> list[dict[str, str]]:
-    return [
-        {
-            "tool": record.name,
-            "outcome": record.outcome.value,
-            "content": record.content[:300],
-        }
-        for record in result.tool_calls
-        if record.succeeded
-    ]
-
-
-def default_step_prompt(
-    request: ExecutionRequest, grant: ToolGrant
-) -> tuple[str, str]:
+def default_step_prompt(request: ExecutionRequest, grant: ToolGrant) -> tuple[str, str]:
     """只给当前步骤所需信息：执行要求、参数、以及"能用哪些工具"。"""
 
     instruction = request.instruction or "执行该步骤并如实报告结果。"

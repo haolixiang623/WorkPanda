@@ -34,7 +34,22 @@ class Settings(BaseSettings):
     model_trust_env: bool = True
     harness_max_steps: int = 6
     harness_max_tool_calls: int = 8
+    # 0 表示不限；仅在模型服务上报 usage 时生效。
+    harness_max_tokens: int = 0
     harness_deadline_seconds: float = 45.0
+    # 可重试失败的额外尝试次数（仅对幂等工具生效）。
+    harness_tool_retries: int = 1
+    # 落盘与运维接口的脱敏开关。默认开启；除非有明确理由，否则不要关。
+    harness_redact: bool = True
+    # 进程内 trace 保留条数上限，避免留痕变成无限增长的内存占用。
+    # 0 表示不限（只建议在 sqlite 后端且有人负责清理时使用）。
+    harness_trace_capacity: int = 500
+    # trace 存储后端：memory（进程内）/ sqlite（与任务库同文件）/ auto（跟随 store_backend）。
+    harness_trace_backend: str = "auto"
+    # 断点续跑：默认关闭。开启后每个工具调用都会落 checkpoint（含未脱敏的对话原文），
+    # 因此必须先确认存储的权限与留存策略可接受。
+    harness_resume_enabled: bool = False
+    harness_resume_ttl_seconds: float = 900.0
     # 逗号分隔的域名白名单；为空则不注册 http 工具（默认关闭比默认全开安全）。
     harness_allowed_hosts: str = ""
     # Octop-Harness 运行时。默认关闭，未配置模型凭据时不启用。

@@ -136,6 +136,17 @@ def main() -> int:
             failures.append("工具不可用却报完成（虚假成功）")
         if blocked.status not in {TaskStatus.OUTCOME_UNCONFIRMED, TaskStatus.HANDOFF_REQUIRED}:
             failures.append(f"工具不可用时应转待确认或转人工，实际 {blocked.status}")
+
+        # 新增能力同样要真实验证：每次执行都要留下可检索的 trace 与聚合指标。
+        summary = container.traces.summary()
+        print(json.dumps({"trace_summary": summary.model_dump()}, ensure_ascii=False, indent=2))
+        if summary.total < 2:
+            failures.append(f"trace 未覆盖全部执行，实际 {summary.total} 条")
+        if summary.unconfirmed_rate >= 1.0:
+            failures.append("所有执行都被判为未确认，trace 或结果映射可能出错")
+        if summary.tokens_total <= 0:
+            # usage 是上游可选字段；缺失只应提示，不应判失败。
+            print("提示：上游未上报 token 用量，token 预算本次未生效。")
     finally:
         container.close()
 

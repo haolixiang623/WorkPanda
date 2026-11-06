@@ -3,6 +3,7 @@
 测试通过替换这里的依赖来构造不同的存储或执行器，而不修改业务代码。
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from workpanda.application.ports import Executor, IntentRouter
@@ -13,15 +14,20 @@ from workpanda.domain.flow import FlowDefinition, FlowRegistry
 from workpanda.domain.identity import SessionSigner, new_secret
 from workpanda.domain.repository import ConfirmationStore, TaskStore
 from workpanda.harness.builtin import default_registry
+from workpanda.harness.checkpoint import CheckpointStore, InMemoryCheckpointStore
 from workpanda.harness.executor import HarnessExecutor
 from workpanda.harness.openai_client import OpenAICompatibleClient
+from workpanda.harness.redaction import DEFAULT_REDACTOR, NO_REDACTION
+from workpanda.harness.trace import InMemoryTraceStore, TraceStore
 from workpanda.infrastructure.adapters import KeywordIntentRouter, ScriptedExecutor
 from workpanda.infrastructure.demo_flows import demo_flows
 from workpanda.infrastructure.event_broker import EventBroker
 from workpanda.infrastructure.memory_store import InMemoryConfirmationStore, InMemoryTaskStore
 from workpanda.infrastructure.octop_runtime import OctopHarnessExecutor, OctopHarnessGateway
 from workpanda.infrastructure.rate_limit import TokenBucketLimiter
+from workpanda.infrastructure.sqlite_checkpoint_store import SqliteCheckpointStore
 from workpanda.infrastructure.sqlite_store import SqliteStore
+from workpanda.infrastructure.sqlite_trace_store import SqliteTraceStore
 
 
 @dataclass
@@ -36,11 +42,44 @@ class Container:
     tasks: TaskService
     signer: SessionSigner
     limiter: TokenBucketLimiter
+    traces: TraceStore
     closers: list = field(default_factory=list)
 
     def close(self) -> None:
         for closer in self.closers:
             closer()
+
+
+def resolve_trace_backend(settings: Settings) -> str:
+    """决定 trace 落到哪里。auto 跟随任务存储：任务持久化时留痕也持久化。"""
+
+    backend = settings.harness_trace_backend.strip().lower()
+    if backend == "auto":
+        return "sqlite" if settings.store_backend == "sqlite" else "memory"
+    if backend not in {"memory", "sqlite"}:
+        # 配置写错时宁可启动失败，也不要静默退化成"重启即丢"。
+        raise ValueError(f"unsupported harness_trace_backend: {settings.harness_trace_backend}")
+    return backend
+
+
+def build_trace_store(settings: Settings) -> tuple[TraceStore, list[Callable[[], None]]]:
+    if resolve_trace_backend(settings) == "sqlite":
+        store = SqliteTraceStore(settings.sqlite_path, capacity=settings.harness_trace_capacity)
+        return store, [store.close]
+    return InMemoryTraceStore(capacity=max(1, settings.harness_trace_capacity)), []
+
+
+def build_checkpoint_store(
+    settings: Settings,
+) -> tuple[CheckpointStore | None, list[Callable[[], None]]]:
+    """断点存储。未开启续跑时既不建库也不落盘，避免留下无人使用的会话原文。"""
+
+    if not settings.harness_resume_enabled:
+        return None, []
+    if settings.store_backend == "sqlite":
+        store = SqliteCheckpointStore(settings.sqlite_path)
+        return store, [store.close]
+    return InMemoryCheckpointStore(), []
 
 
 def build_container(
@@ -68,6 +107,9 @@ def build_container(
     registered = flows if flows is not None else (demo_flows() if settings.enable_demo_flow else [])
     registry = FlowRegistry(registered)
     broker = EventBroker()
+    # trace 独立于任务结果存放：既能覆盖成功执行，也能做跨任务的聚合指标。
+    traces, trace_closers = build_trace_store(settings)
+    closers.extend(trace_closers)
 
     if executor is None:
         # 优先级：通用 harness > Octop 运行时 > 脚手架执行器。
@@ -82,15 +124,24 @@ def build_container(
                 timeout_seconds=settings.model_timeout_seconds,
                 trust_env=settings.model_trust_env,
             )
+            checkpoints, checkpoint_closers = build_checkpoint_store(settings)
             executor_instance: Executor = HarnessExecutor(
                 model_client,
                 registry=tool_registry,
                 max_steps=settings.harness_max_steps,
                 max_tool_calls=settings.harness_max_tool_calls,
+                max_tokens=settings.harness_max_tokens,
                 deadline_seconds=settings.harness_deadline_seconds,
+                tool_retries=settings.harness_tool_retries,
+                redactor=DEFAULT_REDACTOR if settings.harness_redact else NO_REDACTION,
+                traces=traces,
+                checkpoints=checkpoints,
+                resume_enabled=settings.harness_resume_enabled,
+                resume_ttl_seconds=settings.harness_resume_ttl_seconds,
             )
             closers.append(model_client.close)
             closers.extend(tool_closers)
+            closers.extend(checkpoint_closers)
         elif settings.octop_enabled:
             gateway = OctopHarnessGateway(
                 agent_name=settings.octop_agent_name,
@@ -144,5 +195,6 @@ def build_container(
         limiter=TokenBucketLimiter(
             per_minute=settings.rate_limit_per_minute, burst=settings.rate_limit_burst
         ),
+        traces=traces,
         closers=closers,
     )
