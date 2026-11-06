@@ -55,9 +55,20 @@ class ToolSpec(BaseModel):
     # JSON Schema（object）。harness 只做轻量校验，不做完整 JSON Schema 实现。
     parameters: dict[str, Any] = Field(default_factory=dict)
     risk: RiskLevel = RiskLevel.LOW
-    # 重复调用是否安全。不幂等的工具在同一任务内应被限制次数。
+    # 重复调用是否安全。不幂等的工具在一次执行里只允许成功一次，防止重复副作用。
     idempotent: bool = True
     timeout_seconds: float = Field(default=10.0, gt=0, le=120)
+    # 单次执行内最多调用几次。None 表示按 idempotent 推导：
+    # 幂等工具交给总调用预算约束，非幂等工具固定为 1。
+    max_calls: int | None = Field(default=None, ge=1, le=64)
+    # 该工具的参数名里哪些必须脱敏（例如凭据类入参）。
+    sensitive_fields: list[str] = Field(default_factory=list)
+
+    @property
+    def call_limit(self) -> int | None:
+        if self.max_calls is not None:
+            return self.max_calls
+        return None if self.idempotent else 1
 
 
 class ToolCall(BaseModel):
@@ -74,6 +85,7 @@ class ToolOutcome(StrEnum):
     ERROR = "error"
     # 未执行：未授权、未注册或参数不合法。
     BLOCKED = "blocked"
+    # 执行未在限期内返回。结果未知，绝不能当失败重试。
     TIMEOUT = "timeout"
 
 
@@ -88,6 +100,8 @@ class ToolCallRecord(BaseModel):
     error_code: str | None = None
     duration_ms: int = 0
     risk: RiskLevel = RiskLevel.LOW
+    # 实际尝试次数（含重试）。>1 说明发生过可重试失败。
+    attempts: int = 1
 
     @property
     def succeeded(self) -> bool:
@@ -111,11 +125,37 @@ class HarnessMessage(BaseModel):
     tool_calls: list[ToolCall] = Field(default_factory=list)
 
 
+class TokenUsage(BaseModel):
+    """模型服务上报的用量。缺失时不猜测，一律按 0 计。"""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+    @classmethod
+    def from_payload(cls, payload: object) -> TokenUsage | None:
+        if not isinstance(payload, dict):
+            return None
+
+        def as_int(value: object) -> int:
+            return value if isinstance(value, int) and value >= 0 else 0
+
+        usage = cls(
+            prompt_tokens=as_int(payload.get("prompt_tokens")),
+            completion_tokens=as_int(payload.get("completion_tokens")),
+            total_tokens=as_int(payload.get("total_tokens")),
+        )
+        if usage.total_tokens == 0:
+            usage.total_tokens = usage.prompt_tokens + usage.completion_tokens
+        return usage
+
+
 class ModelResponse(BaseModel):
     text: str = ""
     tool_calls: list[ToolCall] = Field(default_factory=list)
     finish_reason: str | None = None
     duration_ms: int = 0
+    usage: TokenUsage | None = None
 
 
 class EventKind(StrEnum):
