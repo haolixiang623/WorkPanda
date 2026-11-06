@@ -15,6 +15,8 @@ from workpanda.domain.repository import ConfirmationStore, TaskStore
 from workpanda.harness.builtin import default_registry
 from workpanda.harness.executor import HarnessExecutor
 from workpanda.harness.openai_client import OpenAICompatibleClient
+from workpanda.harness.redaction import DEFAULT_REDACTOR, NO_REDACTION
+from workpanda.harness.trace import InMemoryTraceStore, TraceStore
 from workpanda.infrastructure.adapters import KeywordIntentRouter, ScriptedExecutor
 from workpanda.infrastructure.demo_flows import demo_flows
 from workpanda.infrastructure.event_broker import EventBroker
@@ -36,6 +38,7 @@ class Container:
     tasks: TaskService
     signer: SessionSigner
     limiter: TokenBucketLimiter
+    traces: TraceStore
     closers: list = field(default_factory=list)
 
     def close(self) -> None:
@@ -68,6 +71,8 @@ def build_container(
     registered = flows if flows is not None else (demo_flows() if settings.enable_demo_flow else [])
     registry = FlowRegistry(registered)
     broker = EventBroker()
+    # trace 独立于任务结果存放：既能覆盖成功执行，也能做跨任务的聚合指标。
+    traces: TraceStore = InMemoryTraceStore(capacity=settings.harness_trace_capacity)
 
     if executor is None:
         # 优先级：通用 harness > Octop 运行时 > 脚手架执行器。
@@ -87,7 +92,11 @@ def build_container(
                 registry=tool_registry,
                 max_steps=settings.harness_max_steps,
                 max_tool_calls=settings.harness_max_tool_calls,
+                max_tokens=settings.harness_max_tokens,
                 deadline_seconds=settings.harness_deadline_seconds,
+                tool_retries=settings.harness_tool_retries,
+                redactor=DEFAULT_REDACTOR if settings.harness_redact else NO_REDACTION,
+                traces=traces,
             )
             closers.append(model_client.close)
             closers.extend(tool_closers)
@@ -144,5 +153,6 @@ def build_container(
         limiter=TokenBucketLimiter(
             per_minute=settings.rate_limit_per_minute, burst=settings.rate_limit_burst
         ),
+        traces=traces,
         closers=closers,
     )
