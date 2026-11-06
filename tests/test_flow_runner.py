@@ -13,15 +13,18 @@ from workpanda.domain.models import (
     TaskStatus,
 )
 
+SUBJECT = "session-a"
+OTHER = "session-b"
 
-def start(container: Container, **overrides) -> object:
+
+def start(container: Container, **overrides):
     request = TaskCreateRequest(
         conversation_id="conversation-1",
         input_text="我要办理测试事项",
         flow_id="test.confirm",
         **overrides,
     )
-    return container.tasks.create_task(request)
+    return container.tasks.create_task(request, SUBJECT)
 
 
 def test_missing_fields_pause_without_calling_executor(container, executor) -> None:
@@ -30,18 +33,22 @@ def test_missing_fields_pause_without_calling_executor(container, executor) -> N
     assert task.status is TaskStatus.WAITING_FOR_USER
     assert task.pending_fields == ["subject", "contact"]
     assert executor.calls == []
-    events = container.tasks.events(task.task_id)
+    events = container.tasks.events(task.task_id, SUBJECT)
     assert EventType.CLARIFICATION_REQUIRED in [event.type for event in events]
 
 
 def test_answer_then_requires_confirmation(container, executor) -> None:
     task = start(container)
-    task = container.tasks.answer(task.task_id, TaskAnswerRequest(values={"subject": "测试主题"}))
+    task = container.tasks.answer(
+        task.task_id, TaskAnswerRequest(values={"subject": "测试主题"}), SUBJECT
+    )
 
     assert task.status is TaskStatus.WAITING_FOR_USER
     assert task.pending_fields == ["contact"]
 
-    task = container.tasks.answer(task.task_id, TaskAnswerRequest(values={"contact": "12345"}))
+    task = container.tasks.answer(
+        task.task_id, TaskAnswerRequest(values={"contact": "12345"}), SUBJECT
+    )
 
     assert task.status is TaskStatus.WAITING_FOR_CONFIRMATION
     assert task.current_step == "submit"
@@ -52,7 +59,7 @@ def test_confirmation_executes_once_and_completes(container, executor) -> None:
     task = start(container, slots={"subject": "测试主题", "contact": "12345"})
     assert task.status is TaskStatus.WAITING_FOR_CONFIRMATION
 
-    task = container.tasks.confirm(task.task_id, TaskConfirmRequest(step_id="submit"))
+    task = container.tasks.confirm(task.task_id, TaskConfirmRequest(step_id="submit"), SUBJECT)
 
     assert task.status is TaskStatus.COMPLETED
     assert len(executor.calls) == 1
@@ -63,10 +70,10 @@ def test_confirmation_executes_once_and_completes(container, executor) -> None:
 
 def test_second_confirmation_is_rejected(container, executor) -> None:
     task = start(container, slots={"subject": "测试主题", "contact": "12345"})
-    container.tasks.confirm(task.task_id, TaskConfirmRequest(step_id="submit"))
+    container.tasks.confirm(task.task_id, TaskConfirmRequest(step_id="submit"), SUBJECT)
 
     with pytest.raises(TaskConflict):
-        container.tasks.confirm(task.task_id, TaskConfirmRequest(step_id="submit"))
+        container.tasks.confirm(task.task_id, TaskConfirmRequest(step_id="submit"), SUBJECT)
 
     assert len(executor.calls) == 1
 
@@ -78,12 +85,14 @@ def test_parameter_change_after_confirmation_requires_new_confirmation(
     assert task.status is TaskStatus.WAITING_FOR_CONFIRMATION
 
     # 群众在执行前修改了信息，旧凭证必须失效。
-    task = container.tasks.answer(task.task_id, TaskAnswerRequest(values={"contact": "99999"}))
+    task = container.tasks.answer(
+        task.task_id, TaskAnswerRequest(values={"contact": "99999"}), SUBJECT
+    )
 
     assert task.status is TaskStatus.WAITING_FOR_CONFIRMATION
     assert executor.calls == []
 
-    task = container.tasks.confirm(task.task_id, TaskConfirmRequest(step_id="submit"))
+    task = container.tasks.confirm(task.task_id, TaskConfirmRequest(step_id="submit"), SUBJECT)
     assert task.status is TaskStatus.COMPLETED
     assert executor.calls[0].arguments["contact"] == "99999"
 
@@ -97,16 +106,16 @@ def test_unconfirmed_outcome_is_not_retried(container, executor) -> None:
         )
     )
     task = start(container, slots={"subject": "测试主题", "contact": "12345"})
-    task = container.tasks.confirm(task.task_id, TaskConfirmRequest(step_id="submit"))
+    task = container.tasks.confirm(task.task_id, TaskConfirmRequest(step_id="submit"), SUBJECT)
 
     assert task.status is TaskStatus.OUTCOME_UNCONFIRMED
     assert len(executor.calls) == 1
 
-    events = container.tasks.events(task.task_id)
+    events = container.tasks.events(task.task_id, SUBJECT)
     assert events[-1].type is EventType.OUTCOME_UNCONFIRMED
 
     with pytest.raises(TaskConflict):
-        container.tasks.answer(task.task_id, TaskAnswerRequest(values={"contact": "1"}))
+        container.tasks.answer(task.task_id, TaskAnswerRequest(values={"contact": "1"}), SUBJECT)
 
 
 def test_failed_execution_hands_off(container, executor) -> None:
@@ -118,11 +127,11 @@ def test_failed_execution_hands_off(container, executor) -> None:
         )
     )
     task = start(container, slots={"subject": "测试主题", "contact": "12345"})
-    task = container.tasks.confirm(task.task_id, TaskConfirmRequest(step_id="submit"))
+    task = container.tasks.confirm(task.task_id, TaskConfirmRequest(step_id="submit"), SUBJECT)
 
     assert task.status is TaskStatus.HANDOFF_REQUIRED
     assert task.failure_code == "tool_failed"
-    events = container.tasks.events(task.task_id)
+    events = container.tasks.events(task.task_id, SUBJECT)
     handoff = [event for event in events if event.type is EventType.HANDOFF_REQUIRED]
     assert handoff and handoff[0].data["completed_steps"] == ["collect"]
 
@@ -131,7 +140,9 @@ def test_unexpected_answer_field_is_rejected(container) -> None:
     task = start(container)
 
     with pytest.raises(RequestRejected):
-        container.tasks.answer(task.task_id, TaskAnswerRequest(values={"unknown": "x"}))
+        container.tasks.answer(
+            task.task_id, TaskAnswerRequest(values={"unknown": "x"}), SUBJECT
+        )
 
 
 def test_flow_without_confirmation_completes_directly(container, executor) -> None:
@@ -140,7 +151,8 @@ def test_flow_without_confirmation_completes_directly(container, executor) -> No
             conversation_id="conversation-1",
             input_text="查询公开信息",
             flow_id="test.direct",
-        )
+        ),
+        SUBJECT,
     )
 
     assert task.status is TaskStatus.COMPLETED
@@ -149,10 +161,17 @@ def test_flow_without_confirmation_completes_directly(container, executor) -> No
 
 def test_cancelled_task_cannot_be_modified(container) -> None:
     task = start(container)
-    cancelled = container.tasks.cancel(task.task_id)
+    cancelled = container.tasks.cancel(task.task_id, SUBJECT)
 
     assert cancelled.status is TaskStatus.CANCELLED
-    assert container.tasks.events(task.task_id)[-1].type is EventType.CANCELLED
+    assert container.tasks.events(task.task_id, SUBJECT)[-1].type is EventType.CANCELLED
 
     with pytest.raises(TaskConflict):
-        container.tasks.cancel(task.task_id)
+        container.tasks.cancel(task.task_id, SUBJECT)
+
+
+def test_other_subject_cannot_read_task(container) -> None:
+    task = start(container)
+
+    with pytest.raises(LookupError):
+        container.tasks.get_task(task.task_id, OTHER)

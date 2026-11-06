@@ -84,7 +84,7 @@ class TaskCreateRequest(BaseModel):
     input_text: str = Field(min_length=1, max_length=10_000)
     flow_id: str | None = Field(default=None, max_length=128)
     flow_version: str | None = Field(default=None, max_length=64)
-    user_ref: str | None = Field(default=None, max_length=128)
+    # 归属由服务端从会话解析，客户端不能自行声明 user_ref，避免冒充他人。
     slots: dict[str, str] = Field(default_factory=dict)
 
 

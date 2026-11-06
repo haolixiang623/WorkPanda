@@ -21,7 +21,7 @@ from workpanda.domain.models import (
     TaskStatus,
     utc_now,
 )
-from workpanda.domain.repository import ConfirmationStore, TaskStore
+from workpanda.domain.repository import ConfirmationStore, TaskNotFoundError, TaskStore
 
 BLOCKED_STATUSES: frozenset[TaskStatus] = frozenset(
     {
@@ -54,12 +54,12 @@ class TaskService:
 
     # ---------- 命令 ----------
 
-    def create_task(self, request: TaskCreateRequest) -> Task:
+    def create_task(self, request: TaskCreateRequest, subject: str) -> Task:
         flow = self._resolve_flow(request)
         task = self.store.create(
             Task(
                 conversation_id=request.conversation_id,
-                user_ref=request.user_ref,
+                user_ref=subject,
                 flow_id=flow.flow_id,
                 flow_version=flow.version,
                 slots={key: value for key, value in request.slots.items() if value},
@@ -68,8 +68,8 @@ class TaskService:
         self.runner.emit(task, EventType.ACCEPTED, {"flow_id": flow.flow_id})
         return self.runner.advance(task)
 
-    def answer(self, task_id: UUID, request: TaskAnswerRequest) -> Task:
-        task = self._active_task(task_id)
+    def answer(self, task_id: UUID, request: TaskAnswerRequest, subject: str) -> Task:
+        task = self._active_task(task_id, subject)
         step = self._current_step(task)
         # 允许补充流程中任意收集节点的字段；当前节点决定提示什么，不代表只能改它。
         allowed = self._declared_fields(task)
@@ -86,8 +86,8 @@ class TaskService:
         self.confirmations.revoke(task.task_id, step.step_id)
         return self.runner.advance(task)
 
-    def confirm(self, task_id: UUID, request: TaskConfirmRequest) -> Task:
-        task = self._active_task(task_id)
+    def confirm(self, task_id: UUID, request: TaskConfirmRequest, subject: str) -> Task:
+        task = self._active_task(task_id, subject)
         if task.status is not TaskStatus.WAITING_FOR_CONFIRMATION:
             raise TaskConflict("task is not waiting for confirmation")
         if task.current_step != request.step_id:
@@ -107,8 +107,8 @@ class TaskService:
         self.runner.emit(task, EventType.CONFIRMATION_ACCEPTED, {"step_id": step.step_id})
         return self.runner.advance(task)
 
-    def cancel(self, task_id: UUID) -> Task:
-        task = self.store.get(task_id)
+    def cancel(self, task_id: UUID, subject: str) -> Task:
+        task = self._owned(task_id, subject)
         if task.status in BLOCKED_STATUSES:
             raise TaskConflict(f"task in {task.status} state cannot be cancelled")
 
@@ -122,14 +122,22 @@ class TaskService:
 
     # ---------- 查询 ----------
 
-    def get_task(self, task_id: UUID) -> Task:
-        return self.store.get(task_id)
+    def get_task(self, task_id: UUID, subject: str) -> Task:
+        return self._owned(task_id, subject)
 
-    def events(self, task_id: UUID, after_sequence: int = 0) -> Sequence[TaskEvent]:
-        self.store.get(task_id)
+    def events(self, task_id: UUID, subject: str, after_sequence: int = 0) -> Sequence[TaskEvent]:
+        self._owned(task_id, subject)
         return self.store.events(task_id, after_sequence)
 
     # ---------- 内部 ----------
+
+    def _owned(self, task_id: UUID, subject: str) -> Task:
+        """任务归属校验：不是自己的任务一律按不存在处理，避免泄露任务存在性。"""
+
+        task = self.store.get(task_id)
+        if task.user_ref != subject:
+            raise TaskNotFoundError(str(task_id))
+        return task
 
     def _resolve_flow(self, request: TaskCreateRequest) -> FlowDefinition:
         if request.flow_id:
@@ -146,8 +154,8 @@ class TaskService:
         except (FlowNotFound, FlowNotRunnable) as exc:
             raise RequestRejected(str(exc)) from exc
 
-    def _active_task(self, task_id: UUID) -> Task:
-        task = self.store.get(task_id)
+    def _active_task(self, task_id: UUID, subject: str) -> Task:
+        task = self._owned(task_id, subject)
         if task.status in BLOCKED_STATUSES:
             raise TaskConflict(f"task in {task.status} state cannot be modified")
         return task

@@ -30,3 +30,7 @@ out/
 
 # 测试临时目录
 .pytest-tmp/
+
+# 本地存储
+*.db
+*.db-journal

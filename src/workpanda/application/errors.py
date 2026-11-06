@@ -11,3 +11,15 @@ class RequestRejected(ValueError):
 
 class IntentUnresolved(Exception):
     """无法把输入解析为已发布流程，需要澄清或转人工。"""
+
+
+class AuthenticationRequired(Exception):
+    """会话令牌缺失或无效。"""
+
+
+class RateLimited(Exception):
+    """请求过于频繁。"""
+
+    def __init__(self, retry_after_seconds: int = 1) -> None:
+        super().__init__("too many requests")
+        self.retry_after_seconds = retry_after_seconds

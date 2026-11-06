@@ -11,6 +11,7 @@ WorkPanda 是面向群众的自然语言公共服务入口。当前仓库处于*
 - 任务状态机，含澄清、等待确认、待确认结果和转人工；
 - 槽位收集与多轮澄清；
 - 关键动作的服务端一次性确认凭证（绑定任务、流程版本、步骤和参数摘要）；
+- 签名会话令牌、任务归属隔离与按会话限流；
 - 执行器、意图路由、事件发布的可替换端口；
 - SSE 事件流，支持断线后按序号补发；
 - 内存与 SQLite 两种存储；
@@ -45,6 +46,8 @@ uvicorn workpanda.main:app --app-dir src --reload
 
 ## 接口
 
+所有 `/api` 请求都需要携带 `X-WorkPanda-Session`。首次请求可以不带，服务端会在响应头下发新会话，客户端后续请求需原样带回。
+
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/healthz` | 健康检查 |
@@ -54,6 +57,8 @@ uvicorn workpanda.main:app --app-dir src --reload
 | POST | `/api/tasks/{task_id}/confirm` | 提交确认意图 |
 | POST | `/api/tasks/{task_id}/cancel` | 取消任务 |
 | GET | `/api/tasks/{task_id}/events` | SSE 事件流，支持 `?after=` 补发 |
+
+任务按会话隔离：访问不属于自己的任务返回 404，不暴露任务是否存在。超限返回 429 并带 `Retry-After`。
 
 ## 配置
 
@@ -66,6 +71,10 @@ uvicorn workpanda.main:app --app-dir src --reload
 | `WORKPANDA_INTENT_CONFIDENCE_THRESHOLD` | `0.6` | 意图匹配最低置信度 |
 | `WORKPANDA_CONFIRMATION_TTL_SECONDS` | `300` | 确认凭证有效期 |
 | `WORKPANDA_EVENT_KEEPALIVE_SECONDS` | `15` | SSE 心跳间隔 |
+| `WORKPANDA_SESSION_SECRET` | 进程随机值 | 会话令牌签名密钥；未配置时重启后旧会话失效 |
+| `WORKPANDA_SESSION_TTL_SECONDS` | `43200` | 会话有效期 |
+| `WORKPANDA_RATE_LIMIT_PER_MINUTE` | `120` | 每会话每分钟请求数 |
+| `WORKPANDA_RATE_LIMIT_BURST` | `30` | 每会话瞬时突发上限 |
 | `WORKPANDA_ENABLE_DEMO_FLOW` | `true` | 启用骨架自检流程 `demo.generic` |
 
 `demo.generic` 只用于验证"收集 → 确认 → 执行 → 完成"链路，不代表任何业务规则。正式接入业务前必须设为 `false`。

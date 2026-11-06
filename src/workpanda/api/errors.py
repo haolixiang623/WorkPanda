@@ -3,7 +3,13 @@
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
-from workpanda.application.errors import IntentUnresolved, RequestRejected, TaskConflict
+from workpanda.application.errors import (
+    AuthenticationRequired,
+    IntentUnresolved,
+    RateLimited,
+    RequestRejected,
+    TaskConflict,
+)
 from workpanda.domain.confirmation import ConfirmationError
 from workpanda.domain.flow import FlowNotFound, FlowNotRunnable
 from workpanda.domain.repository import TaskNotFoundError
@@ -49,3 +55,13 @@ def register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(ConfirmationError)
     async def _confirmation(request: Request, exc: ConfirmationError) -> JSONResponse:
         return _error(status.HTTP_409_CONFLICT, "confirmation_invalid", str(exc))
+
+    @app.exception_handler(AuthenticationRequired)
+    async def _unauthenticated(request: Request, exc: AuthenticationRequired) -> JSONResponse:
+        return _error(status.HTTP_401_UNAUTHORIZED, "session_invalid", str(exc))
+
+    @app.exception_handler(RateLimited)
+    async def _rate_limited(request: Request, exc: RateLimited) -> JSONResponse:
+        response = _error(status.HTTP_429_TOO_MANY_REQUESTS, "rate_limited", "请求过于频繁。")
+        response.headers["Retry-After"] = str(max(1, exc.retry_after_seconds))
+        return response

@@ -10,11 +10,13 @@ from workpanda.application.runner import FlowRunner
 from workpanda.application.task_service import TaskService
 from workpanda.config import Settings, get_settings
 from workpanda.domain.flow import FlowDefinition, FlowRegistry
+from workpanda.domain.identity import SessionSigner, new_secret
 from workpanda.domain.repository import ConfirmationStore, TaskStore
 from workpanda.infrastructure.adapters import KeywordIntentRouter, ScriptedExecutor
 from workpanda.infrastructure.demo_flows import demo_flows
 from workpanda.infrastructure.event_broker import EventBroker
 from workpanda.infrastructure.memory_store import InMemoryConfirmationStore, InMemoryTaskStore
+from workpanda.infrastructure.rate_limit import TokenBucketLimiter
 from workpanda.infrastructure.sqlite_store import SqliteStore
 
 
@@ -28,6 +30,8 @@ class Container:
     router: IntentRouter
     flows: FlowRegistry
     tasks: TaskService
+    signer: SessionSigner
+    limiter: TokenBucketLimiter
     closers: list = field(default_factory=list)
 
     def close(self) -> None:
@@ -90,5 +94,11 @@ def build_container(
         router=router_instance,
         flows=registry,
         tasks=tasks,
+        signer=SessionSigner(
+            settings.session_secret or new_secret(), ttl_seconds=settings.session_ttl_seconds
+        ),
+        limiter=TokenBucketLimiter(
+            per_minute=settings.rate_limit_per_minute, burst=settings.rate_limit_burst
+        ),
         closers=closers,
     )

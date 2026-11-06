@@ -16,6 +16,11 @@ class Settings(BaseSettings):
     intent_confidence_threshold: float = 0.6
     confirmation_ttl_seconds: int = 300
     event_keepalive_seconds: float = 15.0
+    # 会话令牌签名密钥。未配置时使用进程级随机值，重启后旧会话失效。
+    session_secret: str | None = None
+    session_ttl_seconds: int = 43_200
+    rate_limit_per_minute: int = 120
+    rate_limit_burst: int = 30
     # 骨架自检流程，只用于验证任务链路；正式接入业务前必须关闭。
     enable_demo_flow: bool = True
 

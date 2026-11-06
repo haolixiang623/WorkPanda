@@ -5,13 +5,16 @@ import uuid
 import pytest
 from fastapi.testclient import TestClient
 
+from workpanda.api.security import SESSION_HEADER
 from workpanda.bootstrap import Container
 from workpanda.main import create_app
 
 
 @pytest.fixture
 def client(container: Container) -> TestClient:
-    return TestClient(create_app(container=container))
+    test_client = TestClient(create_app(container=container))
+    test_client.headers.update({SESSION_HEADER: container.signer.issue()})
+    return test_client
 
 
 def create_task(client: TestClient, **overrides) -> dict:
