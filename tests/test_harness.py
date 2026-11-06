@@ -17,6 +17,7 @@ from workpanda.harness.contract import parse_contract
 from workpanda.harness.executor import HarnessExecutor
 from workpanda.harness.loop import AgentLoop, StopReason
 from workpanda.harness.models import (
+    EventKind,
     MessageRole,
     ModelResponse,
     RiskLevel,
@@ -26,6 +27,7 @@ from workpanda.harness.models import (
     ToolSpec,
     max_risk,
 )
+from workpanda.harness.openai_client import OpenAICompatibleClient
 from workpanda.harness.redaction import MASK
 from workpanda.harness.tools import (
     ToolContext,
@@ -200,6 +202,34 @@ def test_loop_executes_tool_then_returns_final_text() -> None:
         message for message in client.calls[1]["messages"] if message.role is MessageRole.TOOL
     ]
     assert tool_messages and "echo:hi" in tool_messages[0].content
+
+
+def test_model_call_duration_reaches_trace_event() -> None:
+    """单次模型耗时必须来自真实往返：既不能恒为 0，也不能把整步耗时算进去。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        time.sleep(0.03)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "done"}, "finish_reason": "stop"}]},
+        )
+
+    client = OpenAICompatibleClient(
+        base_url="http://model.local/v1",
+        api_key="sk-test",
+        model="test-model",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    loop = AgentLoop(client, max_steps=1)
+    grant = ToolGrant(registry=registry_with(), allowed=frozenset())
+
+    result = loop.run(system_prompt="s", user_prompt="u", grant=grant, context=context())
+
+    responded = [event for event in result.events if event.kind is EventKind.MODEL_RESPONDED]
+    assert len(responded) == 1
+    assert responded[0].data["duration_ms"] >= 20
+    # 模型耗时是整步耗时的一部分，不可能超过它。
+    assert responded[0].data["duration_ms"] <= result.duration_ms
 
 
 def test_multiple_tool_calls_in_one_response_run_in_order() -> None:

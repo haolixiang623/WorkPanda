@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -67,6 +68,9 @@ class OpenAICompatibleClient:
             payload["tools"] = [_tool_wire(spec) for spec in tools]
             payload["tool_choice"] = "auto"
 
+        # 只计这一段往返耗时：transport 错误和超时会抛异常、不产生响应，
+        # 耗时应由失败路径自己记录，不能混进下一次调用的成功耗时里。
+        started = time.monotonic()
         try:
             response = self._client.post(
                 f"{self._base_url}/chat/completions",
@@ -77,6 +81,7 @@ class OpenAICompatibleClient:
             raise ModelTimeout("模型调用超时") from exc
         except httpx.HTTPError as exc:
             raise ModelError("transport_error", f"无法连接模型服务：{type(exc).__name__}") from exc
+        duration_ms = int((time.monotonic() - started) * 1000)
 
         if response.status_code >= 400:
             raise ModelError(
@@ -89,7 +94,7 @@ class OpenAICompatibleClient:
         except ValueError as exc:
             raise ModelError("invalid_response", "模型服务返回的不是 JSON") from exc
 
-        return _parse_completion(data)
+        return _parse_completion(data, duration_ms=duration_ms)
 
 
 def _to_wire(message: HarnessMessage) -> dict[str, Any]:
@@ -130,7 +135,7 @@ def _tool_wire(spec: ToolSpec) -> dict[str, Any]:
     }
 
 
-def _parse_completion(data: dict[str, Any]) -> ModelResponse:
+def _parse_completion(data: dict[str, Any], *, duration_ms: int = 0) -> ModelResponse:
     choices = data.get("choices") or []
     if not choices:
         raise ModelError("empty_choices", "模型服务没有返回任何候选结果")
@@ -143,6 +148,7 @@ def _parse_completion(data: dict[str, Any]) -> ModelResponse:
         text=content if isinstance(content, str) else "",
         tool_calls=[call for call in tool_calls if call is not None],
         finish_reason=choices[0].get("finish_reason"),
+        duration_ms=duration_ms,
         # 有的网关不返回 usage；拿不到就不统计，绝不用字符数估算。
         usage=TokenUsage.from_payload(data.get("usage")),
     )

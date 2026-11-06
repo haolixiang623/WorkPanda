@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 from uuid import uuid4
@@ -108,11 +109,14 @@ class HarnessExecutor(Executor):
         )
 
     def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        # 拒绝路径也要有真实耗时：留痕里恒为 0 会让"快速拒绝"和"根本没执行"
+        # 变成同一种记录，运维无法区分。
+        started = time.monotonic()
         trace_id = uuid4().hex
         grant = self._grant(request)
         snapshot, resumed_from, refusal = self._resume_state(request, grant)
         if refusal is not None:
-            return self._refuse(request, grant, trace_id, *refusal)
+            return self._refuse(request, grant, trace_id, *refusal, started=started)
 
         system_prompt, user_prompt = self._prompt_builder(request, grant)
         result = self._loop.run(
@@ -209,9 +213,12 @@ class HarnessExecutor(Executor):
         trace_id: str,
         error_code: str,
         message: str,
+        *,
+        started: float | None = None,
     ) -> ExecutionResult:
         """存在断点但不允许续跑：拒绝执行，交人工核实，绝不盲目重来。"""
 
+        duration_ms = int((time.monotonic() - started) * 1000) if started is not None else 0
         output = {
             "trace_id": trace_id,
             "tool": request.tool,
@@ -222,7 +229,7 @@ class HarnessExecutor(Executor):
             "trace": [],
             "model_calls": 0,
             "tokens": 0,
-            "duration_ms": 0,
+            "duration_ms": duration_ms,
             "stop_reason": "refused",
             "risk": max_risk(grant.risks).value,
         }
@@ -233,6 +240,7 @@ class HarnessExecutor(Executor):
             outcome=ExecutionOutcome.UNCONFIRMED,
             error_code=error_code,
             stop_reason="refused",
+            duration_ms=duration_ms,
         )
         return ExecutionResult(
             outcome=ExecutionOutcome.UNCONFIRMED,
