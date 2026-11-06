@@ -36,6 +36,7 @@ from workpanda.harness.tools import (
     ToolError,
     ToolGrant,
     ToolRegistry,
+    ToolResultSummary,
     validate_arguments,
 )
 from workpanda.harness.trace import InMemoryTraceStore
@@ -376,7 +377,83 @@ def test_loop_stops_on_max_tool_calls() -> None:
     result = loop.run(system_prompt="s", user_prompt="u", grant=grant, context=context())
 
     assert result.stop_reason is StopReason.MAX_TOOL_CALLS
-    assert len(result.tool_calls) == 1
+    # 没轮到的调用不再是"凭空消失"：记成 SKIPPED，但绝不能算执行过。
+    assert [record.outcome for record in result.tool_calls] == [
+        ToolOutcome.OK,
+        ToolOutcome.SKIPPED,
+    ]
+    assert result.tool_calls[1].call_id == "b"
+    assert result.tool_calls[1].error_code == "budget_max_tool_calls"
+    assert ToolResultSummary.from_records(result.tool_calls).executed == 1
+    assert EventKind.TOOL_SKIPPED in [event.kind for event in result.events]
+    # 跳过的调用不消耗调用预算：stopped 事件里的用量只算真正发起过的那一条。
+    assert result.events[-1].data["budget"]["tool_calls"] == 1
+
+
+def test_skipped_calls_leave_a_resumable_conversation() -> None:
+    """中止后断点里的对话必须合法。
+
+    assistant 带着两条 tool_calls、却只有一条 tool 回执时，OpenAI 兼容接口会
+    直接 400。以前"跳过调用不留痕"顺带留下了这个畸形断点，续跑必炸。
+    """
+
+    batch = ModelResponse(
+        tool_calls=[
+            tool_call("test_echo", call_id="a", text="1"),
+            tool_call("test_echo", call_id="b", text="2"),
+        ]
+    )
+    snapshots: list[Any] = []
+    loop = AgentLoop(ScriptedModelClient([batch] * 3), max_steps=3, max_tool_calls=1)
+
+    result = loop.run(
+        system_prompt="s",
+        user_prompt="u",
+        grant=ToolGrant(registry=registry_with(EchoTool()), allowed=frozenset({"test_echo"})),
+        context=context(),
+        on_progress=snapshots.append,
+    )
+
+    assert result.stop_reason is StopReason.MAX_TOOL_CALLS
+    last = snapshots[-1]
+    assistant = next(
+        message for message in reversed(last.messages) if message.role is MessageRole.ASSISTANT
+    )
+    tool_ids = [
+        message.tool_call_id
+        for message in last.messages
+        if message.role is MessageRole.TOOL
+    ]
+    assert [call.call_id for call in assistant.tool_calls] == tool_ids == ["a", "b"]
+    # 断点里也要能看到"第二条没做过"，续跑才不会误以为它还在待办队列里。
+    assert [record.call_id for record in last.tool_calls] == ["a", "b"]
+    assert last.tool_calls[1].outcome is ToolOutcome.SKIPPED
+
+
+def test_executor_trace_counts_skipped_calls_separately() -> None:
+    """trace 的 tool_calls 是"做了几次"，跳过的单独成列，不能混在一起。"""
+
+    traces = InMemoryTraceStore()
+    client = ScriptedModelClient(
+        [
+            ModelResponse(
+                tool_calls=[
+                    tool_call("test_echo", call_id="a", text="1"),
+                    tool_call("test_echo", call_id="b", text="2"),
+                ]
+            )
+        ]
+    )
+    executor = make_executor(client, EchoTool(), max_tool_calls=1, traces=traces)
+
+    result = executor.execute(request_for())
+    saved = traces.list(limit=1)[0]
+
+    assert result.outcome is ExecutionOutcome.UNCONFIRMED
+    assert saved.tool_calls == 1
+    assert saved.skipped_tool_calls == 1
+    assert saved.outcome == "unconfirmed"
+
 
 
 def test_loop_maps_model_failures() -> None:
@@ -1111,10 +1188,13 @@ def test_parallel_falls_back_when_budget_cannot_fit_batch() -> None:
         context=context(),
     )
 
-    # 预算放不下整批时退回串行，保持"已执行的调用仍然留痕"的既有语义。
+    # 预算放不下整批时退回串行：已执行的留痕，没轮到的记成 SKIPPED。
     assert result.stop_reason is StopReason.MAX_TOOL_CALLS
-    assert len(result.tool_calls) == 1
-    assert len(tool.windows) == 1
+    assert [record.outcome for record in result.tool_calls] == [
+        ToolOutcome.OK,
+        ToolOutcome.SKIPPED,
+    ]
+    assert len(tool.windows) == 1, "第二条绝不能真的执行"
     assert EventKind.TOOLS_PARALLEL not in [event.kind for event in result.events]
 
 

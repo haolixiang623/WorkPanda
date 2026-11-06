@@ -245,6 +245,46 @@ def test_execution_and_effect_are_archived(tmp_path: Path) -> None:
     assert execution.trace_id == result.output["trace_id"]
 
 
+def test_skipped_calls_are_counted_but_never_archived_as_effects(tmp_path: Path) -> None:
+    """预算掐断的第二条提交没发生过：归档里只能有一笔真实副作用。"""
+
+    path = tmp_path / "audit.jsonl"
+    tool = SubmitTool()
+    registry = ToolRegistry()
+    registry.register(tool)
+    client = ScriptedModelClient(
+        [
+            ModelResponse(
+                tool_calls=[
+                    tool_call(tool.spec.name, call_id="c1", token="t1"),
+                    tool_call(tool.spec.name, call_id="c2", token="t2"),
+                ]
+            )
+        ]
+    )
+    executor = HarnessExecutor(
+        client, registry=registry, deadline_seconds=30, audit=journal(path), max_tool_calls=1
+    )
+    request = ExecutionRequest(
+        task_id=uuid.uuid4(),
+        flow_id="test.flow",
+        flow_version="1",
+        step_id="submit",
+        tool=tool.spec.name,
+        instruction="提交单据",
+        arguments={"token": "t1"},
+    )
+
+    executor.execute(request)
+    records = journal(path).read()
+    execution = next(record for record in records if record.kind is AuditKind.EXECUTION)
+
+    assert len([record for record in records if record.kind is AuditKind.EFFECT]) == 1
+    assert execution.payload["tool_calls"] == 1
+    assert execution.payload["skipped_tool_calls"] == 1
+    assert execution.payload["effects_applied"] == 1
+
+
 def test_sensitive_arguments_never_reach_the_archive(tmp_path: Path) -> None:
     path = tmp_path / "audit.jsonl"
 

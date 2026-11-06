@@ -47,6 +47,9 @@ class TraceRecord(BaseModel):
     blocked_tool_calls: int = Field(default=0, ge=0)
     failed_tool_calls: int = Field(default=0, ge=0)
     timed_out_tool_calls: int = Field(default=0, ge=0)
+    # 模型要求过、但因预算用尽或取消没执行的调用。不计入 tool_calls：
+    # 那几件"没做"的事要能被单独检索到，而不是混进"做了几次"里。
+    skipped_tool_calls: int = Field(default=0, ge=0)
     tokens: int = Field(default=0, ge=0)
     duration_ms: int = Field(default=0, ge=0)
     # 这次执行是从哪个 trace 续跑来的。为空表示从零开始，事后据此判断"重试了几次"。
@@ -67,6 +70,7 @@ class TraceSummary(BaseModel):
     blocked_tool_calls: int = 0
     failed_tool_calls: int = 0
     timed_out_tool_calls: int = 0
+    skipped_tool_calls: int = 0
     avg_model_calls: float = 0.0
     avg_duration_ms: float = 0.0
     tokens_total: int = 0
@@ -139,6 +143,7 @@ def summarize(records: Sequence[TraceRecord]) -> TraceSummary:
         blocked_tool_calls=sum(record.blocked_tool_calls for record in records),
         failed_tool_calls=sum(record.failed_tool_calls for record in records),
         timed_out_tool_calls=sum(record.timed_out_tool_calls for record in records),
+        skipped_tool_calls=sum(record.skipped_tool_calls for record in records),
         avg_model_calls=round(sum(record.model_calls for record in records) / total, 2),
         avg_duration_ms=round(sum(record.duration_ms for record in records) / total, 1),
         tokens_total=sum(record.tokens for record in records),

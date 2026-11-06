@@ -415,13 +415,24 @@ def _invoke_with_timeout(
 
 @dataclass(frozen=True)
 class ToolResultSummary:
-    """对一组调用记录的只读汇总，供 trace 与运维指标使用。"""
+    """对一组调用记录的只读汇总，供 trace 与运维指标使用。
+
+    `total` 包含所有记录，因此 `executed` 要单独给：被预算或取消省下的调用
+    也占一条记录，但它们没有被调用过，不该算进"调了几次工具"。
+    """
 
     total: int
     succeeded: int
     failed: int
     blocked: int
     timed_out: int
+    skipped: int = 0
+
+    @property
+    def executed(self) -> int:
+        """真正发起过的调用次数（不含被省下的）。"""
+
+        return max(0, self.total - self.skipped)
 
     @classmethod
     def from_records(cls, records: Sequence[ToolCallRecord]) -> ToolResultSummary:
@@ -431,6 +442,7 @@ class ToolResultSummary:
             failed=sum(1 for record in records if record.outcome is ToolOutcome.ERROR),
             blocked=sum(1 for record in records if record.outcome is ToolOutcome.BLOCKED),
             timed_out=sum(1 for record in records if record.outcome is ToolOutcome.TIMEOUT),
+            skipped=sum(1 for record in records if record.outcome is ToolOutcome.SKIPPED),
         )
 
 

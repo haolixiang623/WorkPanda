@@ -240,10 +240,14 @@ def test_loop_skips_remaining_tool_calls_after_cancel() -> None:
     result = run_loop(client, registry_with(echo, other), cancel=token, tool_concurrency=1)
 
     assert result.stop_reason is StopReason.CANCELLED
-    assert [record.call_id for record in result.tool_calls] == ["1"], "只应留下已执行的那一条"
+    # 两条都在留痕里，但一条是"没执行过"，不能与已执行的混为一谈。
+    assert [record.call_id for record in result.tool_calls] == ["1", "2"]
+    assert [record.outcome.value for record in result.tool_calls] == ["ok", "skipped"]
+    assert result.tool_calls[1].error_code == "cancelled"
     assert echo.calls == [{"text": "a"}]
     assert other.calls == [], "取消之后不该再发起新的调用"
     assert len(client.calls) == 1, "停止后不该再请求模型"
+    assert EventKind.TOOL_SKIPPED in [event.kind for event in result.events]
     cancelled = [event for event in result.events if event.kind is EventKind.CANCELLED]
     assert cancelled[0].data["stage"] == "before_tool"
     assert cancelled[0].data["skipped_calls"] == ["test_echo_second"]

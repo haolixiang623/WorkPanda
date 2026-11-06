@@ -29,6 +29,7 @@ from workpanda.harness.models import (
     HarnessMessage,
     MessageRole,
     ModelResponse,
+    RiskLevel,
     ToolCall,
     ToolCallRecord,
     ToolOutcome,
@@ -226,6 +227,71 @@ class AgentLoop:
             # 工具调用一旦落账就可能是副作用，必须立刻可恢复。
             report_progress()
 
+        def skip(
+            calls: Sequence[ToolCall],
+            cause: BaseException,
+            *,
+            mirror_messages: bool = False,
+        ) -> None:
+            """把因预算用尽或取消而没执行的调用记成 SKIPPED。
+
+            这件事以前是空缺的：预算在中途耗尽时，剩余调用一条记录都没有，
+            事后只能看到"模型要求了 5 件事、做了 3 件"，却答不出另外 2 件是什么。
+            取消路径稍好一点（事件里留了名字），但同样不可检索、不可计数。
+
+            `mirror_messages=True` 表示助手那条"我要调这些工具"已经进了对话历史
+            （批次执行到一半才中止）。此时必须给每条没跑的调用补一条工具回执：
+            OpenAI 兼容接口要求 assistant.tool_calls 与 tool 消息一一对应，
+            否则断点续跑会拿着一段畸形对话再发给模型，直接被网关 400 拒掉。
+            取消发生在模型刚给出清单、工具一条未动时，助手消息还没入历史，
+            反而不能补回执——补了就是凭空多出一条没有来源的观察。
+
+            另外三条边界刻意保持不变：
+
+            - 不消耗预算：它们没有被调用过；
+            - 不当副作用：`build_effects` 只认 OK/TIMEOUT，SKIPPED 确定没改动外部世界；
+            - 不算"成功依据"：`ToolCallRecord.succeeded` 只认 OK。
+            """
+
+            code = (
+                "cancelled"
+                if isinstance(cause, Cancelled)
+                else f"budget_{getattr(cause, 'reason', 'exhausted')}"
+            )
+            for call in calls:
+                spec = grant.spec_for(call.name)
+                record = ToolCallRecord(
+                    call_id=call.call_id,
+                    name=call.name,
+                    arguments=call.arguments,
+                    outcome=ToolOutcome.SKIPPED,
+                    content="本次执行已中止，该调用未执行。",
+                    error_code=code,
+                    risk=spec.risk if spec is not None else RiskLevel.LOW,
+                )
+                records.append(record)
+                if mirror_messages:
+                    messages.append(
+                        HarnessMessage(
+                            role=MessageRole.TOOL,
+                            tool_call_id=call.call_id,
+                            name=call.name,
+                            content=_tool_content(record),
+                        )
+                    )
+                emit(
+                    EventKind.TOOL_SKIPPED,
+                    {
+                        "call_id": call.call_id,
+                        "name": call.name,
+                        "error_code": code,
+                        "reason": _skip_reason(cause),
+                    },
+                )
+            # 中止留下的状态也要可恢复：断点必须知道"这几件没做过"，
+            # 否则续跑时会以为它们还在队列里，甚至重复提交。
+            report_progress()
+
         def finish(*args, **kwargs) -> LoopResult:
             """统一收尾：把预算用量补进 stopped 事件，事后能判断是否被预算掐断。"""
 
@@ -262,9 +328,15 @@ class AgentLoop:
                 if response.tool_calls:
                     # 模型刚给出调用清单、工具还没动：取消赶在这时到达，一条都不执行。
                     # 这正是"点了取消却还是提交了"最容易发生的窗口。
-                    check_cancel(
-                        "before_tool", skipped=[call.name for call in response.tool_calls]
-                    )
+                    try:
+                        check_cancel(
+                            "before_tool", skipped=[call.name for call in response.tool_calls]
+                        )
+                    except Cancelled as exc:
+                        # 一条都没跑，但模型要求过：省下的这几条同样要留痕。
+                        # 助手消息尚未入历史，不能补工具回执。
+                        skip(response.tool_calls, exc)
+                        raise
                     messages.append(
                         HarnessMessage(
                             role=MessageRole.ASSISTANT,
@@ -280,6 +352,7 @@ class AgentLoop:
                         accept=accept,
                         emit=emit,
                         check_cancel=check_cancel,
+                        skip=skip,
                     )
                     continue
 
@@ -357,6 +430,7 @@ class AgentLoop:
         accept: Callable[[ToolCall, ToolCallRecord], None],
         emit: Callable[[EventKind, dict], None],
         check_cancel: Callable[..., None] | None = None,
+                skip: Callable[..., None] | None = None,
     ) -> None:
         """执行同一轮的多个工具调用，逐条交给 `accept` 落账。
 
@@ -372,18 +446,33 @@ class AgentLoop:
         取消的边界在这里最窄：串行时每条调用之前检查一次，被省下的就是后面那几条；
         并行批次一旦提交就整批跑完（它们都是幂等工具，重放安全），结果照常落账，
         真正的停发生在下一轮模型调用之前。
+
+        中止（预算用尽或取消）时，没执行的调用交给 `skip` 记成 SKIPPED：
+        否则这段空档在留痕里完全不存在，事后无法回答"模型还要求了什么没做"。
         """
 
         guard = check_cancel or _no_cancel
+        on_skip = skip or _no_skip
         workers = self._parallel_workers(calls, grant, budget)
         if workers <= 0:
             for index, call in enumerate(calls):
-                guard("before_tool", [pending.name for pending in calls[index:]])
-                budget.consume_tool_call()
+                pending = list(calls[index:])
+                try:
+                    guard("before_tool", [item.name for item in pending])
+                    budget.consume_tool_call()
+                except (Cancelled, BudgetExhausted) as exc:
+                    # 助手消息已在历史里：补回执，续跑才拿得到合法对话。
+                    on_skip(pending, exc, mirror_messages=True)
+                    raise
                 accept(call, grant.call(call, self._tool_context(context, budget)))
             return
 
-        guard("before_tool", [call.name for call in calls])
+        try:
+            guard("before_tool", [call.name for call in calls])
+        except Cancelled as exc:
+            # 并发批次一条都没提交：整批都算省下的，不能凭空消失。
+            on_skip(calls, exc, mirror_messages=True)
+            raise
         emit(
             EventKind.TOOLS_PARALLEL,
             {
@@ -522,6 +611,23 @@ def _no_cancel(stage: str, skipped: Sequence[str] = ()) -> None:
     """未启用取消时的空闸门，免得每个调用点都判一次 None。"""
 
     return None
+
+
+def _no_skip(
+    calls: Sequence[ToolCall], cause: BaseException, *, mirror_messages: bool = False
+) -> None:
+    """未接入留痕时的空动作，保持 `_dispatch_tools` 可在测试里单独调用。"""
+
+    return None
+
+
+def _skip_reason(cause: BaseException) -> str:
+    """把中止原因压成一句给人看的话，避免运维对着错误码猜。"""
+
+    if isinstance(cause, Cancelled):
+        return f"执行被取消（原因 {cause.reason}，边界 {cause.stage}）"
+    reason = getattr(cause, "reason", "exhausted")
+    return f"预算用尽（{reason}）"
 
 
 def _crashed(call: ToolCall, exc: BaseException) -> ToolCallRecord:
