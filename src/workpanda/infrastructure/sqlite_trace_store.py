@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS harness_traces (
     blocked_tool_calls INTEGER NOT NULL,
     failed_tool_calls INTEGER NOT NULL,
     timed_out_tool_calls INTEGER NOT NULL,
+    skipped_tool_calls INTEGER NOT NULL DEFAULT 0,
     tokens INTEGER NOT NULL,
     duration_ms INTEGER NOT NULL,
     resumed_from TEXT,
@@ -67,6 +68,7 @@ SELECT
     COALESCE(SUM(blocked_tool_calls), 0) AS blocked_tool_calls,
     COALESCE(SUM(failed_tool_calls), 0) AS failed_tool_calls,
     COALESCE(SUM(timed_out_tool_calls), 0) AS timed_out_tool_calls,
+    COALESCE(SUM(skipped_tool_calls), 0) AS skipped_tool_calls,
     COALESCE(AVG(model_calls), 0) AS avg_model_calls,
     COALESCE(AVG(duration_ms), 0) AS avg_duration_ms,
     COALESCE(SUM(tokens), 0) AS tokens_total
@@ -76,7 +78,8 @@ FROM harness_traces
 _COLUMNS = (
     "trace_id, task_id, flow_id, flow_version, step_id, outcome, stop_reason, error_code,"
     " risk, model_calls, tool_calls, successful_tool_calls, blocked_tool_calls,"
-    " failed_tool_calls, timed_out_tool_calls, tokens, duration_ms, resumed_from, created_at"
+    " failed_tool_calls, timed_out_tool_calls, skipped_tool_calls, tokens, duration_ms,"
+    " resumed_from, created_at"
 )
 
 
@@ -86,6 +89,12 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
     existing = {row["name"] for row in conn.execute("PRAGMA table_info(harness_traces)")}
     if "resumed_from" not in existing:
         conn.execute("ALTER TABLE harness_traces ADD COLUMN resumed_from TEXT")
+    if "skipped_tool_calls" not in existing:
+        # 老记录里没有"被省下的调用"，按 0 处理；补列必须带 DEFAULT，
+        # 否则 SQLite 无法给已有行填值。
+        conn.execute(
+            "ALTER TABLE harness_traces ADD COLUMN skipped_tool_calls INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 class SqliteTraceStore:
@@ -115,7 +124,7 @@ class SqliteTraceStore:
         with self._lock:
             self._conn.execute(
                 f"INSERT OR REPLACE INTO harness_traces ({_COLUMNS})"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     record.trace_id,
                     str(record.task_id),
@@ -132,6 +141,7 @@ class SqliteTraceStore:
                     record.blocked_tool_calls,
                     record.failed_tool_calls,
                     record.timed_out_tool_calls,
+                    record.skipped_tool_calls,
                     record.tokens,
                     record.duration_ms,
                     record.resumed_from,
@@ -181,6 +191,7 @@ class SqliteTraceStore:
             blocked_tool_calls=int(row["blocked_tool_calls"]),
             failed_tool_calls=int(row["failed_tool_calls"]),
             timed_out_tool_calls=int(row["timed_out_tool_calls"]),
+            skipped_tool_calls=int(row["skipped_tool_calls"]),
             avg_model_calls=round(float(row["avg_model_calls"]), 2),
             avg_duration_ms=round(float(row["avg_duration_ms"]), 1),
             tokens_total=int(row["tokens_total"]),
@@ -209,6 +220,7 @@ class SqliteTraceStore:
             blocked_tool_calls=int(row["blocked_tool_calls"]),
             failed_tool_calls=int(row["failed_tool_calls"]),
             timed_out_tool_calls=int(row["timed_out_tool_calls"]),
+            skipped_tool_calls=int(row["skipped_tool_calls"]),
             tokens=int(row["tokens"]),
             duration_ms=int(row["duration_ms"]),
             resumed_from=row["resumed_from"],

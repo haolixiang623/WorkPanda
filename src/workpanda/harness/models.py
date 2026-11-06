@@ -83,10 +83,14 @@ class ToolOutcome(StrEnum):
     OK = "ok"
     # 工具执行了但返回失败。
     ERROR = "error"
-    # 未执行：未授权、未注册或参数不合法。
+    # 未执行：未授权、未注册、参数不合法或重复副作用——是闸门拒绝了它。
     BLOCKED = "blocked"
     # 执行未在限期内返回。结果未知，绝不能当失败重试。
     TIMEOUT = "timeout"
+    # 未执行，但不是因为闸门拒绝：预算用尽或执行被取消，这次没轮到它。
+    # 必须单独留痕，否则事后只能看到"模型要求了 5 件事、做了 3 件"，
+    # 却答不出另外 2 件是什么、为什么没做。
+    SKIPPED = "skipped"
 
 
 class ToolCallRecord(BaseModel):
@@ -167,6 +171,9 @@ class EventKind(StrEnum):
     # 否则事后按耗时排查会以为它们串行。
     TOOLS_PARALLEL = "tools_parallel"
     TOOL_COMPLETED = "tool_completed"
+    # 模型要求过、但因为预算用尽或取消而没有执行的调用。与 BLOCKED 区分开：
+    # 前者是"系统拒绝了你"，后者是"这次没轮到"，两种情况的处置完全不同。
+    TOOL_SKIPPED = "tool_skipped"
     # 观察到取消请求，以及在哪个边界上停下的。取消也是事实，必须留痕：
     # 否则事后只看到"执行提前结束"，会误判成预算耗尽或模型抖动。
     CANCELLED = "cancelled"

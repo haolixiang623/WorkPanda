@@ -101,6 +101,18 @@ def test_blocked_and_failed_calls_are_not_effects() -> None:
     assert build(records) == []
 
 
+def test_skipped_calls_are_not_effects() -> None:
+    """被预算/取消省下的非幂等调用确定没发生过，不能让人工再去核对一次。"""
+
+    records = [
+        record(outcome=ToolOutcome.SKIPPED, error_code="budget_max_tool_calls"),
+        record(outcome=ToolOutcome.SKIPPED, error_code="cancelled"),
+    ]
+
+    assert build(records) == []
+    assert summarize_effects(build(records)).requires_manual_check is False
+
+
 def test_unknown_tool_is_treated_as_side_effecting() -> None:
     # 登记表里查不到这个工具（例如热更新后注册表落后），宁可多一条待核对，
     # 也不能把一次真实提交当成"查询"漏掉。

@@ -14,7 +14,9 @@ from workpanda.harness.trace import InMemoryTraceStore, TraceRecord, summarize
 from workpanda.infrastructure.sqlite_trace_store import SqliteTraceStore
 
 
-def record(*, outcome: str = "succeeded", trace_id: str | None = None) -> TraceRecord:
+def record(
+    *, outcome: str = "succeeded", trace_id: str | None = None, skipped_tool_calls: int = 0
+) -> TraceRecord:
     return TraceRecord(
         trace_id=trace_id or uuid.uuid4().hex,
         task_id=uuid.uuid4(),
@@ -30,6 +32,7 @@ def record(*, outcome: str = "succeeded", trace_id: str | None = None) -> TraceR
         blocked_tool_calls=1,
         failed_tool_calls=0,
         timed_out_tool_calls=0,
+        skipped_tool_calls=skipped_tool_calls,
         tokens=100,
         duration_ms=50,
     )
@@ -151,6 +154,30 @@ def test_existing_table_is_migrated_for_resume_lineage(workdir: Path) -> None:
 
     assert [item.trace_id for item in items] == ["after-migration"]
     assert items[0].resumed_from is None
+    # 同一套补列机制也要覆盖新增的 skipped_tool_calls，老行按 0 算。
+    assert items[0].skipped_tool_calls == 0
+
+
+def test_skipped_calls_are_persisted_and_aggregated(workdir: Path) -> None:
+    """被省下的调用要能跨重启检索，且 SQL 与内存聚合口径一致。"""
+
+    records = [record(), record(skipped_tool_calls=2, trace_id="with-skips")]
+    memory = InMemoryTraceStore()
+    store = SqliteTraceStore(workdir / "traces.db")
+    try:
+        for item in records:
+            memory.save(item)
+            store.save(item)
+        from_sql = store.summary()
+        saved = store.list(limit=1)[0]
+    finally:
+        store.close()
+
+    assert saved.skipped_tool_calls == 2
+    assert from_sql.skipped_tool_calls == 2
+    assert from_sql.model_dump() == memory.summary().model_dump()
+    # 只有真正发起过的调用计数，跳过的不能混进"调了几次"。
+    assert from_sql.tool_calls == 6
 
 
 def test_trace_backend_resolution() -> None:
