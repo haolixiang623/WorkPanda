@@ -60,19 +60,52 @@ def parse_contract(text: str) -> tuple[ExecutionOutcome, dict[str, Any]]:
 
 
 def extract_json(text: str) -> dict[str, Any] | None:
-    """从模型输出里取出一个 JSON 对象，容忍 ```json 代码块围栏。"""
+    """从模型输出里取出**唯一一个** JSON 对象，容忍围栏与前导/尾随文字。
+
+    以前用"第一个 { 到最后一个 }"整段 `json.loads`：模型只要多说一句话、
+    加个示例或补一段解释，整段就解析失败，明明给了结论也变成 `unparsable_output`。
+    现在按花括号逐个尝试 `raw_decode`，但严格保持一条不变式：
+
+    **能解析出两个及以上 JSON 对象时一律返回 None。** 例如"这是示例 {...}，
+    真正结果是 {...}"——此时无法判断哪个才是模型真正的结论，猜错就可能把
+    `succeeded` 读进一个本该未确认的步骤。宁可转人工，不能猜。
+
+    `raw_decode` 会一次吃掉整个对象（含嵌套），因此嵌套字段不会被重复计数；
+    候选数量有上限，避免恶意/异常输出让解析变成 CPU 黑洞。
+    """
+
+    cleaned = _strip_fence(text)
+    decoder = json.JSONDecoder()
+    candidates: list[dict[str, Any]] = []
+    cursor = 0
+    while len(candidates) <= _MAX_JSON_CANDIDATES:
+        start = cleaned.find("{", cursor)
+        if start == -1:
+            break
+        try:
+            parsed, end = decoder.raw_decode(cleaned, start)
+        except json.JSONDecodeError:
+            cursor = start + 1
+            continue
+        if isinstance(parsed, dict):
+            candidates.append(parsed)
+        cursor = max(end, start + 1)
+
+    return candidates[0] if len(candidates) == 1 else None
+
+
+_MAX_JSON_CANDIDATES = 20
+
+
+def _strip_fence(text: str) -> str:
+    """去掉一层 ``` 围栏；不是围栏的文本原样返回。"""
 
     cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`")
-        if cleaned.lstrip().lower().startswith("json"):
-            cleaned = cleaned.lstrip()[4:]
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start == -1 or end <= start:
-        return None
-    try:
-        parsed = json.loads(cleaned[start : end + 1])
-    except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
+    if not cleaned.startswith("```"):
+        return cleaned
+    newline = cleaned.find("\n")
+    cleaned = cleaned[newline + 1 :] if newline != -1 else cleaned.strip("`")
+    closing = cleaned.rfind("```")
+    if closing != -1:
+        cleaned = cleaned[:closing]
+    return cleaned.strip()

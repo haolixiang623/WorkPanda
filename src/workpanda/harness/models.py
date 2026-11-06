@@ -156,6 +156,9 @@ class TokenUsage(BaseModel):
 
 class ModelResponse(BaseModel):
     text: str = ""
+    # 推理模型（如 deepseek-reasoner 类）会把思考过程放在 reasoning_content 里，
+    # 与最终答复分开返回。它只用于留痕排障，绝不参与契约解析或作为成功依据。
+    reasoning: str = ""
     tool_calls: list[ToolCall] = Field(default_factory=list)
     finish_reason: str | None = None
     duration_ms: int = 0
