@@ -1,0 +1,51 @@
+name: 仓库基础门禁
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - 'workbuddy/**'
+
+permissions:
+  contents: read
+
+jobs:
+  governance:
+    name: 文档与敏感信息基础检查
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 检查必需规范文件
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s AGENTS.md
+          test -s design/DESIGN.md
+          test -s docs/DEVELOPMENT-OPERATING-MECHANISM.md
+          test -s .github/pull_request_template.md
+          test -s .github/ISSUE_TEMPLATE/feature.yml
+          test -s .github/ISSUE_TEMPLATE/bug.yml
+
+      - name: 检查 Markdown 空白和链接引用
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git grep -nE '[[:blank:]]+$' -- '*.md' '*.yml'; then
+            echo '发现行尾空白，请修复后再提交。' >&2
+            exit 1
+          fi
+          for path in AGENTS.md design/DESIGN.md docs/DEVELOPMENT-OPERATING-MECHANISM.md; do
+            test -s "$path"
+          done
+
+      - name: 基础敏感信息扫描
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git grep -nI -E '(AKIA[0-9A-Z]{16}|-----BEGIN (RSA|EC|OPENSSH|PRIVATE) KEY-----|gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,})' -- ':!*.lock'; then
+            echo '疑似凭据或私钥进入仓库，请移除并通过授权的密钥渠道处理。' >&2
+            exit 1
+          fi

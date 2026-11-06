@@ -1,0 +1,68 @@
+name: 功能需求
+description: 提交一个可验收的功能或用户价值切片
+title: "[功能] "
+labels:
+  - type:feature
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请先阅读 AGENTS.md 和 docs/DEVELOPMENT-OPERATING-MECHANISM.md。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 用户问题与预期结果
+      description: 谁遇到了什么问题？完成后用户能做什么？
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: 范围与非目标
+      description: 明确本次做什么，以及明确不做什么。
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收标准
+      description: 使用可观察结果描述正常、失败、恢复和不应发生的行为。
+      value: |
+        - [ ] 正常路径：
+        - [ ] 缺参/歧义：
+        - [ ] 失败/超时：
+        - [ ] 取消/重试/恢复：
+        - [ ] 不应发生：
+    validations:
+      required: true
+  - type: dropdown
+    id: risk
+    attributes:
+      label: 风险等级
+      options:
+        - 低：展示或无副作用公开信息
+        - 中：表单、会话、任务状态或浏览器自动化
+        - 高：提交、发送、改业务数据、认证、权限或敏感数据
+    validations:
+      required: true
+  - type: checkboxes
+    id: impact
+    attributes:
+      label: 影响范围
+      options:
+        - label: 涉及个人信息或敏感数据
+        - label: 可能产生外部副作用
+        - label: 涉及权限、认证或工具白名单
+        - label: 涉及群众侧 UI
+        - label: 需要业务或安全责任人确认
+  - type: textarea
+    id: validation
+    attributes:
+      label: 验证计划
+      description: 写明拟运行的测试、评测、用户走查或试点验证。
+    validations:
+      required: true
+  - type: textarea
+    id: decisions
+    attributes:
+      label: 待确认问题与依赖
