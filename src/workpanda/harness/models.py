@@ -16,6 +16,11 @@ from pydantic import BaseModel, Field
 # 单次工具返回最多保留的字符数，避免把大响应写进任务事件。
 MAX_TOOL_CONTENT = 4000
 
+# 工具抛出未预期异常（不是自报的 `ToolError`）时的错误码。它不是普通失败：
+# 工具没能把话说完，外部状态因此未知——账本按 `unknown` 入账、断点按不可续跑处理。
+# 常量放在这里，避免"崩溃"这个语义在 tools / loop / effects / executor 里各写一份字符串。
+CRASH_ERROR_CODE = "tool_crashed"
+
 
 def utc_now() -> datetime:
     return datetime.now(UTC)

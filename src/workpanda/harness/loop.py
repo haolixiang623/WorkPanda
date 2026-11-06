@@ -24,6 +24,7 @@ from workpanda.harness.cancel import Cancelled, CancelToken
 from workpanda.harness.checkpoint import ExecutionSnapshot
 from workpanda.harness.clients import ModelClient, ModelError, ModelTimeout
 from workpanda.harness.models import (
+    CRASH_ERROR_CODE,
     EventKind,
     HarnessEvent,
     HarnessMessage,
@@ -500,7 +501,7 @@ class AgentLoop:
                 try:
                     record = future.result()
                 except Exception as exc:  # noqa: BLE001 - 单条异常不能击穿整轮
-                    record = _crashed(call, exc)
+                    record = _crashed(call, exc, risk=_risk_of(grant, call))
                 accept(call, record)
 
     def _parallel_workers(
@@ -636,10 +637,25 @@ def _skip_reason(cause: BaseException) -> str:
     return f"预算用尽（{reason}）"
 
 
-def _crashed(call: ToolCall, exc: BaseException) -> ToolCallRecord:
+def _risk_of(grant: ToolGrant, call: ToolCall) -> RiskLevel:
+    """崩溃记录要用的风险等级，按工具声明取；查不到就按最高风险处理。
+
+    取不到声明说明登记表与调用对不上（热更新、注册表落后），此时宁可把这次
+    崩溃标成高风险让人看见，也不能默认 low 把它埋掉。
+    """
+
+    spec = grant.spec_for(call.name)
+    return RiskLevel.HIGH if spec is None else spec.risk
+
+
+def _crashed(call: ToolCall, exc: BaseException, *, risk: RiskLevel) -> ToolCallRecord:
     """并行调度里单条调用抛出未预期异常时的兜底记录。
 
     宁可留下一条"执行异常"，也不能让整轮带着"有条调用不知去向"继续跑。
+
+    `risk` 由调用方带进来、且**不给默认值**：崩溃记录若一律记成 low，高风险提交
+    出的事在归档里就看不出来了。`CRASH_ERROR_CODE` 也不只是"另一个错误码"——
+    账本据此按"结果未知"入账，断点据此拒绝续跑。
     """
 
     return ToolCallRecord(
@@ -648,7 +664,8 @@ def _crashed(call: ToolCall, exc: BaseException) -> ToolCallRecord:
         arguments=call.arguments,
         outcome=ToolOutcome.ERROR,
         content=f"工具执行异常：{type(exc).__name__}",
-        error_code="tool_crashed",
+        error_code=CRASH_ERROR_CODE,
+        risk=risk,
     )
 
 

@@ -26,6 +26,7 @@ from uuid import UUID
 from pydantic import BaseModel, Field
 
 from workpanda.harness.models import (
+    CRASH_ERROR_CODE,
     RiskLevel,
     ToolCallRecord,
     ToolOutcome,
@@ -107,10 +108,14 @@ def build_effects(
 
     判定口径（宁可多一条待核对，也不要漏掉一次真实提交）：
 
-    - 声明的幂等工具（查询类）一律不算副作用，包括它超时的情况；
+    - 声明的幂等工具（查询类）一律不算副作用，包括它超时或崩溃的情况；
     - 未声明 `specs` 里的工具按"可能有副作用"处理——登记表缺失时保守对待；
     - 成功 → `applied`；超时 → `unknown`；
-    - 被拦（未授权/参数不合法/重复提交）与工具自报失败 → 明确没有执行，不入账。
+    - **崩溃 → `unknown`**：工具没自报就抛了未预期异常，说明它没能说完话。
+      连接重置、响应解析失败这类根因恰恰发生在请求已经发出去之后，
+      因此不能当"确定没执行"——这正是最需要人工核对的形态；
+    - 被拦（未授权/参数不合法/重复提交）与工具**自报**失败（`ToolError`）→
+      明确没有执行，不入账。
     """
 
     catalog = specs or {}
@@ -122,6 +127,9 @@ def build_effects(
         if record.outcome is ToolOutcome.OK:
             status = EffectStatus.APPLIED
         elif record.outcome is ToolOutcome.TIMEOUT:
+            status = EffectStatus.UNKNOWN
+        elif record.outcome is ToolOutcome.ERROR and record.error_code == CRASH_ERROR_CODE:
+            # 崩溃与"自报失败"是两件事：前者工具没能给出结论，外部状态未知。
             status = EffectStatus.UNKNOWN
         else:
             # 被拦或工具明确报错：外部系统没有被改动，不需要人工去核实。

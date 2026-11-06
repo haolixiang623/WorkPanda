@@ -73,6 +73,29 @@ class SlowTool:
         return "done"
 
 
+class CrashTool:
+    """非幂等提交工具：请求可能已送达外部，读响应时崩了。"""
+
+    spec = ToolSpec(
+        name="test_submit",
+        description="提交单据（崩）",
+        parameters={
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+        idempotent=False,
+    )
+
+    def __init__(self) -> None:
+        self.invocations = 0
+
+    def invoke(self, arguments: dict[str, Any], context: ToolContext) -> str:
+        self.invocations += 1
+        raise ConnectionResetError("connection reset by peer while reading response")
+
+
 def registry_with(*tools: Any) -> ToolRegistry:
     registry = ToolRegistry()
     for tool in tools:
@@ -214,6 +237,40 @@ def test_timeout_makes_checkpoint_unresumable_and_refuses_retry() -> None:
     assert client.calls == []
     # 断点保留给人工核实，不被静默丢弃。
     assert store.load(request.task_id, request.step_id) is not None
+
+
+def test_crash_makes_checkpoint_unresumable_and_refuses_retry() -> None:
+    """工具崩溃时请求可能已送达外部，断点绝不能被当成"可以接着跑"。"""
+
+    store = InMemoryCheckpointStore()
+    crash = CrashTool()
+    request = request_for()
+    request = request.model_copy(update={"arguments": {"value": "x"}})
+
+    with pytest.raises(RuntimeError):
+        crash_after_tool(crash, arguments={"value": "x"}, checkpoints=store).execute(request)
+
+    checkpoint = store.load(request.task_id, request.step_id)
+    assert checkpoint is not None
+    assert not checkpoint.resumable
+    assert checkpoint.blocked_reason == "tool_crashed"
+
+    client = ScriptedModelClient([])
+    executor = HarnessExecutor(
+        client,
+        registry=registry_with(crash),
+        deadline_seconds=30,
+        resume_enabled=True,
+        checkpoints=store,
+    )
+
+    result = executor.execute(request)
+
+    assert result.outcome is ExecutionOutcome.UNCONFIRMED
+    assert result.error_code == "checkpoint_not_resumable"
+    # 关键：一次都没有再提交，重复副作用的窗口被彻底关上。
+    assert client.calls == []
+    assert crash.invocations == 1
 
 
 def test_resume_is_off_by_default_and_leaves_no_checkpoint() -> None:

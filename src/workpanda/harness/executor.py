@@ -46,7 +46,12 @@ from workpanda.harness.contract import OUTCOME_CONTRACT, parse_contract
 from workpanda.harness.effects import build_effects, summarize_effects
 from workpanda.harness.lease import StepLeaseStore
 from workpanda.harness.loop import AgentLoop, LoopResult, StopReason
-from workpanda.harness.models import ToolCallRecord, ToolOutcome, max_risk
+from workpanda.harness.models import (
+    CRASH_ERROR_CODE,
+    ToolCallRecord,
+    ToolOutcome,
+    max_risk,
+)
 from workpanda.harness.redaction import DEFAULT_REDACTOR, Redactor, mask_values
 from workpanda.harness.tools import (
     ToolContext,
@@ -425,9 +430,26 @@ class HarnessExecutor(Executor):
 
         def save(snapshot: ExecutionSnapshot) -> None:
             # 任何一个工具出现"结果未知"，整次执行都不可续跑：外部可能已经执行。
-            timed_out = any(
-                record.outcome is ToolOutcome.TIMEOUT for record in snapshot.tool_calls
+            # 崩掉与超时同属这一类——工具没给出结论，续跑就可能把同一笔提交再发一次。
+            unknown = next(
+                (
+                    record
+                    for record in snapshot.tool_calls
+                    if record.outcome is ToolOutcome.TIMEOUT
+                    or (
+                        record.outcome is ToolOutcome.ERROR
+                        and record.error_code == CRASH_ERROR_CODE
+                    )
+                ),
+                None,
             )
+            blocked_reason = None
+            if unknown is not None:
+                blocked_reason = (
+                    "tool_timeout"
+                    if unknown.outcome is ToolOutcome.TIMEOUT
+                    else CRASH_ERROR_CODE
+                )
             store.save(
                 HarnessCheckpoint(
                     trace_id=trace_id,
@@ -438,8 +460,8 @@ class HarnessExecutor(Executor):
                     allowed_tools=list(grant.names),
                     snapshot=snapshot,
                     grant_state=grant.state(),
-                    resumable=not timed_out,
-                    blocked_reason="tool_timeout" if timed_out else None,
+                    resumable=unknown is None,
+                    blocked_reason=blocked_reason,
                 )
             )
 
