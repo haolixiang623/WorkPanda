@@ -12,6 +12,13 @@
    `resumed_from`，事后能看出"这一次是从哪一次接着跑的"；
 4. checkpoint 遇到"结果未知"（工具超时）即标为不可续跑，续跑请求一律拒绝，
    不做盲目重试。
+
+与"取消"有关的两条：
+
+5. 取消是人的决定，不是故障：结论同样是 `unconfirmed`（此前可能已有副作用），
+   但错误码是 `cancelled`，且**保留断点**——用户取消的是"继续跑"，不是"刚才没发生"；
+6. 取消请求可能先于执行到达：取令牌时先看登记表里有没有暂存的取消，
+   有就一步都不跑，连模型都不调。
 """
 
 from __future__ import annotations
@@ -28,6 +35,7 @@ from workpanda.application.ports import (
     Executor,
 )
 from workpanda.harness.audit import AuditJournal, entries_for_records
+from workpanda.harness.cancel import CancelRegistry, CancelToken
 from workpanda.harness.checkpoint import (
     CheckpointStore,
     ExecutionSnapshot,
@@ -55,6 +63,7 @@ STOP_ERROR_CODES: dict[StopReason, str] = {
     StopReason.MODEL_TIMEOUT: "model_timeout",
     StopReason.MODEL_ERROR: "model_error",
     StopReason.NO_PROGRESS: "empty_model_response",
+    StopReason.CANCELLED: "cancelled",
 }
 
 STOP_MESSAGES: dict[StopReason, str] = {
@@ -65,6 +74,7 @@ STOP_MESSAGES: dict[StopReason, str] = {
     StopReason.MODEL_TIMEOUT: "模型调用超时，结果无法确认。",
     StopReason.MODEL_ERROR: "模型调用失败，结果无法确认。",
     StopReason.NO_PROGRESS: "模型连续返回空内容，无法确认结果。",
+    StopReason.CANCELLED: "执行已被取消，此前的动作可能已经生效，须人工核实。",
 }
 
 
@@ -91,6 +101,7 @@ class HarnessExecutor(Executor):
         checkpoints: CheckpointStore | None = None,
         resume_enabled: bool = False,
         resume_ttl_seconds: float = 900.0,
+        cancellations: CancelRegistry | None = None,
         prompt_builder: Callable[[ExecutionRequest, ToolGrant], tuple[str, str]] | None = None,
     ) -> None:
         self._registry = registry
@@ -107,6 +118,9 @@ class HarnessExecutor(Executor):
         # 默认关闭：续跑会让"一次执行的中间状态"留存下来，属于需要显式开启的能力。
         self._resume_enabled = resume_enabled and checkpoints is not None
         self._resume_ttl_seconds = resume_ttl_seconds
+        # 取消登记表由装配层持有：取消方（HTTP 线程）与执行方（执行线程）
+        # 必须看到同一个对象，否则取消只是账面上的一句话。
+        self._cancellations = cancellations
         self._prompt_builder = prompt_builder or default_step_prompt
         self._loop = AgentLoop(
             client,
@@ -120,6 +134,20 @@ class HarnessExecutor(Executor):
         )
 
     def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        """执行一个步骤。令牌的取用与释放都在这里，保证不会漏放。"""
+
+        token = self._begin_cancel(request)
+        try:
+            if token is not None and token.cancelled:
+                # 取消先于执行到达：一步都不跑，连模型都不调。
+                return self._cancelled_before_start(request, token)
+            return self._execute_step(request, token)
+        finally:
+            self._end_cancel(request)
+
+    def _execute_step(
+        self, request: ExecutionRequest, token: CancelToken | None
+    ) -> ExecutionResult:
         # 拒绝路径也要有真实耗时：留痕里恒为 0 会让"快速拒绝"和"根本没执行"
         # 变成同一种记录，运维无法区分。
         started = time.monotonic()
@@ -142,6 +170,7 @@ class HarnessExecutor(Executor):
             ),
             resume=snapshot,
             on_progress=self._progress_recorder(request, grant, trace_id),
+            cancel=token,
         )
         output = self._output(request, grant, result, trace_id, resumed_from)
         # trace 只统计"这次尝试"发生的调用；断点里带过来的记录仍然算依据，但不重复计数。
@@ -152,7 +181,7 @@ class HarnessExecutor(Executor):
         )
 
         if result.stop_reason is not StopReason.COMPLETED:
-            # 预算耗尽或模型异常：这次执行没有结论，断点保留——后续要么接着跑，
+            # 预算耗尽、模型异常或被取消：这次执行没有结论，断点保留——后续要么接着跑，
             # 要么被明确拒绝，绝不能当"没发生过"重新执行一遍。
             outcome = ExecutionOutcome.UNCONFIRMED
             error_code = result.error_code or STOP_ERROR_CODES[result.stop_reason]
@@ -217,6 +246,39 @@ class HarnessExecutor(Executor):
 
     # ---------- 内部 ----------
 
+    def _begin_cancel(self, request: ExecutionRequest) -> CancelToken | None:
+        """取本步骤的取消令牌。未配置登记表时不参与取消（行为与之前完全一致）。"""
+
+        registry = self._cancellations
+        if registry is None:
+            return None
+        return registry.begin(request.task_id, request.step_id)
+
+    def _end_cancel(self, request: ExecutionRequest) -> None:
+        registry = self._cancellations
+        if registry is None:
+            return
+        try:
+            registry.end(request.task_id, request.step_id)
+        except Exception:  # noqa: BLE001 - 释放失败只影响内存占用，不该击穿结果
+            return
+
+    def _cancelled_before_start(
+        self, request: ExecutionRequest, token: CancelToken
+    ) -> ExecutionResult:
+        """执行还没开始就被取消：不调模型、不碰工具，但仍然留一条痕。"""
+
+        grant = self._grant(request)
+        return self._refuse(
+            request,
+            grant,
+            uuid4().hex,
+            "cancelled",
+            f"本次执行在开始前已被取消（{token.reason}），未调用模型或工具。",
+            started=time.monotonic(),
+            stop_reason=StopReason.CANCELLED.value,
+        )
+
     def _refuse(
         self,
         request: ExecutionRequest,
@@ -226,8 +288,9 @@ class HarnessExecutor(Executor):
         message: str,
         *,
         started: float | None = None,
+        stop_reason: str = "refused",
     ) -> ExecutionResult:
-        """存在断点但不允许续跑：拒绝执行，交人工核实，绝不盲目重来。"""
+        """存在断点但不允许续跑（或被取消）：拒绝执行，交人工核实，绝不盲目重来。"""
 
         duration_ms = int((time.monotonic() - started) * 1000) if started is not None else 0
         output = {
@@ -241,7 +304,7 @@ class HarnessExecutor(Executor):
             "model_calls": 0,
             "tokens": 0,
             "duration_ms": duration_ms,
-            "stop_reason": "refused",
+            "stop_reason": stop_reason,
             "risk": max_risk(grant.risks).value,
         }
         self._save_trace(
@@ -250,7 +313,7 @@ class HarnessExecutor(Executor):
             trace_id=trace_id,
             outcome=ExecutionOutcome.UNCONFIRMED,
             error_code=error_code,
-            stop_reason="refused",
+            stop_reason=stop_reason,
             duration_ms=duration_ms,
         )
         return ExecutionResult(

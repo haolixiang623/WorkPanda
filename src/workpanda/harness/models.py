@@ -167,6 +167,9 @@ class EventKind(StrEnum):
     # 否则事后按耗时排查会以为它们串行。
     TOOLS_PARALLEL = "tools_parallel"
     TOOL_COMPLETED = "tool_completed"
+    # 观察到取消请求，以及在哪个边界上停下的。取消也是事实，必须留痕：
+    # 否则事后只看到"执行提前结束"，会误判成预算耗尽或模型抖动。
+    CANCELLED = "cancelled"
     STOPPED = "stopped"
 
 
