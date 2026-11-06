@@ -10,7 +10,6 @@
 """
 
 import asyncio
-import json
 import logging
 import threading
 from collections.abc import Callable
@@ -23,6 +22,9 @@ from workpanda.application.ports import (
     ExecutionResult,
     Executor,
 )
+
+# 结果契约属于通用 harness，不属于任何厂商适配器；此处只做复用与再导出。
+from workpanda.harness.contract import OUTCOME_CONTRACT, parse_contract
 
 logger = logging.getLogger(__name__)
 
@@ -42,17 +44,6 @@ class HarnessGateway(Protocol):
         ...
 
     def close(self) -> None: ...
-
-
-OUTCOME_CONTRACT = (
-    "只执行该步骤，不要改变流程、不要调用其他工具、不要编造结果。\n"
-    "必须只返回一个 JSON 对象，不要输出其他文字或代码块标记，字段如下：\n"
-    '{"outcome": "succeeded|failed|unconfirmed",'
-    ' "summary": "一句话说明做了什么",'
-    ' "evidence": "判断该结果的依据，例如实际返回值或明确的外部响应"}\n'
-    "无法真正完成该步骤时，outcome 必须为 failed 或 unconfirmed；"
-    "没有可核验依据时不得填 succeeded。"
-)
 
 
 class OctopHarnessGateway:
@@ -262,55 +253,3 @@ def default_prompt(request: ExecutionRequest) -> str:
         "你不需要在运行时调用同名工具；请直接按执行要求完成本步骤。\n"
         f"{OUTCOME_CONTRACT}"
     )
-
-
-def parse_contract(text: str) -> tuple[ExecutionOutcome, dict[str, Any]]:
-    """解析模型返回的结构化契约。
-
-    只有明确声明 succeeded 且给出可核验依据时才认为成功；
-    解析失败、缺少依据或自述无法完成，一律按"未确认"处理，绝不默认成功。
-    """
-
-    payload = _extract_json(text)
-    if payload is None:
-        return ExecutionOutcome.UNCONFIRMED, {
-            "reason": "unparsable_output",
-            "summary": text[:300],
-        }
-
-    raw_outcome = str(payload.get("outcome", "")).strip().lower()
-    evidence = str(payload.get("evidence", "")).strip()
-    summary = str(payload.get("summary", "")).strip()
-
-    if raw_outcome == ExecutionOutcome.SUCCEEDED.value:
-        if not evidence:
-            return ExecutionOutcome.UNCONFIRMED, {
-                "reason": "missing_evidence",
-                "summary": summary,
-            }
-        return ExecutionOutcome.SUCCEEDED, {"summary": summary, "evidence": evidence}
-
-    if raw_outcome == ExecutionOutcome.FAILED.value:
-        return ExecutionOutcome.FAILED, {"summary": summary, "evidence": evidence}
-
-    return ExecutionOutcome.UNCONFIRMED, {
-        "reason": raw_outcome or "unspecified_outcome",
-        "summary": summary,
-    }
-
-
-def _extract_json(text: str) -> dict[str, Any] | None:
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`")
-        if cleaned.lstrip().lower().startswith("json"):
-            cleaned = cleaned.lstrip()[4:]
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start == -1 or end <= start:
-        return None
-    try:
-        parsed = json.loads(cleaned[start : end + 1])
-    except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, dict) else None

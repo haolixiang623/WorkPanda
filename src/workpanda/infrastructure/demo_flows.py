@@ -23,7 +23,7 @@ DEMO_FLOW = FlowDefinition(
             step_id="execute_demo",
             kind=StepKind.EXECUTE,
             title="模型回显自检",
-            tool="model.echo",
+            tool="model_echo",
             instruction=(
                 "把参数 subject 的值原样返回，不要改写；"
                 "并在 evidence 中给出你实际返回的内容，作为可核验依据。"

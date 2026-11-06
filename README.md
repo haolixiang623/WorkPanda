@@ -1,8 +1,8 @@
 # WorkPanda
 
-WorkPanda 是面向群众的自然语言公共服务入口。当前仓库处于**工程骨架**阶段：已建立统一业务后端、固定流程执行、任务状态与确认凭证机制，尚未接入具体业务事项、真实模型和外部执行器。
+WorkPanda 是面向群众的自然语言公共服务入口。当前仓库处于**工程骨架**阶段：已建立统一业务后端、固定流程执行、任务状态与确认凭证机制，并具备受控执行能力（模型可调用受控工具、结果可核验）；尚未接入具体业务事项与外部业务系统。
 
-工程实现细节见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，协作规范见 [AGENTS.md](AGENTS.md) 与 [docs/DEVELOPMENT-OPERATING-MECHANISM.md](docs/DEVELOPMENT-OPERATING-MECHANISM.md)，界面约束见 [design/DESIGN.md](design/DESIGN.md)。
+工程实现细节见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，受控执行层见 [docs/HARNESS.md](docs/HARNESS.md)，协作规范见 [AGENTS.md](AGENTS.md) 与 [docs/DEVELOPMENT-OPERATING-MECHANISM.md](docs/DEVELOPMENT-OPERATING-MECHANISM.md)，界面约束见 [design/DESIGN.md](design/DESIGN.md)。
 
 ## 已实现
 
@@ -12,7 +12,9 @@ WorkPanda 是面向群众的自然语言公共服务入口。当前仓库处于*
 - 槽位收集与多轮澄清；
 - 关键动作的服务端一次性确认凭证（绑定任务、流程版本、步骤和参数摘要）；
 - 签名会话令牌、任务归属隔离与按会话限流；
-- Octop-Harness 运行时适配器（可选启用），超时与异常映射为“待确认”；
+- **通用 harness 受控执行层**：工具白名单、参数校验、三重预算、逐次留痕；
+- 结构化结果契约：没有可核验依据不得报成功，工具不可用不伪装完成；
+- Octop-Harness 运行时适配器（备选后端，可选启用）；
 - 运维只读接口 `/api/ops/*`，供 Octop 控制台读取；
 - 执行器、意图路由、事件发布的可替换端口；
 - SSE 事件流，支持断线后按序号补发；
@@ -22,8 +24,8 @@ WorkPanda 是面向群众的自然语言公共服务入口。当前仓库处于*
 ## 未实现
 
 - 任何真实公共服务事项与话术；
-- Octop 控制台插件、Octop Browser、真实外部 API；
-- 真实模型端到端调用（无可用凭据）；
+- 真实业务系统工具（尚无外部 API 接入）；
+- Octop 控制台插件、Octop Browser；
 - 登录、实名核验、权限分级与审计后台；
 - 流程管理后台、发布审核；
 - PostgreSQL、多实例部署、监控告警。
@@ -87,6 +89,16 @@ uvicorn workpanda.main:app --app-dir src --reload
 | `WORKPANDA_RATE_LIMIT_PER_MINUTE` | `120` | 每会话每分钟请求数 |
 | `WORKPANDA_RATE_LIMIT_BURST` | `30` | 每会话瞬时突发上限 |
 | `WORKPANDA_OPS_TOKEN` | 空 | 运维只读接口凭据；为空时接口不可用 |
+| `WORKPANDA_HARNESS_ENABLED` | `false` | 启用通用 harness 执行器（优先于 Octop） |
+| `WORKPANDA_MODEL_BASE_URL` | 空 | OpenAI 兼容接口地址 |
+| `WORKPANDA_MODEL_API_KEY` | 空 | 模型凭据；启用 harness 时必填 |
+| `WORKPANDA_MODEL_NAME` | `gpt-4o-mini` | 模型标识 |
+| `WORKPANDA_MODEL_TIMEOUT_SECONDS` | `60` | 单次模型调用超时 |
+| `WORKPANDA_MODEL_TRUST_ENV` | `true` | 是否沿用系统代理变量 |
+| `WORKPANDA_HARNESS_MAX_STEPS` | `6` | 单步骤最多模型轮次 |
+| `WORKPANDA_HARNESS_MAX_TOOL_CALLS` | `8` | 单步骤最多工具调用次数 |
+| `WORKPANDA_HARNESS_DEADLINE_SECONDS` | `45` | 单步骤总耗时上限 |
+| `WORKPANDA_HARNESS_ALLOWED_HOSTS` | 空 | 逗号分隔的 http 工具域名白名单；为空则不注册 |
 | `WORKPANDA_OCTOP_ENABLED` | `false` | 启用 Octop-Harness 运行时执行器 |
 | `WORKPANDA_OCTOP_API_KEY` | 空 | 模型凭据；启用时必填 |
 | `WORKPANDA_OCTOP_MODEL` | `gpt-4o-mini` | 模型标识 |
@@ -118,13 +130,15 @@ src/workpanda/
 ├── api/             路由、错误映射、依赖
 ├── application/     任务服务、流程推进器、端口协议
 ├── domain/          状态机、流程定义、确认凭证、存储协议
-├── infrastructure/  内存/SQLite 存储、事件总线、开发期适配器
+├── harness/         通用受控执行层（工具循环、预算、留痕、契约）
+├── infrastructure/  内存/SQLite 存储、事件总线、Octop 适配器
 ├── bootstrap.py     依赖装配
 ├── config.py        配置
 └── main.py          应用入口
 
 tests/               单元与接口测试
-docs/                架构与开发运营机制
+scripts/             端到端冒烟脚本
+docs/                架构、受控执行层与开发运营机制
 design/              UI/UX 设计契约
 ```
 

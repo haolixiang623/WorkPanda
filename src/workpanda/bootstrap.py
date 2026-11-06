@@ -12,6 +12,9 @@ from workpanda.config import Settings, get_settings
 from workpanda.domain.flow import FlowDefinition, FlowRegistry
 from workpanda.domain.identity import SessionSigner, new_secret
 from workpanda.domain.repository import ConfirmationStore, TaskStore
+from workpanda.harness.builtin import default_registry
+from workpanda.harness.executor import HarnessExecutor
+from workpanda.harness.openai_client import OpenAICompatibleClient
 from workpanda.infrastructure.adapters import KeywordIntentRouter, ScriptedExecutor
 from workpanda.infrastructure.demo_flows import demo_flows
 from workpanda.infrastructure.event_broker import EventBroker
@@ -67,7 +70,28 @@ def build_container(
     broker = EventBroker()
 
     if executor is None:
-        if settings.octop_enabled:
+        # 优先级：通用 harness > Octop 运行时 > 脚手架执行器。
+        # harness 用的是我们自己的受控循环（工具白名单 + 预算 + 留痕），
+        # Octop 运行时作为备选：它能执行步骤，但工具循环不由我们控制。
+        if settings.harness_enabled and settings.model_configured:
+            tool_registry, tool_closers = default_registry(allowed_hosts=settings.allowed_hosts)
+            model_client = OpenAICompatibleClient(
+                base_url=settings.model_base_url or "",
+                api_key=settings.model_api_key or "",
+                model=settings.model_name,
+                timeout_seconds=settings.model_timeout_seconds,
+                trust_env=settings.model_trust_env,
+            )
+            executor_instance: Executor = HarnessExecutor(
+                model_client,
+                registry=tool_registry,
+                max_steps=settings.harness_max_steps,
+                max_tool_calls=settings.harness_max_tool_calls,
+                deadline_seconds=settings.harness_deadline_seconds,
+            )
+            closers.append(model_client.close)
+            closers.extend(tool_closers)
+        elif settings.octop_enabled:
             gateway = OctopHarnessGateway(
                 agent_name=settings.octop_agent_name,
                 model=settings.octop_model,

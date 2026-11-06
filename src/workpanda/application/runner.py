@@ -244,6 +244,9 @@ def _diagnostics(result: ExecutionResult) -> dict[str, Any]:
     return {
         "failure_code": result.error_code,
         "message": result.message,
+        # 真实执行器会给出停止原因与工具调用，失败复盘时这两项最关键。
+        "stop_reason": output.get("stop_reason"),
+        "tool_calls": output.get("tool_calls") or [],
         "model_text": str(output.get("text", ""))[:1000],
         "verification": verification if isinstance(verification, dict) else {},
     }
