@@ -16,6 +16,7 @@ from workpanda.infrastructure.adapters import KeywordIntentRouter, ScriptedExecu
 from workpanda.infrastructure.demo_flows import demo_flows
 from workpanda.infrastructure.event_broker import EventBroker
 from workpanda.infrastructure.memory_store import InMemoryConfirmationStore, InMemoryTaskStore
+from workpanda.infrastructure.octop_runtime import OctopHarnessExecutor, OctopHarnessGateway
 from workpanda.infrastructure.rate_limit import TokenBucketLimiter
 from workpanda.infrastructure.sqlite_store import SqliteStore
 
@@ -64,7 +65,26 @@ def build_container(
     registered = flows if flows is not None else (demo_flows() if settings.enable_demo_flow else [])
     registry = FlowRegistry(registered)
     broker = EventBroker()
-    executor_instance = executor or ScriptedExecutor()
+
+    if executor is None:
+        if settings.octop_enabled:
+            gateway = OctopHarnessGateway(
+                agent_name=settings.octop_agent_name,
+                model=settings.octop_model,
+                provider=settings.octop_provider,
+                api_key=settings.octop_api_key,
+                base_url=settings.octop_base_url,
+                workspace=settings.octop_workspace,
+            )
+            executor_instance: Executor = OctopHarnessExecutor(
+                gateway, timeout_seconds=settings.octop_timeout_seconds
+            )
+            closers.append(gateway.close)
+        else:
+            executor_instance = ScriptedExecutor()
+    else:
+        executor_instance = executor
+
     router_instance = router or KeywordIntentRouter()
 
     runner = FlowRunner(

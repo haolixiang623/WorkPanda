@@ -12,6 +12,8 @@ WorkPanda 是面向群众的自然语言公共服务入口。当前仓库处于*
 - 槽位收集与多轮澄清；
 - 关键动作的服务端一次性确认凭证（绑定任务、流程版本、步骤和参数摘要）；
 - 签名会话令牌、任务归属隔离与按会话限流；
+- Octop-Harness 运行时适配器（可选启用），超时与异常映射为“待确认”；
+- 运维只读接口 `/api/ops/*`，供 Octop 控制台读取；
 - 执行器、意图路由、事件发布的可替换端口；
 - SSE 事件流，支持断线后按序号补发；
 - 内存与 SQLite 两种存储；
@@ -20,8 +22,9 @@ WorkPanda 是面向群众的自然语言公共服务入口。当前仓库处于*
 ## 未实现
 
 - 任何真实公共服务事项与话术；
-- Octop-Harness、Octop Browser、真实外部 API；
-- 用户认证、实名核验、限流与审计后台；
+- Octop 控制台插件、Octop Browser、真实外部 API；
+- 真实模型端到端调用（无可用凭据）；
+- 登录、实名核验、权限分级与审计后台；
 - 流程管理后台、发布审核；
 - PostgreSQL、多实例部署、监控告警。
 
@@ -58,6 +61,14 @@ uvicorn workpanda.main:app --app-dir src --reload
 | POST | `/api/tasks/{task_id}/cancel` | 取消任务 |
 | GET | `/api/tasks/{task_id}/events` | SSE 事件流，支持 `?after=` 补发 |
 
+运维只读接口（需 `X-WorkPanda-Ops-Token`，未配置 `WORKPANDA_OPS_TOKEN` 时整体 404）：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/ops/tasks` | 列出任务，支持 `limit`、`status` |
+| GET | `/api/ops/tasks/{task_id}` | 任务详情 |
+| GET | `/api/ops/tasks/{task_id}/events` | 事件列表 |
+
 任务按会话隔离：访问不属于自己的任务返回 404，不暴露任务是否存在。超限返回 429 并带 `Retry-After`。
 
 ## 配置
@@ -75,7 +86,21 @@ uvicorn workpanda.main:app --app-dir src --reload
 | `WORKPANDA_SESSION_TTL_SECONDS` | `43200` | 会话有效期 |
 | `WORKPANDA_RATE_LIMIT_PER_MINUTE` | `120` | 每会话每分钟请求数 |
 | `WORKPANDA_RATE_LIMIT_BURST` | `30` | 每会话瞬时突发上限 |
+| `WORKPANDA_OPS_TOKEN` | 空 | 运维只读接口凭据；为空时接口不可用 |
+| `WORKPANDA_OCTOP_ENABLED` | `false` | 启用 Octop-Harness 运行时执行器 |
+| `WORKPANDA_OCTOP_API_KEY` | 空 | 模型凭据；启用时必填 |
+| `WORKPANDA_OCTOP_MODEL` | `gpt-4o-mini` | 模型标识 |
+| `WORKPANDA_OCTOP_PROVIDER` | `openai` | `openai` 或 `anthropic` |
+| `WORKPANDA_OCTOP_BASE_URL` | 空 | 兼容接口地址 |
+| `WORKPANDA_OCTOP_WORKSPACE` | `.octop/workpanda` | Agent 工作区，必须可解析为绝对路径 |
+| `WORKPANDA_OCTOP_TIMEOUT_SECONDS` | `30` | 单步骤执行超时 |
 | `WORKPANDA_ENABLE_DEMO_FLOW` | `true` | 启用骨架自检流程 `demo.generic` |
+
+Octop 集成细节见 [docs/OCTOP-INTEGRATION.md](docs/OCTOP-INTEGRATION.md)。启用运行时时需安装可选依赖：
+
+```bash
+python -m pip install -e '.[octop]'
+```
 
 `demo.generic` 只用于验证"收集 → 确认 → 执行 → 完成"链路，不代表任何业务规则。正式接入业务前必须设为 `false`。
 

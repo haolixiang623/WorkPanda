@@ -126,6 +126,15 @@ created → running → waiting_for_user → running
 
 限流状态在进程内存中，多实例部署需替换为共享存储（如 Redis）。
 
+### 3.9 Octop 集成
+
+运行时由 Octop-Harness 承担，控制台由 Octop 提供，详见 [OCTOP-INTEGRATION.md](OCTOP-INTEGRATION.md)。
+
+- `OctopHarnessExecutor` 实现 `Executor` 协议，只执行单个受控步骤；
+- 超时与运行时异常映射为 `unconfirmed`，不重试、不报成功；
+- 运维读接口 `/api/ops/*` 由 `WORKPANDA_OPS_TOKEN` 保护，未配置时整体 404；
+- 控制台只读，不写业务状态，避免双写冲突。
+
 ## 4. 接口
 
 | 方法 | 路径 | 说明 |

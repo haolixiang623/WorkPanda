@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from workpanda.api.errors import register_error_handlers
+from workpanda.api.ops import router as ops_router
 from workpanda.api.routes import router
 from workpanda.bootstrap import Container, build_container
 from workpanda.config import Settings, get_settings
@@ -39,6 +40,7 @@ def create_app(settings: Settings | None = None, container: Container | None = N
 
     register_error_handlers(app)
     app.include_router(router)
+    app.include_router(ops_router)
     return app
 
 

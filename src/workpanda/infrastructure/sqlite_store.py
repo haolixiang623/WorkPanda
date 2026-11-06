@@ -198,6 +198,18 @@ class SqliteStore:
             ).fetchall()
         return tuple(self._to_event(row) for row in rows)
 
+    def list_tasks(self, *, limit: int = 50, status: TaskStatus | None = None) -> Sequence[Task]:
+        query = "SELECT * FROM tasks"
+        params: list[Any] = []
+        if status is not None:
+            query += " WHERE status = ?"
+            params.append(status.value)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return tuple(self._to_task(row) for row in rows)
+
     # ---------- 确认凭证 ----------
 
     def issue(self, confirmation: Confirmation) -> Confirmation:

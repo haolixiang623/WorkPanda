@@ -34,3 +34,9 @@ out/
 # 本地存储
 *.db
 *.db-journal
+
+# Octop 运行时工作区
+.octop/
+
+# Octop 运行时工作区
+.octop/

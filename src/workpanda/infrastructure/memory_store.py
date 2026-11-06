@@ -61,6 +61,16 @@ class InMemoryTaskStore:
                 event for event in self._events.get(task_id, ()) if event.sequence > after_sequence
             )
 
+    def list_tasks(self, *, limit: int = 50, status: TaskStatus | None = None) -> Sequence[Task]:
+        with self._lock:
+            tasks = [
+                task.model_copy(deep=True)
+                for task in self._tasks.values()
+                if status is None or task.status is status
+            ]
+        tasks.sort(key=lambda task: task.created_at, reverse=True)
+        return tuple(tasks[:limit])
+
 
 class InMemoryConfirmationStore:
     def __init__(self) -> None:

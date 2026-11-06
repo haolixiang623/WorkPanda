@@ -34,6 +34,10 @@ class TaskStore(Protocol):
 
     def events(self, task_id: UUID, after_sequence: int = 0) -> Sequence[TaskEvent]: ...
 
+    def list_tasks(self, *, limit: int = 50, status: TaskStatus | None = None) -> Sequence[Task]:
+        """按创建时间倒序列出任务，供运维控制台只读查询。"""
+        ...
+
 
 class ConfirmationStore(Protocol):
     def issue(self, confirmation: Confirmation) -> Confirmation: ...

@@ -129,6 +129,18 @@ class TaskService:
         self._owned(task_id, subject)
         return self.store.events(task_id, after_sequence)
 
+    # ---------- 运维只读（由运维控制台使用，需独立凭据） ----------
+
+    def list_tasks(self, *, limit: int = 50, status: TaskStatus | None = None) -> Sequence[Task]:
+        return self.store.list_tasks(limit=limit, status=status)
+
+    def ops_task(self, task_id: UUID) -> Task:
+        return self.store.get(task_id)
+
+    def ops_events(self, task_id: UUID, after_sequence: int = 0) -> Sequence[TaskEvent]:
+        self.store.get(task_id)
+        return self.store.events(task_id, after_sequence)
+
     # ---------- 内部 ----------
 
     def _owned(self, task_id: UUID, subject: str) -> Task:
