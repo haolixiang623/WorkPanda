@@ -3,6 +3,7 @@
 测试通过替换这里的依赖来构造不同的存储或执行器，而不修改业务代码。
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from workpanda.application.ports import Executor, IntentRouter
@@ -24,6 +25,7 @@ from workpanda.infrastructure.memory_store import InMemoryConfirmationStore, InM
 from workpanda.infrastructure.octop_runtime import OctopHarnessExecutor, OctopHarnessGateway
 from workpanda.infrastructure.rate_limit import TokenBucketLimiter
 from workpanda.infrastructure.sqlite_store import SqliteStore
+from workpanda.infrastructure.sqlite_trace_store import SqliteTraceStore
 
 
 @dataclass
@@ -44,6 +46,25 @@ class Container:
     def close(self) -> None:
         for closer in self.closers:
             closer()
+
+
+def resolve_trace_backend(settings: Settings) -> str:
+    """决定 trace 落到哪里。auto 跟随任务存储：任务持久化时留痕也持久化。"""
+
+    backend = settings.harness_trace_backend.strip().lower()
+    if backend == "auto":
+        return "sqlite" if settings.store_backend == "sqlite" else "memory"
+    if backend not in {"memory", "sqlite"}:
+        # 配置写错时宁可启动失败，也不要静默退化成"重启即丢"。
+        raise ValueError(f"unsupported harness_trace_backend: {settings.harness_trace_backend}")
+    return backend
+
+
+def build_trace_store(settings: Settings) -> tuple[TraceStore, list[Callable[[], None]]]:
+    if resolve_trace_backend(settings) == "sqlite":
+        store = SqliteTraceStore(settings.sqlite_path, capacity=settings.harness_trace_capacity)
+        return store, [store.close]
+    return InMemoryTraceStore(capacity=max(1, settings.harness_trace_capacity)), []
 
 
 def build_container(
@@ -72,7 +93,8 @@ def build_container(
     registry = FlowRegistry(registered)
     broker = EventBroker()
     # trace 独立于任务结果存放：既能覆盖成功执行，也能做跨任务的聚合指标。
-    traces: TraceStore = InMemoryTraceStore(capacity=settings.harness_trace_capacity)
+    traces, trace_closers = build_trace_store(settings)
+    closers.extend(trace_closers)
 
     if executor is None:
         # 优先级：通用 harness > Octop 运行时 > 脚手架执行器。
