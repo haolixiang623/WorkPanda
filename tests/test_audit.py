@@ -160,6 +160,46 @@ def test_rotates_when_size_limit_is_reached_and_keeps_bounded_backups(tmp_path: 
             assert json.loads(line)["kind"] == "execution"
 
 
+def test_read_spans_rotated_backups_newest_first(tmp_path: Path) -> None:
+    """滚动出去的历史必须还能查到，否则归档答不了"三个月前到底发出去没有"。"""
+
+    path = tmp_path / "audit.jsonl"
+    # max_bytes=1：第一次写入落地，此后每次写入都把上一条推进备份，
+    # 于是 e0..e3 依次落在 .3 / .2 / .1 / 当前文件，四条全在，便于断言顺序。
+    store = journal(path, max_bytes=1, backups=3)
+    for sequence in range(4):
+        store.append(entry(outcome="succeeded", seq=sequence))
+
+    assert store.backup_path(3).exists()  # 确认确实滚到了最旧的备份
+    records = store.read(limit=100)
+
+    assert [record.payload["seq"] for record in records] == [3, 2, 1, 0]
+
+
+def test_read_task_filter_and_limit_apply_across_backups(tmp_path: Path) -> None:
+    path = tmp_path / "audit.jsonl"
+    store = journal(path, max_bytes=1, backups=3)
+    target = entry(outcome="succeeded", seq="target")
+    store.append(target)
+    for sequence in range(3):
+        store.append(entry(outcome="failed", seq=sequence))
+
+    # 目标条目已被推进备份，按 task_id 仍要能捞出来。
+    assert [one.trace_id for one in store.read(task_id=target.task_id)] == [target.trace_id]
+    # limit 是"跨文件合计"的上限，不能每个文件各自算一遍。
+    assert len(store.read(limit=2)) == 2
+
+
+def test_read_still_works_when_current_file_is_missing(tmp_path: Path) -> None:
+    path = tmp_path / "audit.jsonl"
+    store = journal(path, max_bytes=1, backups=3)
+    for sequence in range(3):
+        store.append(entry(outcome="succeeded", seq=sequence))
+    path.unlink()  # 只剩备份：不能因为当前文件不在就整体读空
+
+    assert [record.payload["seq"] for record in store.read(limit=100)] == [1, 0]
+
+
 def test_backups_zero_keeps_only_the_current_file(tmp_path: Path) -> None:
     path = tmp_path / "audit.jsonl"
     store = journal(path, max_bytes=300, backups=0)
