@@ -154,6 +154,8 @@ def build_container(
                 max_tokens=settings.harness_max_tokens,
                 deadline_seconds=settings.harness_deadline_seconds,
                 tool_retries=settings.harness_tool_retries,
+                model_retries=settings.model_retries,
+                model_retry_backoff_seconds=settings.model_retry_backoff_seconds,
                 redactor=DEFAULT_REDACTOR if settings.harness_redact else NO_REDACTION,
                 traces=traces,
                 audit=audit,

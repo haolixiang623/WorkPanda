@@ -22,12 +22,18 @@ class ModelTimeout(Exception):
 
 
 class ModelError(Exception):
-    """模型调用失败。code 会进入任务事件，便于运维定位。"""
+    """模型调用失败。code 会进入任务事件，便于运维定位。
 
-    def __init__(self, code: str, message: str) -> None:
+    `retryable` 表达的是"这次失败是不是瞬时抖动"，由客户端根据 HTTP 语义判定：
+    429/5xx/连接失败可以再试一次，400/401/参数错误再试一万次也一样。
+    重试上限、退避与总耗时仍由执行循环控制，客户端不自行重试。
+    """
+
+    def __init__(self, code: str, message: str, *, retryable: bool = False) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.retryable = retryable
 
 
 class ModelClient(Protocol):

@@ -5,7 +5,9 @@
 - 循环必须可终止：步数、工具调用次数、总耗时三重上限；
 - 超预算不是"失败"，而是"未确认"——此刻可能已经调用过有副作用的工具；
 - 每一次模型调用和工具调用都写进 trace，事后必须能完整重放发生了什么；
-- 每次工具调用落账后回调进度快照，使中断后可以从最近一次已知状态续跑。
+- 每次工具调用落账后回调进度快照，使中断后可以从最近一次已知状态续跑；
+- 模型调用的瞬时失败可以有限重试，但绝不重试工具：模型调用没有副作用，
+  工具调用可能有。
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from workpanda.harness.models import (
     MessageRole,
     ModelResponse,
     ToolCallRecord,
+    ToolSpec,
 )
 from workpanda.harness.tools import ToolContext, ToolGrant
 
@@ -86,6 +89,8 @@ class AgentLoop:
         max_tokens: int = 0,
         deadline_seconds: float = 45.0,
         max_empty_responses: int = 2,
+        model_retries: int = 0,
+        model_retry_backoff_seconds: float = 0.5,
     ) -> None:
         self._client = client
         self._max_steps = max_steps
@@ -93,6 +98,8 @@ class AgentLoop:
         self._max_tokens = max_tokens
         self._deadline_seconds = deadline_seconds
         self._max_empty_responses = max_empty_responses
+        self._model_retries = max(0, model_retries)
+        self._model_retry_backoff_seconds = max(0.0, model_retry_backoff_seconds)
 
     def run(
         self,
@@ -140,6 +147,11 @@ class AgentLoop:
         def emit(kind: EventKind, data: dict) -> None:
             events.append(HarnessEvent(sequence=len(events) + 1, kind=kind, data=data))
 
+        def count_model_call() -> None:
+            # 失败的尝试同样是一次真实调用，必须计入：否则"重试了 3 次"在 trace 上看不出来。
+            nonlocal model_calls
+            model_calls += 1
+
         def report_progress() -> None:
             if on_progress is None:
                 return
@@ -171,8 +183,13 @@ class AgentLoop:
                     EventKind.MODEL_REQUESTED,
                     {"step": budget.steps, "tools": [spec.name for spec in specs]},
                 )
-                response = self._client.complete(messages=messages, tools=specs)
-                model_calls += 1
+                response = self._complete(
+                    messages=messages,
+                    tools=specs,
+                    budget=budget,
+                    emit=emit,
+                    on_attempt=count_model_call,
+                )
                 emit(EventKind.MODEL_RESPONDED, _describe_response(response))
 
                 if response.usage is not None:
@@ -257,6 +274,53 @@ class AgentLoop:
                 error_code=exc.code,
                 error_message=exc.message,
             )
+
+    def _complete(
+        self,
+        *,
+        messages: Sequence[HarnessMessage],
+        tools: Sequence[ToolSpec],
+        budget: Budget,
+        emit: Callable[[EventKind, dict], None],
+        on_attempt: Callable[[], None],
+    ) -> ModelResponse:
+        """调用模型，对"瞬时失败"做有界重试。
+
+        三条边界：
+
+        - 只重试客户端判定为 retryable 的错误（429 / 5xx / 传输失败）。鉴权、参数、
+          模型不存在这类错误重试一万次也是同一个结果，重试只会放大故障；
+        - 重试次数与退避都有上限，且必须留在步骤总耗时以内。否则一次网关抖动
+          会把整步时间耗光，最后连"为什么没结果"都说不清；
+        - 模型调用本身没有副作用，重试不会重复提交任何业务动作。
+
+        每次**尝试**都会先回调 `on_attempt`（失败的尝试同样是真实发生的调用，
+        必须计入 `model_calls`），重试另留一条 `model_retried` 事件，
+        避免事后看成"只调了一次模型"。
+        """
+
+        attempts = 0
+        while True:
+            attempts += 1
+            on_attempt()
+            try:
+                return self._client.complete(messages=messages, tools=tools)
+            except ModelError as exc:
+                if not exc.retryable or attempts > self._model_retries:
+                    raise
+                delay = self._model_retry_backoff_seconds * attempts
+                if budget.remaining_seconds <= 0 or delay >= budget.remaining_seconds:
+                    # 没有时间退避就别假装还能救：直接按原错误上报。
+                    raise
+                emit(
+                    EventKind.MODEL_RETRIED,
+                    {
+                        "attempt": attempts,
+                        "error_code": exc.code,
+                        "delay_ms": int(delay * 1000),
+                    },
+                )
+                time.sleep(delay)
 
     def _finish(
         self,

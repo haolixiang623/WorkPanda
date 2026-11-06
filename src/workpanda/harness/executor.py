@@ -82,6 +82,8 @@ class HarnessExecutor(Executor):
         deadline_seconds: float = 45.0,
         require_tool_call: bool = True,
         tool_retries: int = 1,
+        model_retries: int = 0,
+        model_retry_backoff_seconds: float = 0.5,
         redactor: Redactor | None = None,
         traces: TraceStore | None = None,
         audit: AuditJournal | None = None,
@@ -111,6 +113,8 @@ class HarnessExecutor(Executor):
             max_tool_calls=max_tool_calls,
             max_tokens=max_tokens,
             deadline_seconds=deadline_seconds,
+            model_retries=model_retries,
+            model_retry_backoff_seconds=model_retry_backoff_seconds,
         )
 
     def execute(self, request: ExecutionRequest) -> ExecutionResult:

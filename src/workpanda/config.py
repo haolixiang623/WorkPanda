@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     model_api_key: str | None = None
     model_name: str = "gpt-4o-mini"
     model_timeout_seconds: float = 60.0
+    # 模型调用的有界重试：只对瞬时失败（429/5xx/传输错误）生效。
+    # 0 表示不重试；重试同样受 harness_deadline_seconds 约束。
+    model_retries: int = 1
+    model_retry_backoff_seconds: float = 0.5
     # 是否沿用系统代理环境变量。内网地址被代理拦截时置为 false。
     model_trust_env: bool = True
     harness_max_steps: int = 6
