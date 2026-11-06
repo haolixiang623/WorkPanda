@@ -161,12 +161,27 @@ def _parse_completion(data: dict[str, Any], *, duration_ms: int = 0) -> ModelRes
 
     return ModelResponse(
         text=content if isinstance(content, str) else "",
+        reasoning=_reasoning_of(message),
         tool_calls=[call for call in tool_calls if call is not None],
         finish_reason=choices[0].get("finish_reason"),
         duration_ms=duration_ms,
         # 有的网关不返回 usage；拿不到就不统计，绝不用字符数估算。
         usage=TokenUsage.from_payload(data.get("usage")),
     )
+
+
+def _reasoning_of(message: dict[str, Any]) -> str:
+    """不同网关给推理过程起的字段名不一样，两个常见的都认。
+
+    只取字符串；给错类型（列表、dict）时不猜测结构，按"没有"处理。
+    这段内容只用于排障，不会进入 `text`，因此不可能被当成结论或依据。
+    """
+
+    for key in ("reasoning_content", "reasoning"):
+        value = message.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
 
 
 def _parse_tool_call(raw: dict[str, Any]) -> ToolCall | None:

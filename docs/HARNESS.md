@@ -93,6 +93,8 @@ Octop **不是** harness 的上层，而是它可选的一种后端：
 | 工具超时（`TIMEOUT`） | 不算依据；若模型仍称 `succeeded` 则 `unconfirmed` | `unverified_success` |
 | 工具被拦（`BLOCKED`） | 不算依据；原因回灌给模型 | 记录 `error_code` |
 | 不是合法 JSON | `unconfirmed` | `unparsable_output` |
+| 一段文本里出现两个及以上 JSON 对象 | `unconfirmed` | `unparsable_output`（不猜哪个是结论） |
+| 只有推理内容、没有最终答复 | `unconfirmed` | `empty_model_response` |
 | 步数 / 调用次数 / token / 耗时超限 | `unconfirmed` | `budget_max_steps` / `budget_max_tool_calls` / `budget_max_tokens` / `budget_deadline` |
 | 存在断点但不允许续跑 | `unconfirmed` | `checkpoint_not_resumable` / `checkpoint_expired` / `checkpoint_mismatch` |
 | 模型超时 | `unconfirmed` | `model_timeout` |
@@ -101,6 +103,19 @@ Octop **不是** harness 的上层，而是它可选的一种后端：
 | 执行被取消（边界生效） | `unconfirmed` | `cancelled` |
 
 原则：**只有确定成功才报成功；不确定一律"待确认"并转人工。**
+
+结论解析（`contract.py`）单独守两件事：
+
+- 容忍模型多说一句话、包一层 ``` 围栏、前后带说明文字——这些不该制造出
+  `unparsable_output` 的假转人工；但**文本里出现两个及以上 JSON 对象时一律拒绝**，
+  因为无法判断哪个才是真正结论，猜错就可能把 `succeeded` 读进本该未确认的步骤；
+- 推理模型的思考过程（`reasoning_content` / `reasoning`）与最终答复分开接收，
+  只在 `model_responded` 事件里记长度与一小段**脱敏后**的预览；它不进 `text`，
+  因此永远不会被契约解析器当成结论或依据。
+
+样例按版本固化在 `tests/test_model_output.py`（全合成数据，不含真实群众信息），
+覆盖明确成功、缺依据、歧义、拼写错误、超范围、注入式指令、围栏与尾随文字。
+改动解析逻辑必须整体重跑，并递增 `EVAL_VERSION`。
 
 ## 5. 接入一个新工具
 
@@ -333,9 +348,12 @@ python scripts/smoke_harness.py     # 真实模型端到端
 
 ## 11. 已验证与未验证
 
-已验证（`pytest` 178 项全通过、1 项平台相关跳过，`ruff` 全通过）：
+已验证（全量 `pytest` 通过、`ruff check .` 全通过）：
 
 - 白名单拒绝、参数校验、工具异常、风险归并；
+- 模型输出契约评测集（`EVAL_VERSION = 2026-11-07.1`，16 组合成样例）：围栏、
+  前后说明文字、尾随花括号都能解析；两个 JSON 对象、拼写错误、注入式指令、
+  超范围回复一律不误报成功；推理内容只留脱敏预览，不能当结论或依据；
 - 参数约束真的执行：越界数值/长度、不匹配正则、数组元素个数与元素本身、嵌套对象
   必填与多余字段都被拒；schema 里的正则写错时不连坐合法调用；
 - 模型耗时按**单次往返**记录：慢的第一次调用不会把耗时带进第二次，失败路径（超时、

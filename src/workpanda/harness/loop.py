@@ -482,8 +482,14 @@ class AgentLoop:
             },
         )
         # 先把整批预算扣掉：并发执行中途才发现预算不够，等于让部分调用"白跑"。
-        for _ in calls:
-            budget.consume_tool_call()
+        # 扣不动时（只可能是截止时间已经耗尽）这一批一条都没提交，同样要留痕：
+        # 助手消息已经在历史里，不补回执就会留下畸形对话，续跑必被网关 400 拒。
+        try:
+            for _ in calls:
+                budget.consume_tool_call()
+        except BudgetExhausted as exc:
+            on_skip(calls, exc, mirror_messages=True)
+            raise
 
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="wp-tool") as pool:
             futures = [
@@ -652,6 +658,11 @@ def _describe_response(response: ModelResponse) -> dict:
         "tool_calls": [call.name for call in response.tool_calls],
         "duration_ms": response.duration_ms,
     }
+    if response.reasoning:
+        # 推理过程单独留痕：只记长度与一小段预览，落盘前由执行器统一脱敏。
+        # 它绝不写进 text，契约解析器因此看不到它，也就拿不到"口头成功"的机会。
+        data["reasoning_chars"] = len(response.reasoning)
+        data["reasoning_preview"] = response.reasoning[:200]
     if response.usage is not None:
         data["tokens"] = response.usage.total_tokens
     return data
