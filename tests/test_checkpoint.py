@@ -328,6 +328,53 @@ def test_expired_checkpoint_is_refused() -> None:
     assert client.calls == []
 
 
+def test_refused_run_records_measured_duration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """拒绝续跑也要有真实耗时。
+
+    此前这条路径把 `duration_ms` 写死为 0，留痕里"快速拒绝"和"压根没执行"是
+    同一条记录，运维无法判断到底是哪一种。
+    """
+
+    class FakeClock:
+        def __init__(self) -> None:
+            self._value = 1000.0
+
+        def monotonic(self) -> float:
+            self._value += 0.25
+            return self._value
+
+    monkeypatch.setattr("workpanda.harness.executor.time", FakeClock())
+
+    store = InMemoryCheckpointStore()
+    traces = InMemoryTraceStore()
+    request = request_for()
+    store.save(
+        HarnessCheckpoint(
+            trace_id="other-trace",
+            task_id=request.task_id,
+            flow_id=request.flow_id,
+            flow_version=request.flow_version,
+            step_id=request.step_id,
+            allowed_tools=["some_other_tool"],
+            snapshot=ExecutionSnapshot(),
+        )
+    )
+    executor = HarnessExecutor(
+        ScriptedModelClient([ModelResponse(text=SUCCESS)]),
+        registry=registry_with(SubmitTool()),
+        deadline_seconds=30,
+        resume_enabled=True,
+        checkpoints=store,
+        traces=traces,
+    )
+
+    result = executor.execute(request)
+
+    assert result.error_code == "checkpoint_mismatch"
+    assert result.output["duration_ms"] == 250
+    assert traces.list(limit=1)[0].duration_ms == 250
+
+
 def test_checkpoint_is_cleared_after_a_normal_run() -> None:
     store = InMemoryCheckpointStore()
     submit = SubmitTool()
