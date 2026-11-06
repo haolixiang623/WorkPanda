@@ -129,6 +129,12 @@ class HarnessExecutor(Executor):
             on_progress=self._progress_recorder(request, grant, trace_id),
         )
         output = self._output(request, grant, result, trace_id, resumed_from)
+        # trace 只统计"这次尝试"发生的调用；断点里带过来的记录仍然算依据，但不重复计数。
+        executed = (
+            result.tool_calls[len(snapshot.tool_calls) :]
+            if snapshot is not None
+            else result.tool_calls
+        )
 
         if result.stop_reason is not StopReason.COMPLETED:
             # 预算耗尽或模型异常：这次执行没有结论，断点保留——后续要么接着跑，
@@ -144,7 +150,7 @@ class HarnessExecutor(Executor):
                 outcome=outcome,
                 error_code=error_code,
                 stop_reason=result.stop_reason.value,
-                records=result.tool_calls,
+                records=executed,
                 model_calls=result.model_calls,
                 tokens=result.tokens,
                 duration_ms=result.duration_ms,
@@ -180,7 +186,7 @@ class HarnessExecutor(Executor):
             outcome=outcome,
             error_code=error_code,
             stop_reason=result.stop_reason.value,
-            records=result.tool_calls,
+            records=executed,
             model_calls=result.model_calls,
             tokens=result.tokens,
             duration_ms=result.duration_ms,

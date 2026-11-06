@@ -204,6 +204,9 @@ class LookupOrderTool:
 指纹）。因此已经提交过的非幂等操作会被拦成 `duplicate_side_effect`，副作用不会发生第二次。
 预算也接着算：断点续跑不会凭空多出一份步数、调用次数或 token 配额。
 
+续跑产生的新 trace 通过 `resumed_from` 指向来源，并**只统计这次尝试发生的调用**；
+断点里带过来的记录仍作为 `tool_evidence` 依据，但不重复计入调用次数。
+
 开启与清理：
 
 ```bash

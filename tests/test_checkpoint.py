@@ -177,6 +177,9 @@ def test_resume_continues_without_repeating_the_side_effect() -> None:
         message.role is MessageRole.TOOL for message in client.calls[0]["messages"]
     )
     assert traces.list()[0].resumed_from == source.trace_id
+    # trace 只统计这次尝试的调用（被拦的重复提交），不重复计断点里已有的那次。
+    assert traces.list()[0].tool_calls == 1
+    assert traces.list()[0].successful_tool_calls == 0
     # 有结论后断点应当清理，否则下次会被误判成"上次没跑完"。
     assert store.load(request.task_id, request.step_id) is None
 
