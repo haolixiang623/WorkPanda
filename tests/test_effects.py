@@ -113,6 +113,38 @@ def test_skipped_calls_are_not_effects() -> None:
     assert summarize_effects(build(records)).requires_manual_check is False
 
 
+def test_crashed_non_idempotent_call_is_unknown_not_absent() -> None:
+    """工具没自报就崩了：请求可能已送达外部，必须按"结果未知"入账。
+
+    典型根因是连接重置、响应体解析失败——这些恰恰发生在请求已经发出去之后。
+    把它当成"确定没执行"，事后就再也没人知道那笔提交到底成没成。
+    """
+
+    effects = build([record(outcome=ToolOutcome.ERROR, error_code="tool_crashed")])
+
+    assert len(effects) == 1
+    assert effects[0].status is EffectStatus.UNKNOWN
+    assert effects[0].needs_manual_check is True
+    assert effects[0].error_code == "tool_crashed"
+
+
+def test_crashed_idempotent_call_is_still_not_an_effect() -> None:
+    """查询类工具崩了也不改变外部状态，不能拿它去烦人工核对。"""
+
+    specs = {"test_lookup": LOOKUP_SPEC}
+    records = [record(name="test_lookup", outcome=ToolOutcome.ERROR, error_code="tool_crashed")]
+
+    assert build(records, specs) == []
+
+
+def test_self_reported_failure_is_still_absent() -> None:
+    """工具自己明确回话"我没成"，那才是确定没执行——与崩溃必须区分开。"""
+
+    effects = build([record(outcome=ToolOutcome.ERROR, error_code="upstream_rejected")])
+
+    assert effects == []
+
+
 def test_unknown_tool_is_treated_as_side_effecting() -> None:
     # 登记表里查不到这个工具（例如热更新后注册表落后），宁可多一条待核对，
     # 也不能把一次真实提交当成"查询"漏掉。

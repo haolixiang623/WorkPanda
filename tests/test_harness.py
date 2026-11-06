@@ -18,7 +18,7 @@ from workpanda.harness.builtin import HttpFetchTool, SystemClockTool
 from workpanda.harness.clients import ModelError, ModelTimeout, ScriptedModelClient, tool_call
 from workpanda.harness.contract import parse_contract
 from workpanda.harness.executor import HarnessExecutor
-from workpanda.harness.loop import AgentLoop, StopReason
+from workpanda.harness.loop import AgentLoop, StopReason, _risk_of
 from workpanda.harness.models import (
     EventKind,
     MessageRole,
@@ -1227,6 +1227,87 @@ def test_parallel_call_failure_does_not_break_the_batch() -> None:
     assert [record.outcome for record in result.tool_calls] == [ToolOutcome.OK, ToolOutcome.ERROR]
     assert result.tool_calls[1].error_code == "upstream_down"
     assert result.stop_reason is StopReason.COMPLETED
+
+
+class ExplodingTool:
+    """并行批次里会崩的幂等工具：声明为高风险，用于确认崩溃记录不会丢掉等级。"""
+
+    spec = ToolSpec(
+        name="test_explode",
+        description="读响应时崩",
+        parameters={"type": "object", "properties": {}, "additionalProperties": False},
+        risk=RiskLevel.HIGH,
+        idempotent=True,
+        timeout_seconds=5.0,
+    )
+
+    def invoke(self, arguments: dict[str, Any], context: ToolContext) -> str:
+        raise ConnectionResetError("connection reset by peer while reading response")
+
+
+def test_parallel_crash_record_keeps_declared_risk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """崩溃兜底记录必须带上工具声明的风险等级，并统一用崩溃错误码。
+
+    `grant.call` 自己会兜住工具异常，所以这里让调度层那一步真的抛出来，
+    走的正是 `_crashed` 兜底路径。这条记录会被账本按"结果未知"入账、被断点
+    按"不可续跑"处理：风险等级若一律记成 low，高风险提交出的事在归档里就
+    看不出来了。
+    """
+
+    tool = ExplodingTool()
+    client = ScriptedModelClient(
+        [
+            ModelResponse(
+                tool_calls=[
+                    tool_call("test_explode", call_id="a"),
+                    tool_call("test_explode", call_id="b"),
+                ]
+            ),
+            ModelResponse(text=SUCCESS),
+        ]
+    )
+    grant = ToolGrant(
+        registry=registry_with(tool), allowed=frozenset({"test_explode"})
+    )
+
+    original = ToolGrant.call
+    state = {"blown": False}
+
+    def exploding_call(self: ToolGrant, call: ToolCall, ctx: ToolContext) -> Any:
+        # 只炸第一次，剩下的照常走真实实现，确认整轮不被击穿。
+        if not state["blown"]:
+            state["blown"] = True
+            raise ConnectionResetError("connection reset by peer")
+        return original(self, call, ctx)
+
+    monkeypatch.setattr(ToolGrant, "call", exploding_call)
+
+    result = AgentLoop(client, tool_concurrency=2).run(
+        system_prompt="s", user_prompt="u", grant=grant, context=context()
+    )
+
+    crashed = result.tool_calls[0]
+    assert crashed.error_code == "tool_crashed"
+    assert crashed.outcome is ToolOutcome.ERROR
+    assert crashed.risk is RiskLevel.HIGH, "崩溃记录不能把高风险降级成 low"
+    assert result.stop_reason is StopReason.COMPLETED, "崩溃单条，不该击穿整轮"
+
+
+def test_crash_risk_falls_back_to_high_when_spec_is_missing() -> None:
+    """登记表与调用对不上时（热更新、注册表落后），崩溃宁可标成高风险让人看见。"""
+
+    grant = ToolGrant(
+        registry=registry_with(ExplodingTool()), allowed=frozenset({"test_explode"})
+    )
+    unknown = ToolCall(call_id="y", name="test_gone", arguments={})
+
+    assert _risk_of(grant, unknown) is RiskLevel.HIGH
+    assert (
+        _risk_of(grant, ToolCall(call_id="z", name="test_explode", arguments={}))
+        is RiskLevel.HIGH
+    )
 
 
 def test_tool_call_limit_holds_under_concurrency() -> None:

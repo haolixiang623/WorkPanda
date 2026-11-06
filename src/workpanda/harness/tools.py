@@ -22,6 +22,7 @@ from uuid import UUID
 from pydantic import BaseModel
 
 from workpanda.harness.models import (
+    CRASH_ERROR_CODE,
     MAX_TOOL_CONTENT,
     RiskLevel,
     ToolCall,
@@ -244,7 +245,7 @@ class ToolGrant:
                     ToolOutcome.ERROR,
                     f"工具执行异常：{type(exc).__name__}",
                     started=started,
-                    error_code="tool_crashed",
+                    error_code=CRASH_ERROR_CODE,
                     risk=spec.risk,
                     attempts=attempts,
                 )
