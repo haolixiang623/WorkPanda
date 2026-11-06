@@ -118,33 +118,42 @@ class JsonlAuditJournal:
                     os.fsync(handle.fileno())
 
     def read(self, *, task_id: UUID | None = None, limit: int = 50) -> list[AuditEntry]:
-        """读当前归档文件，新的在前。
+        """读归档，新的在前。
 
-        只读当前文件（滚动出去的备份需人工/离线查），并按行容错：
-        一行坏掉不能让整份归档读不出来——这正是审计数据最不该出现的失败方式。
+        检索范围是当前文件加上全部滚动备份（`.1`、`.2`……由新到旧），
+        否则"三个月前那次提交到底发出去没有"这个问题在滚动之后就没人答得了。
+        `limit` 是跨文件合计的上限，不是每个文件各算一遍。
+        按行容错：一行坏掉不能让整份归档读不出来——这正是审计数据最不该出现的失败方式。
         """
 
         limit = max(0, limit)
-        if limit == 0 or not self._path.exists():
+        if limit == 0:
             return []
 
-        with self._lock:
-            text = self._path.read_text(encoding="utf-8", errors="replace")
-
         entries: list[AuditEntry] = []
-        for line in reversed(text.splitlines()):
-            if not line.strip():
-                continue
-            try:
-                entry = AuditEntry.model_validate_json(line)
-            except (ValidationError, ValueError):
-                continue
-            if task_id is not None and entry.task_id != task_id:
-                continue
-            entries.append(entry)
-            if len(entries) >= limit:
-                break
+        # 读也在锁内：滚动是先改名再重开，放开锁就可能读到"当前文件刚被搬走"的空档。
+        with self._lock:
+            for path in self._paths_newest_first():
+                if not path.exists():
+                    continue
+                text = path.read_text(encoding="utf-8", errors="replace")
+                for line in reversed(text.splitlines()):
+                    if not line.strip():
+                        continue
+                    try:
+                        entry = AuditEntry.model_validate_json(line)
+                    except (ValidationError, ValueError):
+                        continue
+                    if task_id is not None and entry.task_id != task_id:
+                        continue
+                    entries.append(entry)
+                    if len(entries) >= limit:
+                        return entries
         return entries
+
+    def _paths_newest_first(self) -> list[Path]:
+        """当前文件在前，其后依次是 `.1`、`.2`……由新到旧。"""
+        return [self._path, *(self.backup_path(index) for index in range(1, self._backups + 1))]
 
     def backup_path(self, index: int) -> Path:
         return Path(f"{self._path}.{index}")
