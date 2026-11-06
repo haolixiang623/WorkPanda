@@ -49,3 +49,21 @@ jobs:
             echo '疑似凭据或私钥进入仓库，请移除并通过授权的密钥渠道处理。' >&2
             exit 1
           fi
+
+  python:
+    name: Python 检查
+    if: ${{ hashFiles('pyproject.toml') != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 安装项目和开发依赖
+        run: python -m pip install -e '.[dev]'
+      - name: Ruff 检查
+        run: ruff check .
+      - name: 运行测试
+        run: pytest
