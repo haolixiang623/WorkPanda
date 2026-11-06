@@ -82,6 +82,7 @@ class HarnessExecutor(Executor):
         deadline_seconds: float = 45.0,
         require_tool_call: bool = True,
         tool_retries: int = 1,
+        tool_concurrency: int = 1,
         model_retries: int = 0,
         model_retry_backoff_seconds: float = 0.5,
         redactor: Redactor | None = None,
@@ -115,6 +116,7 @@ class HarnessExecutor(Executor):
             deadline_seconds=deadline_seconds,
             model_retries=model_retries,
             model_retry_backoff_seconds=model_retry_backoff_seconds,
+            tool_concurrency=tool_concurrency,
         )
 
     def execute(self, request: ExecutionRequest) -> ExecutionResult:
