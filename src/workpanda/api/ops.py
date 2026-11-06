@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from workpanda.api.dependencies import get_container
 from workpanda.bootstrap import Container
 from workpanda.domain.models import TaskEvent, TaskStatus, TaskView
+from workpanda.harness.audit import AuditEntry
 from workpanda.harness.trace import TraceRecord, TraceSummary
 
 router = APIRouter(prefix="/api/ops", tags=["ops"])
@@ -91,3 +92,22 @@ async def list_traces(
     container: Container = Depends(get_container),
 ) -> list[TraceRecord]:
     return container.traces.list(task_id=task_id, limit=limit)
+
+
+@router.get(
+    "/audit",
+    response_model=list[AuditEntry],
+    dependencies=[Depends(require_ops_token)],
+)
+async def list_audit(
+    task_id: UUID | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    container: Container = Depends(get_container),
+) -> list[AuditEntry]:
+    """审计归档：只追加、不被容量淘汰，用于核对"某次提交到底发出去没有"。
+
+    未配置归档时返回空列表，而不是 404：接口存在性不随配置变化，
+    免得运维看到 404 时误判成"这版还没上这个能力"。
+    """
+
+    return container.audit.read(task_id=task_id, limit=limit)

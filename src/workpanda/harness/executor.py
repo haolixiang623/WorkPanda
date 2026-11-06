@@ -27,6 +27,7 @@ from workpanda.application.ports import (
     ExecutionResult,
     Executor,
 )
+from workpanda.harness.audit import AuditJournal, entries_for_records
 from workpanda.harness.checkpoint import (
     CheckpointStore,
     ExecutionSnapshot,
@@ -34,6 +35,7 @@ from workpanda.harness.checkpoint import (
 )
 from workpanda.harness.clients import ModelClient
 from workpanda.harness.contract import OUTCOME_CONTRACT, parse_contract
+from workpanda.harness.effects import build_effects, summarize_effects
 from workpanda.harness.loop import AgentLoop, LoopResult, StopReason
 from workpanda.harness.models import ToolCallRecord, ToolOutcome, max_risk
 from workpanda.harness.redaction import DEFAULT_REDACTOR, Redactor, mask_values
@@ -82,6 +84,7 @@ class HarnessExecutor(Executor):
         tool_retries: int = 1,
         redactor: Redactor | None = None,
         traces: TraceStore | None = None,
+        audit: AuditJournal | None = None,
         checkpoints: CheckpointStore | None = None,
         resume_enabled: bool = False,
         resume_ttl_seconds: float = 900.0,
@@ -95,6 +98,8 @@ class HarnessExecutor(Executor):
         self._tool_retries = max(0, tool_retries)
         self._redactor = redactor or DEFAULT_REDACTOR
         self._traces = traces
+        # 审计归档独立于 trace：trace 会被淘汰，归档不会。
+        self._audit = audit
         self._checkpoints = checkpoints
         # 默认关闭：续跑会让"一次执行的中间状态"留存下来，属于需要显式开启的能力。
         self._resume_enabled = resume_enabled and checkpoints is not None
@@ -467,32 +472,117 @@ class HarnessExecutor(Executor):
         duration_ms: int = 0,
         resumed_from: str | None = None,
     ) -> None:
-        if self._traces is None:
-            return
         counts = ToolResultSummary.from_records(list(records))
-        self._traces.save(
-            TraceRecord(
+        # trace 与审计归档是两条独立的留痕通道：关掉其中一条不该连带关掉另一条。
+        if self._traces is not None:
+            self._traces.save(
+                TraceRecord(
+                    trace_id=trace_id,
+                    task_id=request.task_id,
+                    flow_id=request.flow_id,
+                    flow_version=request.flow_version,
+                    step_id=request.step_id,
+                    outcome=outcome.value,
+                    stop_reason=stop_reason,
+                    # 记最终错误码（含 unverified_success 这类契约降级），不是循环的原始错误码。
+                    error_code=error_code,
+                    risk=max_risk(grant.risks).value,
+                    model_calls=model_calls,
+                    tool_calls=counts.total,
+                    successful_tool_calls=counts.succeeded,
+                    blocked_tool_calls=counts.blocked,
+                    failed_tool_calls=counts.failed,
+                    timed_out_tool_calls=counts.timed_out,
+                    tokens=tokens,
+                    duration_ms=duration_ms,
+                    resumed_from=resumed_from,
+                )
+            )
+        self._write_audit(
+            request,
+            grant,
+            trace_id=trace_id,
+            outcome=outcome,
+            error_code=error_code,
+            stop_reason=stop_reason,
+            records=list(records),
+            counts=counts,
+            model_calls=model_calls,
+            tokens=tokens,
+            duration_ms=duration_ms,
+            resumed_from=resumed_from,
+        )
+
+    def _write_audit(
+        self,
+        request: ExecutionRequest,
+        grant: ToolGrant,
+        *,
+        trace_id: str,
+        outcome: ExecutionOutcome,
+        error_code: str | None,
+        stop_reason: str,
+        records: Sequence[ToolCallRecord],
+        counts: ToolResultSummary,
+        model_calls: int,
+        tokens: int,
+        duration_ms: int,
+        resumed_from: str | None,
+    ) -> None:
+        """把这一次执行与它产生的副作用追加进审计归档。
+
+        与 trace 的区别只有一个但很关键：trace 会被容量淘汰，归档不会。事后要回答
+        "那次提交到底发出去没有"，只能靠这份只追加的记录。
+
+        归档失败一律吞掉：留痕是为了复盘，不能反过来把已经完成的执行判成失败。
+        这里也刻意不写模型原文与工具参数原文——参数只留指纹，业务数据留在任务事件里。
+        """
+
+        journal = self._audit
+        if journal is None:
+            return
+        try:
+            specs = {spec.name: spec for spec in grant.specs}
+            effects = build_effects(
+                records,
+                specs=specs,
                 trace_id=trace_id,
                 task_id=request.task_id,
                 flow_id=request.flow_id,
                 flow_version=request.flow_version,
                 step_id=request.step_id,
-                outcome=outcome.value,
-                stop_reason=stop_reason,
-                # 记最终错误码（含 unverified_success 这类契约降级），不是循环的原始错误码。
-                error_code=error_code,
-                risk=max_risk(grant.risks).value,
-                model_calls=model_calls,
-                tool_calls=counts.total,
-                successful_tool_calls=counts.succeeded,
-                blocked_tool_calls=counts.blocked,
-                failed_tool_calls=counts.failed,
-                timed_out_tool_calls=counts.timed_out,
-                tokens=tokens,
-                duration_ms=duration_ms,
-                resumed_from=resumed_from,
             )
-        )
+            summary = summarize_effects(effects)
+            entries = entries_for_records(
+                trace_id=trace_id,
+                task_id=request.task_id,
+                flow_id=request.flow_id,
+                flow_version=request.flow_version,
+                step_id=request.step_id,
+                execution={
+                    "outcome": outcome.value,
+                    "stop_reason": stop_reason,
+                    "error_code": error_code,
+                    "risk": max_risk(grant.risks).value,
+                    "model_calls": model_calls,
+                    "tool_calls": counts.total,
+                    "blocked_tool_calls": counts.blocked,
+                    "failed_tool_calls": counts.failed,
+                    "timed_out_tool_calls": counts.timed_out,
+                    "tokens": tokens,
+                    "duration_ms": duration_ms,
+                    "resumed_from": resumed_from,
+                    "effects_applied": summary.applied,
+                    "effects_unknown": summary.unknown,
+                    # 只要有一笔"结果未知"，这次执行就不能当交付完成，必须转人工核对。
+                    "requires_manual_check": summary.requires_manual_check,
+                },
+                effects=effects,
+            )
+            for entry in entries:
+                journal.append(entry)
+        except Exception:  # noqa: BLE001 - 留痕失败不得击穿执行
+            return
 
 
 def default_step_prompt(request: ExecutionRequest, grant: ToolGrant) -> tuple[str, str]:

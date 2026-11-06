@@ -7,9 +7,23 @@
 由它返回 succeeded / failed / unconfirmed 三态和完整留痕。
 """
 
+from workpanda.harness.audit import (
+    AuditEntry,
+    AuditJournal,
+    AuditKind,
+    JsonlAuditJournal,
+    NullAuditJournal,
+)
 from workpanda.harness.budget import Budget, BudgetExhausted
 from workpanda.harness.clients import ModelClient, ModelError, ModelTimeout
 from workpanda.harness.contract import OUTCOME_CONTRACT, parse_contract
+from workpanda.harness.effects import (
+    EffectEntry,
+    EffectStatus,
+    EffectSummary,
+    build_effects,
+    summarize_effects,
+)
 from workpanda.harness.executor import HarnessExecutor
 from workpanda.harness.loop import AgentLoop, LoopResult, StopReason
 from workpanda.harness.models import (
@@ -36,17 +50,25 @@ from workpanda.harness.tools import (
 __all__ = [
     "OUTCOME_CONTRACT",
     "AgentLoop",
+    "AuditEntry",
+    "AuditJournal",
+    "AuditKind",
     "Budget",
     "BudgetExhausted",
+    "EffectEntry",
+    "EffectStatus",
+    "EffectSummary",
     "HarnessEvent",
     "HarnessExecutor",
     "HarnessMessage",
+    "JsonlAuditJournal",
     "LoopResult",
     "MessageRole",
     "ModelClient",
     "ModelError",
     "ModelResponse",
     "ModelTimeout",
+    "NullAuditJournal",
     "RiskLevel",
     "StopReason",
     "Tool",
@@ -58,7 +80,9 @@ __all__ = [
     "ToolOutcome",
     "ToolRegistry",
     "ToolSpec",
+    "build_effects",
     "max_risk",
     "parse_contract",
+    "summarize_effects",
     "validate_arguments",
 ]

@@ -13,6 +13,7 @@ from workpanda.config import Settings, get_settings
 from workpanda.domain.flow import FlowDefinition, FlowRegistry
 from workpanda.domain.identity import SessionSigner, new_secret
 from workpanda.domain.repository import ConfirmationStore, TaskStore
+from workpanda.harness.audit import AuditJournal, JsonlAuditJournal, NullAuditJournal
 from workpanda.harness.builtin import default_registry
 from workpanda.harness.checkpoint import CheckpointStore, InMemoryCheckpointStore
 from workpanda.harness.executor import HarnessExecutor
@@ -43,6 +44,7 @@ class Container:
     signer: SessionSigner
     limiter: TokenBucketLimiter
     traces: TraceStore
+    audit: AuditJournal
     closers: list = field(default_factory=list)
 
     def close(self) -> None:
@@ -67,6 +69,22 @@ def build_trace_store(settings: Settings) -> tuple[TraceStore, list[Callable[[],
         store = SqliteTraceStore(settings.sqlite_path, capacity=settings.harness_trace_capacity)
         return store, [store.close]
     return InMemoryTraceStore(capacity=max(1, settings.harness_trace_capacity)), []
+
+
+def build_audit_journal(
+    settings: Settings,
+) -> tuple[AuditJournal, list[Callable[[], None]]]:
+    """审计归档。默认关闭：未配置路径时不落任何文件，避免无意中把痕迹写到意外位置。"""
+
+    path = settings.harness_audit_path
+    if path is None:
+        return NullAuditJournal(), []
+    journal = JsonlAuditJournal(
+        path,
+        max_bytes=settings.harness_audit_max_bytes,
+        backups=settings.harness_audit_backups,
+    )
+    return journal, []
 
 
 def build_checkpoint_store(
@@ -110,6 +128,9 @@ def build_container(
     # trace 独立于任务结果存放：既能覆盖成功执行，也能做跨任务的聚合指标。
     traces, trace_closers = build_trace_store(settings)
     closers.extend(trace_closers)
+    # 审计归档与 trace 并行存在：一个会被淘汰，一个不会。
+    audit, audit_closers = build_audit_journal(settings)
+    closers.extend(audit_closers)
 
     if executor is None:
         # 优先级：通用 harness > Octop 运行时 > 脚手架执行器。
@@ -135,6 +156,7 @@ def build_container(
                 tool_retries=settings.harness_tool_retries,
                 redactor=DEFAULT_REDACTOR if settings.harness_redact else NO_REDACTION,
                 traces=traces,
+                audit=audit,
                 checkpoints=checkpoints,
                 resume_enabled=settings.harness_resume_enabled,
                 resume_ttl_seconds=settings.harness_resume_ttl_seconds,
@@ -196,5 +218,6 @@ def build_container(
             per_minute=settings.rate_limit_per_minute, burst=settings.rate_limit_burst
         ),
         traces=traces,
+        audit=audit,
         closers=closers,
     )

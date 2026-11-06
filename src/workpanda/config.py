@@ -52,6 +52,12 @@ class Settings(BaseSettings):
     harness_resume_ttl_seconds: float = 900.0
     # 逗号分隔的域名白名单；为空则不注册 http 工具（默认关闭比默认全开安全）。
     harness_allowed_hosts: str = ""
+    # 审计归档路径。为空则不归档（默认关闭）。归档只追加、按大小滚动，
+    # 不随 trace 容量淘汰，用于事后核对"某次提交到底发出去没有"。
+    harness_audit_path: Path | None = None
+    harness_audit_max_bytes: int = 5_000_000
+    # 滚动保留的备份份数；0 表示只留当前文件。
+    harness_audit_backups: int = 3
     # Octop-Harness 运行时。默认关闭，未配置模型凭据时不启用。
     octop_enabled: bool = False
     octop_agent_name: str = "workpanda"
