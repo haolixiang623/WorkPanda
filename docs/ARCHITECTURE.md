@@ -1,6 +1,6 @@
 # WorkPanda 工程骨架架构
 
-> 本文件描述**已实现**的骨架结构，不代表最终业务架构。业务目标与推荐架构仍以父目录的 `business-goals.md` 和 `recommended-architecture.md` 为准；两者进入版本控制前，本文件只记录工程实现事实。
+> 本文件描述**已实现**的骨架结构，不代表最终业务架构。业务目标以 [business-goals.md](../business-goals.md) 为准，目标架构以 [recommended-architecture.md](../recommended-architecture.md) 为准；两者与本文件冲突时，业务与架构意图以后者为准，实现事实以本文件为准。
 
 ## 1. 骨架边界
 
