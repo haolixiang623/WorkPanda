@@ -6,6 +6,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from workpanda.api.ops_auth import OpsAccessPolicy, build_ops_policy
 from workpanda.application.ports import Executor, IntentRouter
 from workpanda.application.runner import FlowRunner
 from workpanda.application.task_service import TaskService
@@ -51,6 +52,8 @@ class Container:
     tasks: TaskService
     signer: SessionSigner
     limiter: TokenBucketLimiter
+    # 运维接口的凭据与角色。构造时就校验配置，写错则启动失败。
+    ops_access: OpsAccessPolicy
     traces: TraceStore
     audit: AuditJournal
     # 取消登记表由容器持有：取消方与执行方看到的必须是同一个对象。
@@ -161,6 +164,8 @@ def build_container(
     router: IntentRouter | None = None,
 ) -> Container:
     settings = settings or get_settings()
+    # 凭据配置在打开任何存储之前校验：配置写错时不该先占住数据库连接再抛错。
+    ops_access = build_ops_policy(settings.ops_token, settings.ops_tokens)
 
     store: TaskStore
     confirmations: ConfirmationStore
@@ -293,6 +298,7 @@ def build_container(
         limiter=TokenBucketLimiter(
             per_minute=settings.rate_limit_per_minute, burst=settings.rate_limit_burst
         ),
+        ops_access=ops_access,
         traces=traces,
         audit=audit,
         cancellations=cancellations,
