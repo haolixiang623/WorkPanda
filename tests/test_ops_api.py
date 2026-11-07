@@ -1,6 +1,7 @@
 """运维只读接口：默认关闭，凭据错误返回 401，且不改写业务状态。"""
 
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -138,6 +139,136 @@ def test_ops_traces_require_token() -> None:
 
     assert client.get("/api/ops/traces").status_code == 401
     assert client.get("/api/ops/traces/summary").status_code == 401
+
+
+def _seed_traces(
+    container, count: int, *, stop_reason: str = "completed", prefix: str = "trace"
+) -> None:
+    for index in range(count):
+        container.traces.save(
+            TraceRecord(
+                trace_id=f"{prefix}-{index:02d}",
+                task_id=uuid.uuid4(),
+                flow_id="test.flow",
+                flow_version="1",
+                step_id="run",
+                outcome="succeeded" if stop_reason == "completed" else "unconfirmed",
+                stop_reason=stop_reason,
+                model_calls=1,
+                tool_calls=1,
+                successful_tool_calls=1,
+                tokens=10,
+                duration_ms=5,
+                created_at=datetime(2026, 11, 7, 4, 0, tzinfo=UTC) + timedelta(minutes=index),
+            )
+        )
+
+
+def test_ops_traces_page_with_the_cursor_header() -> None:
+    """响应体仍是数组（控制台不会被打断），翻页靠 `X-Next-Cursor` 头。"""
+
+    client, container = make_client(ops_token=OPS_TOKEN)
+    _seed_traces(container, 5)
+    headers = {"X-WorkPanda-Ops-Token": OPS_TOKEN}
+
+    first = client.get("/api/ops/traces", params={"limit": 2}, headers=headers)
+    assert first.status_code == 200
+    assert [item["trace_id"] for item in first.json()] == ["trace-04", "trace-03"]
+    cursor = first.headers.get("X-Next-Cursor")
+    assert cursor
+
+    second = client.get(
+        "/api/ops/traces", params={"limit": 2, "cursor": cursor}, headers=headers
+    )
+    assert [item["trace_id"] for item in second.json()] == ["trace-02", "trace-01"]
+
+    last = client.get(
+        "/api/ops/traces",
+        params={"limit": 2, "cursor": second.headers["X-Next-Cursor"]},
+        headers=headers,
+    )
+    assert [item["trace_id"] for item in last.json()] == ["trace-00"]
+    # 到头了就没有游标：否则调用方会一直为"空页"多跑一轮。
+    assert "X-Next-Cursor" not in last.headers
+
+
+def test_ops_traces_reject_an_invalid_cursor() -> None:
+    client, container = make_client(ops_token=OPS_TOKEN)
+    _seed_traces(container, 2)
+
+    response = client.get(
+        "/api/ops/traces",
+        params={"cursor": "definitely-not-a-cursor"},
+        headers={"X-WorkPanda-Ops-Token": OPS_TOKEN},
+    )
+
+    # 不能忽略游标直接返回第一页：那会让调用方以为自己在翻页，实际在打转。
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "invalid_cursor"
+
+
+@pytest.mark.parametrize(
+    ("params", "code"),
+    [
+        ({"since": "2026-11-07T00:00:00"}, "naive_time_window"),
+        ({"until": "2026-11-07T00:00:00"}, "naive_time_window"),
+        (
+            {"since": "2026-11-07T00:00:00+08:00", "until": "2026-11-07T00:00:00+08:00"},
+            "empty_time_window",
+        ),
+        (
+            {"since": "2026-11-08T00:00:00+08:00", "until": "2026-11-07T00:00:00+08:00"},
+            "empty_time_window",
+        ),
+    ],
+)
+def test_ops_traces_reject_ambiguous_time_windows(params: dict, code: str) -> None:
+    """不带时区会被当成 UTC，对东八区等于凭空错开 8 小时——空结果会被误读成没事。"""
+
+    client, container = make_client(ops_token=OPS_TOKEN)
+    _seed_traces(container, 2)
+    headers = {"X-WorkPanda-Ops-Token": OPS_TOKEN}
+
+    assert client.get("/api/ops/traces", params=params, headers=headers).status_code == 400
+    summary = client.get("/api/ops/traces/summary", params=params, headers=headers)
+    assert summary.status_code == 400
+    assert summary.json()["detail"]["code"] == code
+
+
+def test_ops_traces_accepts_timezone_aware_window() -> None:
+    client, container = make_client(ops_token=OPS_TOKEN)
+    _seed_traces(container, 3)
+    headers = {"X-WorkPanda-Ops-Token": OPS_TOKEN}
+
+    response = client.get(
+        "/api/ops/traces",
+        params={
+            "since": "2026-11-07T12:01:00+08:00",  # = 04:01Z
+            "until": "2026-11-07T12:03:00+08:00",  # = 04:03Z，不含
+        },
+        headers=headers,
+    )
+
+    assert [item["trace_id"] for item in response.json()] == ["trace-02", "trace-01"]
+
+
+def test_ops_trace_summary_scopes_to_the_same_filters() -> None:
+    """「这段时间的未确认占比」是运维真问题，不能只给全局数字。"""
+
+    client, container = make_client(ops_token=OPS_TOKEN)
+    _seed_traces(container, 3)
+    _seed_traces(container, 1, stop_reason="deadline", prefix="slow")
+    headers = {"X-WorkPanda-Ops-Token": OPS_TOKEN}
+
+    everything = client.get("/api/ops/traces/summary", headers=headers).json()
+    scoped = client.get(
+        "/api/ops/traces/summary", params={"stop_reason": "deadline"}, headers=headers
+    ).json()
+
+    assert everything["total"] == 4
+    assert everything["unconfirmed_rate"] == 0.25
+    assert scoped["total"] == 1
+    assert scoped["unconfirmed_rate"] == 1.0
 
 
 def test_ops_tool_runtime_reports_absence_without_harness() -> None:
