@@ -37,6 +37,8 @@ def test_create_task_returns_waiting_state(client: TestClient) -> None:
     body = create_task(client)
     assert body["status"] == "waiting_for_user"
     assert body["pending_fields"] == ["subject", "contact"]
+    # 群众可见状态由服务端给出，前端不再自己从 status 推断。
+    assert body["ui_state"] == "awaiting_input"
 
 
 def test_full_confirmation_flow(client: TestClient) -> None:
@@ -49,6 +51,7 @@ def test_full_confirmation_flow(client: TestClient) -> None:
     )
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "completed"
+    assert response.json()["ui_state"] == "completed"
 
 
 def test_unknown_task_returns_404(client: TestClient) -> None:
@@ -72,6 +75,8 @@ def test_unresolved_intent_requires_clarification(client: TestClient) -> None:
     )
     assert response.status_code == 422
     assert response.json()["code"] == "clarification_required"
+    # 识别失败也要给前端一个稳定状态键，而不是让它自己拼一个。
+    assert response.json()["ui_state"] == "needs_clarification"
 
 
 def test_unknown_flow_is_rejected(client: TestClient) -> None:

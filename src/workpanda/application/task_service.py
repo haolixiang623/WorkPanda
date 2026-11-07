@@ -72,17 +72,37 @@ class TaskService:
     # ---------- 命令 ----------
 
     def create_task(self, request: TaskCreateRequest, subject: str) -> Task:
-        flow = self._resolve_flow(request)
+        flow, routed_slots = self._resolve_flow(request)
+        declared = _declared_fields_of(flow)
+        # 与 `answer` 同一套字段门禁：未声明的字段既不能进任务，更不能顺着
+        # `arguments=dict(task.slots)` 流进执行参数。创建时不拦，等于在入口处
+        # 留一个"参数污染"的口子，而后面每一步都以为参数是可信的。
+        unknown = sorted(set(request.slots) - declared)
+        if unknown:
+            raise RequestRejected(f"fields are not accepted for this flow: {', '.join(unknown)}")
+
+        # 识别出来的槽位只填空缺，且只填流程声明过的字段；群众自己填的值优先，
+        # 因为"我填的"比"系统从话里猜的"更接近他的真实意图。
+        slots = {key: value for key, value in routed_slots.items() if key in declared and value}
+        from_text = sorted(set(slots) - set(request.slots))
+        slots.update({key: value for key, value in request.slots.items() if value})
+
         task = self.store.create(
             Task(
                 conversation_id=request.conversation_id,
                 user_ref=subject,
                 flow_id=flow.flow_id,
                 flow_version=flow.version,
-                slots={key: value for key, value in request.slots.items() if value},
+                slots=slots,
             )
         )
-        self.runner.emit(task, EventType.ACCEPTED, {"flow_id": flow.flow_id})
+        # 只留字段名、不留取值：留痕要能回答"这句话被识别出了哪些字段"，
+        # 而不必把群众原话再存一份到事件流里。
+        self.runner.emit(
+            task,
+            EventType.ACCEPTED,
+            {"flow_id": flow.flow_id, "slots_from_text": from_text},
+        )
         return self.runner.advance(task)
 
     def answer(self, task_id: UUID, request: TaskAnswerRequest, subject: str) -> Task:
@@ -253,10 +273,16 @@ class TaskService:
             raise TaskNotFoundError(str(task_id))
         return task
 
-    def _resolve_flow(self, request: TaskCreateRequest) -> FlowDefinition:
+    def _resolve_flow(self, request: TaskCreateRequest) -> tuple[FlowDefinition, dict[str, str]]:
+        """解析本次要走的流程，并带回识别出的槽位。
+
+        调用方显式给了 `flow_id` 时不会跑识别，因此也不会回填槽位：显式指定流程
+        属于内部/调试用法，让它顺带"猜字段"只会制造两套不一致的入口语义。
+        """
+
         if request.flow_id:
             try:
-                return self.flows.resolve(request.flow_id, request.flow_version)
+                return self.flows.resolve(request.flow_id, request.flow_version), {}
             except (FlowNotFound, FlowNotRunnable) as exc:
                 raise RequestRejected(str(exc)) from exc
 
@@ -264,7 +290,7 @@ class TaskService:
         if match is None or match.confidence < self.confidence_threshold:
             raise IntentUnresolved("无法确定办理事项，需要先向群众澄清，或转人工处理。")
         try:
-            return self.flows.require(match.flow_id, match.flow_version)
+            return self.flows.require(match.flow_id, match.flow_version), dict(match.slots)
         except (FlowNotFound, FlowNotRunnable) as exc:
             raise RequestRejected(str(exc)) from exc
 
@@ -285,4 +311,10 @@ class TaskService:
 
     def _declared_fields(self, task: Task) -> set[str]:
         flow = self.flows.require(task.flow_id, task.flow_version)
-        return {field for step in flow.steps for field in step.required_fields}
+        return _declared_fields_of(flow)
+
+
+def _declared_fields_of(flow: FlowDefinition) -> set[str]:
+    """流程声明过的全部字段。多个收集节点可以各自声明，合起来就是白名单。"""
+
+    return {field for step in flow.steps for field in step.required_fields}
