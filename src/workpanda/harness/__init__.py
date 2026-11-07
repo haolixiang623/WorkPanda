@@ -22,6 +22,7 @@ from workpanda.harness.cancel import (
     CancelSignalStore,
     CancelToken,
 )
+from workpanda.harness.cancel_executor import CancellableExecutor
 from workpanda.harness.clients import ModelClient, ModelError, ModelTimeout
 from workpanda.harness.contract import OUTCOME_CONTRACT, parse_contract
 from workpanda.harness.effects import (
@@ -67,6 +68,7 @@ __all__ = [
     "CancelSignalError",
     "CancelSignalStore",
     "CancelToken",
+    "CancellableExecutor",
     "EffectEntry",
     "EffectStatus",
     "EffectSummary",
