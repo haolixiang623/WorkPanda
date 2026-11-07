@@ -1,7 +1,8 @@
-"""运维只读接口，供 Octop 控制台读取任务与事件。
+"""运维接口，供 Octop 控制台读取任务与事件。
 
-控制台替代自建运维界面，但不持有业务状态写入权：
-这里只提供查询，流程推进、确认和副作用仍只能通过群众侧接口完成。
+控制台替代自建运维界面，但不持有业务状态写入权：这里的写入口只有
+`POST /tasks/{id}/notes`（追加人工处置备注，不改状态、不推进流程），
+流程推进、群众确认和副作用仍只能通过群众侧接口完成。
 
 接口默认关闭；必须配置 `WORKPANDA_OPS_TOKEN` 或 `WORKPANDA_OPS_TOKENS` 才能访问。
 可见范围按主体角色收窄：`viewer` 只看列表与聚合指标，明细（任务详情、事件流、
@@ -16,7 +17,13 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, 
 from workpanda.api.dependencies import get_container
 from workpanda.api.ops_auth import OpsDisabled, OpsPrincipal, OpsUnauthenticated
 from workpanda.bootstrap import Container
-from workpanda.domain.models import EventType, TaskEvent, TaskStatus, TaskView
+from workpanda.domain.models import (
+    EventType,
+    TaskEvent,
+    TaskNoteRequest,
+    TaskStatus,
+    TaskView,
+)
 from workpanda.domain.paging import (
     EventQuery,
     TaskCursor,
@@ -221,6 +228,38 @@ async def list_tasks(
 )
 async def get_task(task_id: UUID, container: Container = Depends(get_container)) -> TaskView:
     return TaskView.from_task(container.tasks.ops_task(task_id))
+
+
+@router.post(
+    "/tasks/{task_id}/notes",
+    response_model=TaskEvent,
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_operator_note(
+    task_id: UUID,
+    request: TaskNoteRequest,
+    principal: OpsPrincipal = Depends(require_ops_admin),
+    container: Container = Depends(get_container),
+) -> TaskEvent:
+    """追加一条人工处置备注。**这是整个 `/api/ops` 下唯一的写接口。**
+
+    它只往事件流里追加事实：不改任务状态、不触达执行器、不动确认凭证，也不
+    出现在群众侧事件流里。存在的理由很具体——任务落到 `outcome_unconfirmed`
+    或 `handoff_required` 之后，运营在系统外核实了结果（对方系统其实办成了、
+    群众电话里撤销了、单据号对上了），而这份事实此前只能记在 Excel 里，系统
+    里的记录于是长期与现实不符，事后谁也说不清当时核实到了什么。
+
+    署名取自已鉴权的运维主体（`principal.subject`），不接受请求体自报。
+    要求 admin 角色：备注会带主体标识长期留在事件流里，viewer 是日常值班角色，
+    不该有能力往业务记录里写东西。
+
+    刻意不提供"重试"和"改状态"：
+    - 重试可能让一笔已经提交的副作用再发生一次，群众被扣两次钱、收到两份材料；
+    - 改状态会把虚假成功制度化，正好是本项目用结构化结果契约定点消灭的缺陷。
+    两者都不是这个接口的扩展方向，需要时另做设计评审。
+    """
+
+    return container.tasks.add_operator_note(task_id, request, principal.subject)
 
 
 @router.get(
