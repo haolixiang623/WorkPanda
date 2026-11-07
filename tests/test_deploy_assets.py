@@ -184,8 +184,14 @@ def test_deploy_tree_has_no_credentials() -> None:
         r"|gh[pousr]_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,})"
     )
     for path in sorted((REPO_ROOT / "deploy").rglob("*")):
-        if path.is_file():
-            assert not pattern.search(path.read_text(encoding="utf-8")), path
+        if not path.is_file() or "__pycache__" in path.parts:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            # 导入部署脚本时可能留下 .pyc；二进制产物不是「配置残留」。
+            continue
+        assert not pattern.search(text), path
 
 
 def test_bootstrap_retries_while_old_agent_exits(tmp_path: Path, monkeypatch) -> None:
