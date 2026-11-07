@@ -113,7 +113,7 @@ export WORKPANDA_OCTOP_WORKSPACE=...          # 必须是绝对路径或可解�
 |---|---|---|
 | GET | `/api/ops/tasks?limit=&status=&flow_id=&since=&until=&cursor=` | 按创建时间倒序列出任务 |
 | GET | `/api/ops/tasks/{task_id}` | 任务详情 |
-| POST | `/api/ops/tasks/{task_id}/notes` | 追加人工处置备注（**唯一写入口**，不改状态） |
+| POST | `/api/ops/tasks/{task_id}/notes` | 追加人工处置备注（**唯一写入口**，不改状态；要求 `admin`，署名取凭据主体） |
 | GET | `/api/ops/tasks/{task_id}/events?after=&type=&since=&until=&limit=&cursor=` | 事件流（含澄清、确认、执行结果、转人工） |
 | GET | `/api/ops/traces?task_id=&limit=&outcome=&stop_reason=&risk=&since=&until=&cursor=` | 执行留痕 |
 | GET | `/api/ops/traces/summary` | 留痕聚合指标（未确认占比、被拦/超时调用、token 等） |
@@ -131,6 +131,10 @@ scope，跨端点复用会得到 `400 invalid_cursor`，不会"看起来正常�
 - 凭据错误返回 401；
 - 凭据有效但角色不够返回 403：`viewer` 只能读任务列表与留痕聚合，任务详情、
   事件流、留痕明细、审计归档、工具台账要求 `admin`；
+- `POST /tasks/{id}/notes` 要求 `admin`。事件里的 `operator` 取凭据主体
+  （`OpsPrincipal.subject`），**不读请求体**：可自报的署名等于没有署名。
+  单主体旧配置 `WORKPANDA_OPS_TOKEN` 下主体固定为 `legacy`，此时署名只到
+  "某个共享凭据"，不构成追责依据；
 - 群众会话令牌**不能**访问运维接口，运维凭据也不能当会话令牌用。
 
 角色划分、凭据轮换与 TLS/回退见 [OPS-ACCESS-CONTROL.md](OPS-ACCESS-CONTROL.md)。

@@ -106,12 +106,11 @@ class TaskNoteRequest(BaseModel):
     什么"。少一个字段就少一条覆写状态的路径，也就少一类"库里的结论和现实
     不一致、还查不出是谁改的"事故。
 
-    `operator` 是自述字段而不是鉴权身份——运维凭据当前是共享的，服务端无法
-    证明是谁在操作。它只用于留痕，不能作为追责依据；换成每操作者独立凭据
-    之前，不要把涉及处罚的判断建立在这个字段上。
+    也刻意**没有** `operator` 字段：署名由服务端从运维凭据主体取
+    （`OpsPrincipal.subject`），不接受调用方自报。可自述的署名等于没有署名——
+    真出事时它证明不了任何事。
     """
 
-    operator: str = Field(min_length=1, max_length=64)
     note: str = Field(min_length=1, max_length=1000)
     # 外部依据（工单号、对方系统回执号等），便于日后复核时不必再问一遍。
     reference: str | None = Field(default=None, max_length=200)

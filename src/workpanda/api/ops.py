@@ -234,11 +234,11 @@ async def get_task(task_id: UUID, container: Container = Depends(get_container))
     "/tasks/{task_id}/notes",
     response_model=TaskEvent,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_ops_token)],
 )
 async def add_operator_note(
     task_id: UUID,
     request: TaskNoteRequest,
+    principal: OpsPrincipal = Depends(require_ops_admin),
     container: Container = Depends(get_container),
 ) -> TaskEvent:
     """追加一条人工处置备注。**这是整个 `/api/ops` 下唯一的写接口。**
@@ -249,13 +249,17 @@ async def add_operator_note(
     群众电话里撤销了、单据号对上了），而这份事实此前只能记在 Excel 里，系统
     里的记录于是长期与现实不符，事后谁也说不清当时核实到了什么。
 
+    署名取自已鉴权的运维主体（`principal.subject`），不接受请求体自报。
+    要求 admin 角色：备注会带主体标识长期留在事件流里，viewer 是日常值班角色，
+    不该有能力往业务记录里写东西。
+
     刻意不提供"重试"和"改状态"：
     - 重试可能让一笔已经提交的副作用再发生一次，群众被扣两次钱、收到两份材料；
     - 改状态会把虚假成功制度化，正好是本项目用结构化结果契约定点消灭的缺陷。
     两者都不是这个接口的扩展方向，需要时另做设计评审。
     """
 
-    return container.tasks.add_operator_note(task_id, request)
+    return container.tasks.add_operator_note(task_id, request, principal.subject)
 
 
 @router.get(

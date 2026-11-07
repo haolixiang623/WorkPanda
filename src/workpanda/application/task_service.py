@@ -165,12 +165,17 @@ class TaskService:
 
     # ---------- 运维：人工处置备注（只追加事实，不改状态） ----------
 
-    def add_operator_note(self, task_id: UUID, request: TaskNoteRequest) -> TaskEvent:
+    def add_operator_note(
+        self, task_id: UUID, request: TaskNoteRequest, operator: str
+    ) -> TaskEvent:
         """追加一条运营备注。**任何状态都允许，包括终态。**
 
         这条能力存在的唯一理由：运营在系统外核实了事实（对方系统其实办成了、
         群众已电话撤销、单据号对上了），而这件事实在当前系统里没有任何地方可
         以留痕。它解决的是"记录与现实对不上"，不是"让运营代替群众推进流程"。
+
+        `operator` 必须由调用方从已鉴权的运维主体传入，不接受请求体自报——
+        否则这条备注在事后证明不了是谁写的。
 
         为什么不做条件写：条件写的意义是"我的决策基于我读到的这个状态"。备注
         不做决策、不改状态，因此不需要这一层；反过来，如果走 `commit` 写整行，
@@ -180,7 +185,7 @@ class TaskService:
         """
 
         task = self.store.get(task_id)
-        data: dict[str, Any] = {"operator": request.operator, "note": request.note}
+        data: dict[str, Any] = {"operator": operator, "note": request.note}
         if request.reference:
             data["reference"] = request.reference
         return self.store.append_event(task_id, EventType.OPERATOR_NOTE, task.status, data)
