@@ -1,7 +1,7 @@
 # Octop 集成说明
 
 > 范围：说明 WorkPanda 如何接入 Octop-Harness 运行时，以及 Octop 控制台与 WorkPanda 的职责划分。
-> 现状：运行时适配已实现，真实模型端到端已跑通（含结构化结果契约）；只读控制台插件已实现（`plugins/workpanda-ops/`），并在本机 Octop 实例上完成安装与加载验证（见第 4 节）。Dashboard 浏览器内的真实渲染仍待走查。
+> 现状：运行时适配已实现，真实模型端到端已跑通（含结构化结果契约）；只读控制台插件已实现（`plugins/workpanda-ops/`），并在本机 Octop 实例上完成安装、加载、模型接入、真实聊天工具调用与 Dashboard 浏览器内渲染的全链路走查（见第 4 节）。
 
 ## 1. 相关上游项目
 
@@ -166,9 +166,28 @@ export WORKPANDA_OCTOP_WORKSPACE=...          # 必须是绝对路径或可解�
 缺凭据时如实报错而非伪装成功；源码无写操作；`ruff check .` 全过、
 `pytest` 303 passed。
 
-未验证：Dashboard 浏览器内的真实渲染与交互（需登录控制台并在聊天中调用工具）、
-多用户权限隔离、以及生产部署形态。当前实例位于 `/tmp`，重启或清理后不持久，
-正式试点需换成持久数据目录并配置 HTTPS 与访问控制。
+### 4.4 控制台全链路走查（2026-11-07）
+
+用 Playwright + 系统 Chrome 真实登录 `http://127.0.0.1:8090`（滑块验证），
+逐项确认「控制台 → 模型 → 专家 → 插件 → 工具 → WorkPanda 数据 → UI 卡片」整条链路：
+
+| 环节 | 走查结果 |
+|---|---|
+| 插件管理页 `/admin/plugins` | `WorkPanda 运维只读`、`tool v0.1.0`、**已加载**、启用开关打开 |
+| 模型页 `/admin/models` | `dashscope` Provider 已启用，base_url 为百炼兼容端点，activity model 为 `deepseek-v4.1-flash-1017` |
+| 专家页 `/experts` | `WorkPanda 运维助手`（`agent_id=DZMF8E`）可见 |
+| 工具挂载 | `/api/plugins/agents/DZMF8E/tools` 返回 4 个 `workpanda_ops_*` 工具，`enabled=true`（插件工具默认开启） |
+| 真实聊天 | WebSocket `user_turn` 触发模型调用工具，收到 `tool_call_chunk` → `tool_result`（含 `octop_ui` envelope）→ `done`，无 error |
+| 浏览器渲染 | 4 个工具各渲染一张 `WorkPanda 运维视图 / 只读` 卡片：overview 为指标网格；tasks、traces 为带中文表头的表格（任务 ID / 流程 / 状态、留痕 ID / 步骤 / 结果 …）；audit 无数据时显示「暂无记录」；`pageerror` 为空 |
+
+OpenAPI 面探测：`/api/openapi.json` 共 416 个路径、38 个可无参 GET 的模块，
+除 `/api/ollama-models` 因 Ollama 功能开关未启用返回 503 外，无 5xx；
+少数 4xx 是缺必需参数或 MCP session 协议要求，不是服务异常。
+`enable_api_docs` 仅为本次诊断临时开启，位于 `/tmp` 的实例配置中，不入库。
+
+未验证：多用户权限隔离、Ollama provider 启用、以及生产部署形态。
+当前实例位于 `/tmp`，重启或清理后不持久，正式试点需换成持久数据目录
+并配置 HTTPS 与访问控制。
 
 ## 5. 已验证与未验证
 
@@ -181,7 +200,7 @@ export WORKPANDA_OCTOP_WORKSPACE=...          # 必须是绝对路径或可解�
 
 未验证：
 
-- **Octop 控制台插件**：已实现并在本机 Octop 1.0.2 实例上完成安装、加载与工具取数验证（第 4.3 节）；浏览器内真实渲染、多用户隔离与生产部署形态仍未验证；
+- **Octop 控制台插件**：已实现并在本机 Octop 1.0.2 实例上完成安装、加载、工具取数、真实聊天调用与浏览器渲染走查（第 4.3、4.4 节）；多用户隔离与生产部署形态仍未验证；
 - **并发与多实例**：运行时每个进程各建一个 Agent，多实例的会话与限流一致性未验证；
 - **浏览器类工具**：`octop-browser` 随 SDK 安装，但 WorkPanda 尚未启用，也未做域白名单与用户隔离验证；
 - **真实业务工具**：当前步骤由模型按 `instruction` 直接完成，尚未接入任何外部业务系统；接入时需补工具白名单与幂等设计。
