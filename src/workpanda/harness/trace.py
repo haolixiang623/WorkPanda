@@ -24,28 +24,13 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+# `canonical_stamp` 由任务、事件、审计几处翻页共用，定义下沉到 domain.paging；
+# 这里重新导出，既有 `from workpanda.harness.trace import canonical_stamp` 不变。
+from workpanda.domain.paging import canonical_stamp
+
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
-
-
-def canonical_stamp(value: datetime) -> str:
-    """把时间规范成可比较的字符串。
-
-    库里 `created_at` 存的是 ISO 文本，跨后端排序、翻页游标都靠字符串比较。
-    只有所有写入与游标都经过同一个规范化函数，比较结果才可靠：
-
-    - 一律换算到 UTC，避免 `+08:00` 与 `+00:00` 混写导致"同一时刻排成两个位置"；
-    - 微秒位固定保留，避免 `...:00` 与 `...:00.000000` 长短不一；
-    - 不带时区的值按 UTC 处理（写入口只有本模块，正常不会出现）。
-
-    时区混写是真实隐患：早先只写 `datetime.isoformat()`，一旦有人传了带偏移的
-    时间，字符串顺序就和真实时间顺序不一致，翻页会漏记录或者重复记录。
-    """
-
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=UTC)
-    return value.astimezone(UTC).isoformat(timespec="microseconds")
 
 
 class TraceRecord(BaseModel):

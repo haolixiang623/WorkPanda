@@ -27,6 +27,7 @@ from workpanda.domain.models import (
     TaskStatus,
     utc_now,
 )
+from workpanda.domain.paging import EventPage, EventQuery, TaskPage, TaskQuery
 from workpanda.domain.repository import (
     ConfirmationStore,
     PendingEvent,
@@ -175,12 +176,27 @@ class TaskService:
     def list_tasks(self, *, limit: int = 50, status: TaskStatus | None = None) -> Sequence[Task]:
         return self.store.list_tasks(limit=limit, status=status)
 
+    def query_tasks(self, query: TaskQuery) -> TaskPage:
+        """运维控制台的完整检索：过滤齐了才算"看全了"，否则截断是静默的。"""
+
+        return self.store.query_tasks(query)
+
     def ops_task(self, task_id: UUID) -> Task:
         return self.store.get(task_id)
 
     def ops_events(self, task_id: UUID, after_sequence: int = 0) -> Sequence[TaskEvent]:
         self.store.get(task_id)
         return self.store.events(task_id, after_sequence)
+
+    def query_events(self, query: EventQuery) -> EventPage:
+        """事件检索。任务不存在时仍抛 `TaskNotFoundError`，不返回空页。
+
+        "没有这个任务"和"这个任务没有事件"是两件事，混成一个空列表会让运维
+        以为任务确实安静，而实际是 ID 敲错了。
+        """
+
+        self.store.get(query.task_id)
+        return self.store.query_events(query)
 
     # ---------- 内部 ----------
 

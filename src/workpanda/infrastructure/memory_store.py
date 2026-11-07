@@ -8,6 +8,17 @@ from uuid import UUID
 
 from workpanda.domain.confirmation import Confirmation, ConfirmationError
 from workpanda.domain.models import EventType, Task, TaskEvent, TaskStatus, utc_now
+from workpanda.domain.paging import (
+    EventPage,
+    EventQuery,
+    TaskPage,
+    TaskQuery,
+    canonical_stamp,
+    encode_token,
+    event_matches,
+    task_matches,
+    task_sort_key,
+)
 from workpanda.domain.repository import PendingEvent, StaleTaskState, TaskNotFoundError
 
 
@@ -104,6 +115,40 @@ class InMemoryTaskStore:
             ]
         tasks.sort(key=lambda task: task.created_at, reverse=True)
         return tuple(tasks[:limit])
+
+    def query_tasks(self, query: TaskQuery) -> TaskPage:
+        with self._lock:
+            tasks = [task.model_copy(deep=True) for task in self._tasks.values()]
+
+        selected = [task for task in tasks if task_matches(task, query)]
+        # 新的在前：排障时最关心最近发生了什么。
+        selected.sort(key=task_sort_key, reverse=True)
+
+        limit = max(0, query.limit)
+        page = selected[:limit]
+        next_cursor = None
+        # 只有当"后面确实还有"时才给游标，否则调用方会为了一个空页多跑一轮。
+        if len(selected) > limit and page:
+            last = page[-1]
+            next_cursor = encode_token(
+                "tasks", [canonical_stamp(last.created_at), str(last.task_id)]
+            )
+        return TaskPage(items=tuple(page), next_cursor=next_cursor)
+
+    def query_events(self, query: EventQuery) -> EventPage:
+        with self._lock:
+            events = [
+                event.model_copy(deep=True) for event in self._events.get(query.task_id, ())
+            ]
+
+        selected = [event for event in events if event_matches(event, query)]
+        # 事件按序号正序：回放一次执行时，先发生的事要先看到。
+        selected.sort(key=lambda event: event.sequence)
+
+        limit = max(0, query.limit)
+        page = selected[:limit]
+        next_cursor = str(page[-1].sequence) if len(selected) > limit and page else None
+        return EventPage(items=tuple(page), next_cursor=next_cursor)
 
 
 class InMemoryConfirmationStore:

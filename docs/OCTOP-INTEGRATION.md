@@ -107,13 +107,17 @@ export WORKPANDA_OCTOP_WORKSPACE=...          # 必须是绝对路径或可解�
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/ops/tasks?limit=&status=` | 按创建时间倒序列出任务 |
+| GET | `/api/ops/tasks?limit=&status=&flow_id=&since=&until=&cursor=` | 按创建时间倒序列出任务 |
 | GET | `/api/ops/tasks/{task_id}` | 任务详情 |
-| GET | `/api/ops/tasks/{task_id}/events?after=` | 事件流（含澄清、确认、执行结果、转人工） |
-| GET | `/api/ops/traces?task_id=&limit=` | 执行留痕 |
+| GET | `/api/ops/tasks/{task_id}/events?after=&type=&since=&until=&limit=&cursor=` | 事件流（含澄清、确认、执行结果、转人工） |
+| GET | `/api/ops/traces?task_id=&limit=&outcome=&stop_reason=&risk=&since=&until=&cursor=` | 执行留痕 |
 | GET | `/api/ops/traces/summary` | 留痕聚合指标（未确认占比、被拦/超时调用、token 等） |
-| GET | `/api/ops/audit?limit=` | 审计归档条目 |
+| GET | `/api/ops/audit?task_id=&kind=&since=&until=&limit=&cursor=` | 审计归档条目 |
 | GET | `/api/ops/tool-runtime` | 工具线程台账与容量闸门（第十一轮新增） |
+
+所有列表接口的响应体都是**数组**，翻页信息放在 `X-Next-Cursor` 响应头：把这个值
+原样作为下一页的 `cursor` 参数回传即可；头不存在就是到头了。游标不透明且带端点
+scope，跨端点复用会得到 `400 invalid_cursor`，不会"看起来正常地"返回一页错数据。
 
 鉴权：请求头 `X-WorkPanda-Ops-Token` 必须等于 `WORKPANDA_OPS_TOKEN`。
 

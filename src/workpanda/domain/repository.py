@@ -13,6 +13,7 @@ from uuid import UUID
 
 from workpanda.domain.confirmation import Confirmation
 from workpanda.domain.models import EventType, Task, TaskEvent, TaskStatus
+from workpanda.domain.paging import EventPage, EventQuery, TaskPage, TaskQuery
 
 
 class TaskNotFoundError(LookupError):
@@ -81,6 +82,21 @@ class TaskStore(Protocol):
 
     def list_tasks(self, *, limit: int = 50, status: TaskStatus | None = None) -> Sequence[Task]:
         """按创建时间倒序列出任务，供运维控制台只读查询。"""
+        ...
+
+    def query_tasks(self, query: TaskQuery) -> TaskPage:
+        """带过滤、时间窗与键集翻页的任务检索。
+
+        `list_tasks` 是稳定的小接口（旧的调用点与测试都用它），这里是完整版本：
+        两套后端必须给出逐条一致的分页结果，翻页翻出来的集合不允许依赖后端选择。
+        """
+        ...
+
+    def query_events(self, query: EventQuery) -> EventPage:
+        """带类型过滤、时间窗与序号翻页的事件检索。
+
+        事件按 `sequence` 升序给出（时间正序），翻页锚点即"上一页最后一条的序号"。
+        """
         ...
 
 
