@@ -20,6 +20,13 @@ sys.modules[_spec.name] = claim
 _spec.loader.exec_module(claim)
 
 
+def test_claim_lock_acquire_release_no_crash():
+    # 跨平台锁在「当前平台」取锁 + 释放不得抛异常；Windows 上走 msvcrt、
+    # Unix 上走 fcntl，两者皆缺则退化为不锁 + 警告。至少保证不崩溃。
+    with claim.claim_lock():
+        pass
+
+
 class FakeGitHub:
     """服务端语义的假实现：comment id 在锁内自增，模拟 GitHub 的单调分配。"""
 

@@ -4,7 +4,7 @@
 而在 claim comment 的服务端单调 id：一个 Issue 的有效 claim 中 id 最小者获准。
 comment id 由 GitHub 分配且唯一，所以最小者唯一 —— 这与并发时序无关。
 
-本机的 flock 只保证「挑选 Issue → 发 claim」这一段不撞车；跨主机时 flock 失效，
+本机的进程互斥锁只保证「挑选 Issue → 发 claim」这一段不撞车；跨主机时该锁失效，
 但 comment id 仲裁仍然成立，结果只是一次无效认领，不会有两个 worker 同时开工。
 
 子命令：
@@ -19,7 +19,6 @@ comment id 由 GitHub 分配且唯一，所以最小者唯一 —— 这与并�
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import os
 import re
@@ -28,6 +27,16 @@ import sys
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
+
+try:
+    import fcntl  # Unix / macOS：fcntl.flock 做本机进程互斥
+except ImportError:  # Windows 没有 fcntl
+    fcntl = None  # type: ignore[assignment]
+
+try:
+    import msvcrt  # Windows：msvcrt.locking 做本机进程互斥
+except ImportError:  # 非 Windows
+    msvcrt = None  # type: ignore[assignment]
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -283,14 +292,43 @@ def lock_path() -> Path:
 
 @contextmanager
 def claim_lock():
+    """本机进程互斥锁，跨平台。
+
+    用 fcntl（Unix）或 msvcrt（Windows）对锁文件加排他锁。两者都不存在时
+    退化为「不加锁 + 警告」，绝不崩溃——因为本机锁只是减少无效认领的优化，
+    真正的防重靠 GitHub 服务端 comment id 仲裁（见文档第 10.1 节）。
+
+    锁文件放在仓库之外（lock_path），共享 worktree 被切分支 / commit -a
+    时也不会弄丢它。
+    """
     path = lock_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    handle = path.open("a+b")
+    locker = None
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            locker = "fcntl"
+        elif msvcrt is not None:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            locker = "msvcrt"
+        else:
+            print(
+                "warning: 当前平台既无 fcntl 也无 msvcrt，跳过本机锁；"
+                "跨主机正确性仍由 GitHub comment id 仲裁保证",
+                file=sys.stderr,
+            )
+        yield
+    finally:
         try:
-            yield
+            if locker == "fcntl":
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            elif locker == "msvcrt":
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
 
 
 def require_worker() -> str:
