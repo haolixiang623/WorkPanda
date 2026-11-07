@@ -15,7 +15,7 @@ from uuid import UUID
 
 from workpanda.domain.confirmation import Confirmation, ConfirmationError
 from workpanda.domain.models import EventType, Task, TaskEvent, TaskStatus, utc_now
-from workpanda.domain.repository import TaskNotFoundError
+from workpanda.domain.repository import PendingEvent, StaleTaskState, TaskNotFoundError
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -112,40 +112,119 @@ class SqliteStore:
             raise TaskNotFoundError(str(task_id))
         return self._to_task(row)
 
+    _UPDATE_TASK = """
+        UPDATE tasks SET
+            conversation_id = ?, user_ref = ?, flow_id = ?, flow_version = ?,
+            status = ?, current_step = ?, completed_steps = ?, slots = ?,
+            pending_fields = ?, result = ?, failure_code = ?, failure_message = ?,
+            created_at = ?, updated_at = ?
+        WHERE task_id = ?
+    """
+
+    def _write_task(self, task: Task, expected_status: TaskStatus | None) -> int:
+        """写任务行并返回命中行数；`expected_status` 会并进同一条 UPDATE 的条件。"""
+        sql = self._UPDATE_TASK
+        params: list[Any] = [
+            task.conversation_id,
+            task.user_ref,
+            task.flow_id,
+            task.flow_version,
+            task.status.value,
+            task.current_step,
+            json.dumps(task.completed_steps),
+            json.dumps(task.slots),
+            json.dumps(task.pending_fields),
+            json.dumps(task.result) if task.result is not None else None,
+            task.failure_code,
+            task.failure_message,
+            _iso(task.created_at),
+            _iso(task.updated_at),
+            str(task.task_id),
+        ]
+        if expected_status is not None:
+            sql += " AND status = ?"
+            params.append(expected_status.value)
+        return self._conn.execute(sql, tuple(params)).rowcount
+
     def save(self, task: Task) -> Task:
         with self._lock:
-            cursor = self._conn.execute(
-                """
-                UPDATE tasks SET
-                    conversation_id = ?, user_ref = ?, flow_id = ?, flow_version = ?,
-                    status = ?, current_step = ?, completed_steps = ?, slots = ?,
-                    pending_fields = ?, result = ?, failure_code = ?, failure_message = ?,
-                    created_at = ?, updated_at = ?
-                WHERE task_id = ?
-                """,
-                (
-                    task.conversation_id,
-                    task.user_ref,
-                    task.flow_id,
-                    task.flow_version,
-                    task.status.value,
-                    task.current_step,
-                    json.dumps(task.completed_steps),
-                    json.dumps(task.slots),
-                    json.dumps(task.pending_fields),
-                    json.dumps(task.result) if task.result is not None else None,
-                    task.failure_code,
-                    task.failure_message,
-                    _iso(task.created_at),
-                    _iso(task.updated_at),
-                    str(task.task_id),
-                ),
-            )
-            if cursor.rowcount == 0:
+            if self._write_task(task, None) == 0:
                 self._conn.rollback()
                 raise TaskNotFoundError(str(task.task_id))
             self._conn.commit()
         return task
+
+    def commit(
+        self,
+        task: Task,
+        events: Sequence[PendingEvent] = (),
+        *,
+        expected_status: TaskStatus | None = None,
+    ) -> Sequence[TaskEvent]:
+        """条件写与事件追加在同一事务里完成。
+
+        关键点在顺序：先执行带 `status` 条件的 UPDATE。它一旦命中，SQLite 就
+        持有写锁直到 `commit()`，因此随后分配顺序号、插入事件对别的进程也
+        是同一个临界区。若反过来先 SELECT 再 UPDATE，中间恰好是另一个进程
+        把状态翻成 `cancelled` 的窗口——那等于白做。
+        """
+        with self._lock:
+            try:
+                if self._write_task(task, expected_status) == 0:
+                    exists = (
+                        self._conn.execute(
+                            "SELECT 1 FROM tasks WHERE task_id = ?", (str(task.task_id),)
+                        ).fetchone()
+                        is not None
+                    )
+                    if not exists:
+                        raise TaskNotFoundError(str(task.task_id))
+                    raise StaleTaskState(
+                        f"task {task.task_id} no longer has the expected status"
+                    )
+                row = self._conn.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) AS max_sequence"
+                    " FROM task_events WHERE task_id = ?",
+                    (str(task.task_id),),
+                ).fetchone()
+                sequence = int(row["max_sequence"])
+                written: list[TaskEvent] = []
+                for pending in events:
+                    sequence += 1
+                    event = TaskEvent(
+                        task_id=task.task_id,
+                        type=pending.type,
+                        status=pending.status,
+                        sequence=sequence,
+                        data=dict(pending.data),
+                    )
+                    self._conn.execute(
+                        """
+                        INSERT INTO task_events (
+                            task_id, sequence, event_id, type, status, occurred_at, data
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            str(task.task_id),
+                            sequence,
+                            str(event.event_id),
+                            event.type.value,
+                            event.status.value,
+                            _iso(event.occurred_at),
+                            json.dumps(event.data, ensure_ascii=False),
+                        ),
+                    )
+                    written.append(event)
+                self._conn.commit()
+            except sqlite3.OperationalError as exc:
+                # 另一个连接正持有写锁：本次状态无法确认，按"对方先赢"收口，
+                # 绝不带着疑问继续产生结果事件。
+                self._conn.rollback()
+                raise StaleTaskState(f"task state could not be confirmed: {exc}") from exc
+            except Exception:
+                self._conn.rollback()
+                raise
+        return tuple(written)
 
     def append_event(
         self,
