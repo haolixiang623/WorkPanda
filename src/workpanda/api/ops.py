@@ -7,17 +7,66 @@
 """
 
 import hmac
+from datetime import datetime
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
 
 from workpanda.api.dependencies import get_container
 from workpanda.bootstrap import Container
 from workpanda.domain.models import TaskEvent, TaskStatus, TaskView
 from workpanda.harness.audit import AuditEntry
-from workpanda.harness.trace import TraceRecord, TraceSummary
+from workpanda.harness.trace import (
+    TraceCursor,
+    TracePage,
+    TraceQuery,
+    TraceRecord,
+    TraceSummary,
+    decode_cursor,
+)
 
 router = APIRouter(prefix="/api/ops", tags=["ops"])
+
+
+def _parse_cursor(raw: str | None) -> TraceCursor | None:
+    """游标错就是 400，不能"忽略它返回第一页"。
+
+    静默退回第一页会让调用方在翻到第三页之后悄悄又拿到第一页，而它只看到
+    "有数据"——这是分页最典型的错误表现方式，也是运维最容易误判成"数据重复"的一种。
+    """
+
+    if raw is None:
+        return None
+    try:
+        return decode_cursor(raw)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "invalid_cursor", "detail": "游标无效，请从第一页重新获取。"},
+        ) from exc
+
+
+def _check_window(since: datetime | None, until: datetime | None) -> None:
+    """时间窗必须带时区、且不能反着给。
+
+    不带偏移量的时间会被当成 UTC，对东八区的运维来说是凭空错开 8 小时——错得
+    无声无息，查出来的"空结果"看起来就像"那段时间真没出事"。宁可 400 让人补上时区。
+    """
+
+    for name, value in (("since", since), ("until", until)):
+        if value is not None and value.tzinfo is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "naive_time_window",
+                    "detail": f"{name} 必须带时区偏移，例如 2026-11-07T00:00:00+08:00。",
+                },
+            )
+    if since is not None and until is not None and since >= until:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "empty_time_window", "detail": "until 必须晚于 since。"},
+        )
 
 
 def require_ops_token(
@@ -74,24 +123,82 @@ async def list_events(
 )
 async def trace_summary(
     task_id: UUID | None = Query(default=None),
+    outcome: str | None = Query(default=None, max_length=16),
+    stop_reason: str | None = Query(default=None, max_length=32),
+    risk: str | None = Query(default=None, max_length=16),
+    since: datetime | None = Query(default=None),
+    until: datetime | None = Query(default=None),
     container: Container = Depends(get_container),
 ) -> TraceSummary:
-    """聚合指标：未确认占比是最关键的健康信号，不是任务数量。"""
+    """聚合指标：未确认占比是最关键的健康信号，不是任务数量。
 
-    return container.traces.summary(task_id=task_id)
+    支持与 `/traces` 完全相同的过滤条件——「这段时间的未确认占比是多少」才是
+    运维真正要问的问题，只给全局数字等于把窗口叠加的工作丢给调用方自己算，
+    而多数人会用「翻几页数一数」去凑，那个数一定是错的。
+    """
+
+    _check_window(since, until)
+    query = TraceQuery(
+        task_id=task_id,
+        outcome=outcome,
+        stop_reason=stop_reason,
+        risk=risk,
+        since=since,
+        until=until,
+    )
+    return container.traces.query_summary(query)
 
 
 @router.get(
     "/traces",
     response_model=list[TraceRecord],
     dependencies=[Depends(require_ops_token)],
+    responses={
+        200: {
+            "headers": {
+                "X-Next-Cursor": {
+                    "description": "下一页游标；为空表示已到末尾。作为下一页的 cursor 参数回传。",
+                    "schema": {"type": "string"},
+                }
+            }
+        }
+    },
 )
 async def list_traces(
+    response: Response,
     task_id: UUID | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
+    outcome: str | None = Query(default=None, max_length=16),
+    stop_reason: str | None = Query(default=None, max_length=32),
+    risk: str | None = Query(default=None, max_length=16),
+    since: datetime | None = Query(default=None),
+    until: datetime | None = Query(default=None),
+    cursor: str | None = Query(default=None),
     container: Container = Depends(get_container),
 ) -> list[TraceRecord]:
-    return container.traces.list(task_id=task_id, limit=limit)
+    """按条件检索留痕，新的在前。
+
+    响应体保持为数组（控制台已经在按数组解析），翻页信息放在 `X-Next-Cursor`
+    响应头里：不变更既有形状，同时把"还有下一页"变成调用方拿得到的事实，而不是
+    它从 `len(items) == limit` 猜出来的猜测——猜法在"刚好整页"时必然猜错。
+    """
+
+    _check_window(since, until)
+    page: TracePage = container.traces.query(
+        TraceQuery(
+            task_id=task_id,
+            outcome=outcome,
+            stop_reason=stop_reason,
+            risk=risk,
+            since=since,
+            until=until,
+            limit=limit,
+            cursor=_parse_cursor(cursor),
+        )
+    )
+    if page.next_cursor is not None:
+        response.headers["X-Next-Cursor"] = page.next_cursor
+    return page.items
 
 
 @router.get(

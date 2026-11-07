@@ -18,7 +18,15 @@ from pathlib import Path
 from threading import Lock
 from uuid import UUID
 
-from workpanda.harness.trace import TraceRecord, TraceSummary
+from workpanda.harness.trace import (
+    TraceCursor,
+    TracePage,
+    TraceQuery,
+    TraceRecord,
+    TraceSummary,
+    canonical_stamp,
+    encode_cursor,
+)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS harness_traces (
@@ -48,6 +56,9 @@ CREATE INDEX IF NOT EXISTS idx_harness_traces_task
     ON harness_traces (task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_harness_traces_created
     ON harness_traces (created_at);
+-- 键集翻页按 (created_at, trace_id) 倒序走，这条索引让"比锚点更旧"不必全表扫。
+CREATE INDEX IF NOT EXISTS idx_harness_traces_cursor
+    ON harness_traces (created_at DESC, trace_id DESC);
 """
 
 # 容量按 created_at 排序淘汰：同一秒内写入的多条用 rowid 兜底保证顺序稳定。
@@ -97,6 +108,64 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
         )
 
 
+def _normalize_timestamps(conn: sqlite3.Connection) -> None:
+    """把 `created_at` 统一成可比较的文本。
+
+    翻页靠字符串比较，而 `datetime.isoformat()` 的长度是变的：微秒恰好为 0 时是
+    `...:26+00:00`，否则是 `...:26.000001+00:00`。两种写法在同一秒内比较，
+    `'+'` 比 `'.'` 小，于是"同一时刻"会被排成两个位置——翻页恰好在那一刻经过时，
+    要么漏一条、要么重复一条，而且不报错。老库里的行是旧格式，启动时改写一次。
+    """
+
+    rows = conn.execute("SELECT rowid AS rid, created_at FROM harness_traces").fetchall()
+    for row in rows:
+        current = row["created_at"]
+        try:
+            fixed = canonical_stamp(datetime.fromisoformat(current))
+        except ValueError:
+            # 读不出来的行保持原样：猜一个时间比留着异常值更危险。
+            continue
+        if fixed != current:
+            conn.execute(
+                "UPDATE harness_traces SET created_at = ? WHERE rowid = ?", (fixed, row["rid"])
+            )
+
+
+def _where(query: TraceQuery, *, with_cursor: bool) -> tuple[str, list[object]]:
+    """把查询条件翻译成 WHERE。`with_cursor=False` 用于摘要：只要窗口，不要页位置。
+
+    这里是内存后端 `matches()` 的 SQL 翻译，两边必须给出同样的集合；
+    `tests/test_trace_store.py` 里的跨后端一致性用例盯着这件事。
+    """
+
+    clauses: list[str] = []
+    params: list[object] = []
+    if query.task_id is not None:
+        clauses.append("task_id = ?")
+        params.append(str(query.task_id))
+    if query.outcome is not None:
+        clauses.append("outcome = ?")
+        params.append(query.outcome)
+    if query.stop_reason is not None:
+        clauses.append("stop_reason = ?")
+        params.append(query.stop_reason)
+    if query.risk is not None:
+        clauses.append("risk = ?")
+        params.append(query.risk)
+    if query.since is not None:
+        clauses.append("created_at >= ?")
+        params.append(canonical_stamp(query.since))
+    if query.until is not None:
+        clauses.append("created_at < ?")
+        params.append(canonical_stamp(query.until))
+    if with_cursor and query.cursor is not None:
+        # 严格"比锚点更旧"：时间更早，或同一时刻但 trace_id 更小。
+        clauses.append("(created_at < ? OR (created_at = ? AND trace_id < ?))")
+        anchor = query.cursor.stamp
+        params.extend([anchor, anchor, query.cursor.trace_id])
+    return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+
 class SqliteTraceStore:
     """TraceStore 的 SQLite 实现，与任务库共用同一个文件。"""
 
@@ -114,6 +183,7 @@ class SqliteTraceStore:
         self._conn.execute("PRAGMA busy_timeout = 3000")
         self._conn.executescript(SCHEMA)
         _ensure_columns(self._conn)
+        _normalize_timestamps(self._conn)
         self._conn.commit()
 
     def close(self) -> None:
@@ -145,7 +215,7 @@ class SqliteTraceStore:
                     record.tokens,
                     record.duration_ms,
                     record.resumed_from,
-                    record.created_at.isoformat(),
+                    record.created_at_stamp,
                 ),
             )
             if self._capacity:
@@ -153,25 +223,37 @@ class SqliteTraceStore:
             self._conn.commit()
 
     def list(self, *, task_id: UUID | None = None, limit: int = 50) -> list[TraceRecord]:
-        query = f"SELECT {_COLUMNS} FROM harness_traces"
-        params: list[object] = []
-        if task_id is not None:
-            query += " WHERE task_id = ?"
-            params.append(str(task_id))
-        query += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
-        params.append(max(0, limit))
+        return self.query(TraceQuery(task_id=task_id, limit=limit)).items
+
+    def query(self, query: TraceQuery) -> TracePage:
+        where, params = _where(query, with_cursor=True)
+        limit = max(0, query.limit)
+        # 多取一条用来判断"后面还有没有"。这条不会返回给调用方，
+        # 只是避免再发一次 COUNT：多一次查询就多一个"两次结果不一致"的窗口。
+        sql = (
+            f"SELECT {_COLUMNS} FROM harness_traces{where}"
+            " ORDER BY created_at DESC, trace_id DESC LIMIT ?"
+        )
         with self._lock:
-            rows = self._conn.execute(query, params).fetchall()
-        return [self._to_record(row) for row in rows]
+            rows = self._conn.execute(sql, [*params, limit + 1]).fetchall()
+
+        items = [self._to_record(row) for row in rows[:limit]]
+        next_cursor = None
+        if len(rows) > limit and items:
+            last = items[-1]
+            next_cursor = encode_cursor(
+                TraceCursor(created_at=last.created_at, trace_id=last.trace_id)
+            )
+        return TracePage(items=items, next_cursor=next_cursor)
 
     def summary(self, *, task_id: UUID | None = None) -> TraceSummary:
-        query = _SUMMARY_SQL
-        params: list[object] = []
-        if task_id is not None:
-            query += " WHERE task_id = ?"
-            params.append(str(task_id))
+        return self.query_summary(TraceQuery(task_id=task_id))
+
+    def query_summary(self, query: TraceQuery) -> TraceSummary:
+        # 摘要覆盖整个过滤窗口，不受翻到第几页影响，因此不带游标。
+        where, params = _where(query, with_cursor=False)
         with self._lock:
-            row = self._conn.execute(query, params).fetchone()
+            row = self._conn.execute(_SUMMARY_SQL + where, params).fetchone()
 
         total = int(row["total"]) if row is not None else 0
         if total == 0:
