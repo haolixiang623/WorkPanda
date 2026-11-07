@@ -632,7 +632,8 @@ registry.cancel_task(task_id, "user_cancelled")   # 从 HTTP 线程调用
 
 ### 未验证 / 已知限制
 
-- Octop 运行时与脚手架执行器不读这个信号，取消对它们仍是纯状态翻转；
+- Octop 运行时与脚手架执行器不读这个信号：它们的"开始前"这一道由第 18 节的包装器
+  统一兜住，但执行进行中仍只能跑完（取消对它们不是全无效，只是只覆盖四道边界里的第一道）；
 - 跨主机多实例仍需把共享信号后端换成 Redis / advisory lock，SQLite 只覆盖同机多进程；
 - 执行结束到结果持久化之间极窄的窗口内收到取消，仍可能先落一条结果事件（第 16 节）。
 
@@ -829,3 +830,58 @@ SQLite 实现的顺序是关键：先执行带 `AND status = ?` 的 `UPDATE`，�
 - 锁等待超时（另一个连接持有写锁）按 `StaleTaskState` 收口：状态无法确认时
   放弃本次结果，而不是带着疑问继续写事件。
 
+## 18. 取消对任意执行器生效（开始前那一道）
+
+第 14 节把取消写成"执行侧看得见的信号"，但那个信号只有 `HarnessExecutor` 自己的
+循环在读。装配切到 Octop 运行时或脚手架执行器时，`POST /api/tasks/{id}/cancel`
+又退回纯状态翻转：任务显示已取消，正在排队或刚开始的那一步照样把模型调用与
+工具调用跑完，包括用户刚说"不要了"的那一次提交。
+
+### 能承诺什么，取决于谁在读信号
+
+四道边界里，只有**第一道**（执行开始前）与执行器内部实现无关，任何执行器都能被
+统一兜住。`harness/cancel_executor.py` 的 `CancellableExecutor` 就是这一道：
+
+```python
+from workpanda.harness.cancel_executor import CancellableExecutor
+
+executor = CancellableExecutor(OctopHarnessExecutor(gateway), cancellations)
+```
+
+它做的只有三件事：把请求交给内层之前取一次令牌、已取消就直接给出
+`unconfirmed` + `cancelled`（一步都不跑）、无论结论如何都在 `finally` 里释放登记项。
+默认装配已把 Octop 分支与脚手架分支包进这层（harness 分支自带取消，不再重复包）。
+
+| 执行器 | 开始前 | 执行中 |
+|---|---|---|
+| `HarnessExecutor` | 生效（自带） | 生效（下一轮模型 / 下一条工具 / 退避等待） |
+| Octop 运行时 | 生效（包装器） | 不生效——工具循环不在本服务手里 |
+| 脚手架执行器 | 生效（包装器） | 不生效（占位实现，单次同步返回） |
+| 自定义执行器 | 生效（包装器） | 只在它自己读令牌时生效 |
+
+### 拒绝时长得和 harness 一样
+
+拒绝结果的 `output` 形状刻意与 `HarnessExecutor._refuse` 对齐：
+`stop_reason=cancelled`、`verification.reason=cancelled`、`model_calls=0`、
+`tool_calls=[]`。`FlowRunner` 把这两个字段抄进任务事件，审计归档按
+`stop_reason` 记账——形状不一致会让"取消"在留痕里出现两种互不相认的写法，
+事后核对时最难解释的恰恰是这种差异。
+
+### 刻意不做的事
+
+- **不打断内层**，也不因为它"期间收到过取消"改写结论。执行已经发生，它到底做了
+  什么只有内层知道；替它改判等于伪造一条没人能核实的记录。取消与迟到结果的仲裁
+  仍由第 17 节的条件写负责——谁先写谁生效，输的一边连事件一起丢。
+- **不包装 `HarnessExecutor`**：两层会为同一 `(task_id, step_id)` 各取一次令牌，
+  内层收尾时就把外层还要用的登记项释放了。它已经自带取消，直接用即可。
+- **不解决跨进程**：共享信号仍由第 16 节的 `CancelSignalStore` 负责，包装器只是
+  在令牌上多读一次，后端换成 SQLite 还是 Redis 与它无关。
+
+### 已验证
+
+- 未取消时原样转发，执行结束登记表清空（不随任务数增长）；内层抛异常同样清空；
+- 暂存的取消（比执行更早到达）在进入包装器时立刻生效：内层一次都没被调用，
+  结论 `unconfirmed` + `cancelled`，`stop_reason`/`verification` 与 harness 拒绝一致；
+- 同一条暂存取消只拦住那一次：随后同一任务的又一次执行正常下发到内层；
+- 执行期间被取消且内层自己读到了令牌：包装器原样报告内层结论，不改写；
+- 默认装配（脚手架）与 `octop_enabled` 装配都被包进这一层，内层执行器类型不变。

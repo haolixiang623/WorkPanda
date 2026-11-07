@@ -16,6 +16,7 @@ from workpanda.domain.repository import ConfirmationStore, TaskStore
 from workpanda.harness.audit import AuditJournal, JsonlAuditJournal, NullAuditJournal
 from workpanda.harness.builtin import default_registry
 from workpanda.harness.cancel import CancelRegistry
+from workpanda.harness.cancel_executor import CancellableExecutor
 from workpanda.harness.checkpoint import CheckpointStore, InMemoryCheckpointStore
 from workpanda.harness.executor import HarnessExecutor
 from workpanda.harness.lease import (
@@ -234,12 +235,16 @@ def build_container(
                 base_url=settings.octop_base_url,
                 workspace=settings.octop_workspace,
             )
-            executor_instance: Executor = OctopHarnessExecutor(
-                gateway, timeout_seconds=settings.octop_timeout_seconds
+            # Octop 的工具循环不归本服务控制，读不到取消令牌；至少让"开始前
+            # 已经取消"这一步不白跑：包装器统一了所有执行器的第一道边界。
+            executor_instance: Executor = CancellableExecutor(
+                OctopHarnessExecutor(gateway, timeout_seconds=settings.octop_timeout_seconds),
+                cancellations,
             )
             closers.append(gateway.close)
         else:
-            executor_instance = ScriptedExecutor()
+            # 脚手架执行器同样不读令牌，取消对它就只是账面上的状态翻转。
+            executor_instance = CancellableExecutor(ScriptedExecutor(), cancellations)
     else:
         executor_instance = executor
 
