@@ -149,26 +149,56 @@ scope，跨端点复用会得到 `400 invalid_cursor`，不会"看起来正常�
    单独下发、不复用模型 API Key、不硬编码、不回显；
 5. 需要人工处置时走既定转人工渠道，不直接修改 Task Store。
 
-### 4.3 本机试点部署与验证
+### 4.3 本机试点部署（持久化）
 
-- Octop 平台：`octop 1.0.2`（PyPI wheel，隔离 venv `/tmp/wp-octop-venv`），
-  数据目录 `/tmp/wp-octop-home/.octop`；端口 **8090**（本机 8088 已被
-  Apache Tomcat 占用，不能用默认值）；
-- WorkPanda 服务：`uvicorn workpanda.main:app --app-dir src --port 8010`，
-  插件经 `WORKPANDA_OPS_BASE_URL=http://127.0.0.1:8010` 访问；
-- 凭据：admin 口令由 `octop init --yes` 非交互创建，运维凭据经环境变量注入，
-  两者都不入库；
+试点不再跑在 `/tmp`。`deploy/workpanda_deploy.py`（仅标准库）把两个服务装成
+launchd 托管的常驻进程，全部状态落在 `~/Library/Application Support/WorkPanda`：
+
+| 路径 | 内容 |
+|---|---|
+| `api-venv/` | WorkPanda 自己的 venv（`pip install <仓库>`，与工作树解耦） |
+| `octop-venv/` | Octop 1.0.2 |
+| `octop-home/.octop/` | Octop 数据目录：数据库、插件、模型与 agent 配置 |
+| `data/workpanda.db` | 任务库（SQLite） |
+| `logs/` | 两个进程的标准输出与错误 |
+| `api.env` | 非敏感配置（0600） |
+| `bin/run-api.sh`、`bin/run-octop.sh` | 启动包装脚本（0700） |
+
+- 端口固定：Octop **8090**（本机 8088 已被 Apache Tomcat 占用）、WorkPanda
+  **8010**（8000 被别的 FastAPI 服务占用），都只监听 `127.0.0.1`；
+- launchd 单元 `~/Library/LaunchAgents/com.workpanda.{api,octop}.plist`，
+  `RunAtLoad` + `KeepAlive`：机器重启后自动拉起，进程异常退出也会被拉起；
+- 凭据在登录钥匙串，service `workpanda-deploy`，账户名为环境变量名：
+  `WORKPANDA_OPS_TOKEN`、`WORKPANDA_SESSION_SECRET`、`WORKPANDA_MODEL_API_KEY`、
+  `WORKPANDA_OCTOP_API_KEY`、`OCTOP_ADMIN_PASSWORD`。包装脚本启动时读取并注入，
+  plist 与 `api.env` 里没有明文（`api.env` 只接受白名单内的非敏感键）；
 - 安装：`octop plugin install <插件目录> --force`（1.0.2 的 `plugin install`
-  只接受目录或 URL，**不接受本地 zip 路径**）；随后调用
-  `POST /api/plugins/reload` 使插件进入 loaded 状态。CLI `octop plugin list`
-  的 `[not loaded]` 是离线读 DB 的静态字段，应以 `/api/plugins` 的
-  `loaded` / `registration_error` 为准。
+  只接受目录或 URL，**不接受本地 zip 路径**），随后 `octop plugin reload` 并重启
+  进程使状态生效。CLI `octop plugin list` 的 `[not loaded]` 是离线读 DB 的静态
+  字段，应以 `/api/plugins` 的 `loaded` / `registration_error` 为准。
 
-已验证（本机）：`/api/plugins` 返回 `loaded: true`、`registration_error: null`、
-4 个工具与 `ui` 声明齐全；UI ESM 与 manifest 端点均 200；在 Octop 自身 venv
-里 4 个工具真实取到 WorkPanda 数据（聚合指标、任务 6 条、留痕 2 条）；
-缺凭据时如实报错而非伪装成功；源码无写操作；`ruff check .` 全过、
-`pytest` 303 passed。
+两个已经踩过、并且都写了回归测试的坑：
+
+1. **先去钥匙串、再改 HOME。** `security` 按 `$HOME/Library/Keychains` 找登录
+   钥匙串。包装脚本若先把 `HOME` 指到 `octop-home` 再取凭据，就会「找不到条目」
+   并把运维令牌静默丢掉 —— 服务看起来一切正常，插件工具却全部报缺凭据。
+2. **迁移要改写 agent 里的旧路径。** 工作区绝对路径存在
+   `agents.config_json` 里；只搬目录不改库，agent 仍指向 `/tmp/...`，临时目录
+   一清就找不到工作区。`install --from-octop-home` 会顺手把旧 HOME 前缀换成
+   新的持久目录。
+
+已验证（2026-11-07，本机）：`deploy/workpanda_deploy.py install` 从
+`/tmp/wp-octop-home` 迁移数据后，两个 agent 均为 `running`；
+WorkPanda `/healthz` 与 `/api/ops/tasks` 都是 `200`（后者说明钥匙串里的运维
+令牌确实注入到了进程）；Octop `/api/health` 返回 `{"ok":true,...}`；匿名访问
+`/api/plugins` 仍是 `401`（没有为排障把控制台放开）；`bootout` + `bootstrap`
+重启一轮后两个服务自动恢复、探针全绿；在 Octop 自身 venv 里 4 个工具真实取到
+WorkPanda 数据（overview / tasks / traces / audit 均返回 `octop_ui` envelope）；
+`api.env`、两个 plist、两个包装脚本逐字比对均无明文凭据，`git grep` 亦无命中。
+
+仍需登录后人工确认的一次：控制台插件页的「已加载」标签与 4 个工具的
+`enabled` 开关（`/api/plugins`、`/api/plugins/agents/{id}/tools` 都要管理员
+会话，自动化只覆盖到离线 reload + 工具取数这一层）。
 
 ### 4.4 控制台全链路走查（2026-11-07）
 
@@ -187,11 +217,12 @@ scope，跨端点复用会得到 `400 invalid_cursor`，不会"看起来正常�
 OpenAPI 面探测：`/api/openapi.json` 共 416 个路径、38 个可无参 GET 的模块，
 除 `/api/ollama-models` 因 Ollama 功能开关未启用返回 503 外，无 5xx；
 少数 4xx 是缺必需参数或 MCP session 协议要求，不是服务异常。
-`enable_api_docs` 仅为本次诊断临时开启，位于 `/tmp` 的实例配置中，不入库。
+`enable_api_docs` 已在诊断后关闭，现配置为 `false`；`bind_host` 仍是
+`127.0.0.1`、`tls.enabled` 仍是 `false`（持久化不改变对外暴露面）。
 
 未验证：多用户权限隔离、Ollama provider 启用、以及生产部署形态。
-当前实例位于 `/tmp`，重启或清理后不持久，正式试点需换成持久数据目录
-并配置 HTTPS 与访问控制。
+实例已迁出 `/tmp`、改由 launchd 托管（第 4.3 节），但仍是本机回环形态：
+HTTPS、访问控制与多用户隔离都还没有做。
 
 ## 5. 已验证与未验证
 
