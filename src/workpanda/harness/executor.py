@@ -61,6 +61,21 @@ from workpanda.harness.tools import (
 )
 from workpanda.harness.trace import TraceRecord, TraceStore
 
+# 自动推导租约 TTL 时，deadline 之外还要给的余量（秒）。
+#
+# 一次执行的真实耗时不只是 deadline：**已发出的模型调用不受 deadline 约束**，
+# deadline 只能在下一次检查点生效。默认模型超时 60s、重试 1 次，最坏再多 120s；
+# 原来的 90s 余量盖不住这一档，租约会在执行中途过期（压测见 docs/HARNESS.md
+# 第 21 节，回归用例 test_auto_lease_ttl_covers_model_timeout_and_one_retry）。
+LEASE_TTL_MARGIN_SECONDS = 120.0
+
+
+def auto_lease_ttl(deadline_seconds: float) -> float:
+    """按步骤 deadline 推导租约 TTL。显式配置优先，这里只是兜底。"""
+
+    return max(0.0, deadline_seconds) + LEASE_TTL_MARGIN_SECONDS
+
+
 STOP_ERROR_CODES: dict[StopReason, str] = {
     StopReason.MAX_STEPS: "budget_max_steps",
     StopReason.MAX_TOOL_CALLS: "budget_max_tool_calls",
@@ -197,9 +212,7 @@ class HarnessExecutor(Executor):
 
         if self._leases is None:
             return False
-        # 默认 TTL 要盖住一次执行的最坏耗时：步骤 deadline 之外，模型/工具超时
-        # 与退避还可能再吃掉一段时间。部署方可按真实超时显式配更大的值。
-        ttl = self._lease_ttl_seconds or (self._deadline_seconds + 90.0)
+        ttl = self._lease_ttl_seconds or auto_lease_ttl(self._deadline_seconds)
         try:
             return self._leases.acquire(request.task_id, request.step_id, owner, ttl)
         except Exception:  # noqa: BLE001 - 占用状态不明时必须停，不能赌另一边没在跑

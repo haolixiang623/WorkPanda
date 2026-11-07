@@ -13,8 +13,10 @@ import time
 import uuid
 from typing import Any
 
+from workpanda.config import Settings
 from workpanda.harness.models import RiskLevel, ToolCall, ToolOutcome, ToolSpec
 from workpanda.harness.tools import (
+    DEFAULT_MAX_STUCK_THREADS,
     RunningToolThreads,
     ToolContext,
     ToolGrant,
@@ -193,3 +195,81 @@ def test_capacity_refusal_keeps_risk_and_spends_the_attempt_reservation() -> Non
     )
     assert again.error_code == "tool_call_limit"
     hanging.release.set()
+
+
+def test_stuck_overshoot_is_bounded_by_concurrency() -> None:
+    """闸门数的是"已放弃"，在途调用还没超时所以不算——并发批次会越过上限。
+
+    压测实测（`scripts/stress_tool_threads.py`，cap=16、并发 4）卡住数会到 19：
+    超出量恰好是 `并发度 - 1`。这个数必须被钉住，否则运维按 cap 估算资源会偏小；
+    同时它是有界的，不会随调用次数继续涨。
+    """
+
+    cap = 4
+    concurrency = 4
+    hanging = HangingTool()
+    registry = ToolRegistry(max_stuck_threads=cap)
+    registry.register(hanging)
+    guard = grant(registry, "test_hang", "test_hang", timeout=0.5)
+
+    # 先把名额填到只剩一个，这样并发批次一定越过上限。
+    for seq in range(cap - 1):
+        guard.call(ToolCall(call_id=f"pre-{seq}", name="test_hang", arguments={}), context())
+    assert registry.threads.stats()["stuck"] == cap - 1
+
+    barrier = threading.Barrier(concurrency)
+
+    def rush(seq: int) -> None:
+        barrier.wait(timeout=5.0)
+        guard.call(ToolCall(call_id=f"rush-{seq}", name="test_hang", arguments={}), context())
+
+    threads = [
+        threading.Thread(target=rush, args=(seq,), name=f"test-rush-{seq}", daemon=True)
+        for seq in range(concurrency)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5.0)
+
+    stuck = registry.threads.stats()["stuck"]
+    assert stuck == cap + concurrency - 1, "超出量应当是并发度-1，多了就是闸门失效"
+    # 越界之后闸门是关着的：不是"再挤进去一个"，而是从这里开始拒绝。
+    assert registry.threads.acquire("test_hang") is None
+
+    hanging.release.set()
+
+
+def test_repeated_fill_and_release_cycles_do_not_leak_ledger_entries() -> None:
+    """反复"堆满 → 全部退出"不能让名额被历史调用永久吃掉。
+
+    压测里连跑三轮，每轮 16 条、排空耗时 10-15ms、台账与句柄都回到基线；
+    这里用较小的 cap 复现同一件事，防止将来引入"只登记不摘账"的回归。
+    """
+
+    cap = 3
+    hanging = HangingTool()
+    registry = ToolRegistry(max_stuck_threads=cap)
+    registry.register(hanging)
+    guard = grant(registry, "test_hang", "test_hang", timeout=0.05)
+
+    for cycle in range(3):
+        for seq in range(cap):
+            record = guard.call(
+                ToolCall(call_id=f"c{cycle}-{seq}", name="test_hang", arguments={}), context()
+            )
+            assert record.outcome is ToolOutcome.TIMEOUT
+        assert registry.threads.stats()["stuck"] == cap
+
+        hanging.release.set()
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and registry.threads.stats()["live"]:
+            time.sleep(0.01)
+        assert registry.threads.stats() == {"live": 0, "stuck": 0, "max_stuck": cap}
+        hanging.release = threading.Event()
+
+
+def test_cap_default_matches_config_and_docs() -> None:
+    """常量、配置默认值与文档表格必须是同一个数，否则运维按文档调参会调错。"""
+
+    assert DEFAULT_MAX_STUCK_THREADS == Settings().harness_max_stuck_threads

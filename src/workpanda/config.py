@@ -67,6 +67,10 @@ class Settings(BaseSettings):
     # 允许"已超时但仍未退出"的工具线程数上限；触顶后拒绝发起新的工具调用
     # （BLOCKED `tool_capacity`，确定没执行）。超时的线程无法被强制终止，
     # 不设上限时它们会在真实长任务里悄悄堆到耗尽句柄。0 表示关闭这道闸门。
+    # 压测实测（docs/HARNESS.md 第 21 节）：每条卡住线程约 41KB 峰值 RSS，
+    # 持连接时约 2 个句柄，16 条合计 <1MB / 32 句柄——离资源边界很远，所以这个
+    # 上限的语义是"工具已经坏了"的停止信号，不是资源天花板，不必因压测调大。
+    # 闸门数的是已放弃的线程，并发 C 时最坏会到「上限 + C - 1」，按资源估算用它。
     harness_max_stuck_threads: int = 16
     # 落盘与运维接口的脱敏开关。默认开启；除非有明确理由，否则不要关。
     harness_redact: bool = True
@@ -80,7 +84,10 @@ class Settings(BaseSettings):
     harness_resume_enabled: bool = False
     harness_resume_ttl_seconds: float = 900.0
     # 步骤租约：同一 (task, step) 只允许一个执行者。多进程试点时开启；
-    # 0 表示按 deadline + 余量自动推导 TTL。
+    # 0 表示按 deadline + 120s 自动推导（余量取自"模型超时 60s × 含一次重试"，
+    # 因为已发出的模型调用不受 deadline 约束，docs/HARNESS.md 第 21 节压测过）。
+    # 自动值只是兜底、没有剩余空间：默认配置下正好 165s 对上最坏 165s。
+    # 多进程试点请显式设 180。
     harness_lease_enabled: bool = False
     harness_lease_ttl_seconds: float = 0.0
     # 取消信号的可见范围：memory（仅本进程，默认）/ sqlite（同机多进程，与任务库同文件）。
