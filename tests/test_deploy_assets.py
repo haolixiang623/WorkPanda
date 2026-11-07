@@ -96,12 +96,26 @@ def test_wrappers_pull_secrets_from_keychain_at_startup(
     assert "未配置，跳过" in script
 
 
-def test_api_wrapper_binds_loopback_and_fixed_port(layout: deploy.Layout) -> None:
+def test_api_wrapper_delegates_binding_to_app_gate(layout: deploy.Layout) -> None:
     script = deploy.render_api_wrapper(layout)
-    assert "--host 127.0.0.1 --port 8010" in script
+    # 监听地址与端口交给 `python -m workpanda` 的绑定门禁校验，脚本不另立一份。
+    assert 'exec "$ROOT/api-venv/bin/python" -m workpanda' in script
     assert "0.0.0.0" not in script
     # 配置来自 api.env，凭据来自钥匙串，脚本本身不含任何值。
-    assert ". \"$ROOT/api.env\"" in script
+    assert '. "$ROOT/api.env"' in script
+
+
+def test_api_env_keeps_binding_off_network(layout: deploy.Layout) -> None:
+    joined = "\n".join(deploy.api_env_lines(layout))
+    assert "WORKPANDA_BIND_HOST='127.0.0.1'" in joined
+    assert "WORKPANDA_BIND_PORT='8010'" in joined
+    assert "WORKPANDA_ALLOW_NETWORK_BIND='false'" in joined
+    assert "WORKPANDA_TLS_ENABLED='false'" in joined
+
+
+def test_api_env_rejects_public_bind(layout: deploy.Layout) -> None:
+    with pytest.raises(ValueError):
+        deploy.api_env_lines(layout, host="0.0.0.0")
 
 
 def test_octop_wrapper_reads_keychain_before_overriding_home(layout: deploy.Layout) -> None:
@@ -172,6 +186,52 @@ def test_deploy_tree_has_no_credentials() -> None:
     for path in sorted((REPO_ROOT / "deploy").rglob("*")):
         if path.is_file():
             assert not pattern.search(path.read_text(encoding="utf-8")), path
+
+
+def test_bootstrap_retries_while_old_agent_exits(tmp_path: Path, monkeypatch) -> None:
+    # bootout 是异步的：重装时旧进程还在退出，立刻 bootstrap 会拿到 5: I/O error。
+    plist = tmp_path / "com.workpanda.api.plist"
+    plist.write_text("<plist/>", encoding="utf-8")
+
+    class Completed:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(deploy.subprocess, "run", lambda *a, **k: Completed())
+    monkeypatch.setattr(deploy.time, "sleep", lambda seconds: None)
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if len(calls) < 3:
+            raise subprocess.CalledProcessError(5, cmd)
+        return Completed()
+
+    monkeypatch.setattr(deploy, "_run", fake_run)
+    deploy.bootstrap_agent(plist, "com.workpanda.api")
+    assert len(calls) == 3
+
+
+def test_bootstrap_reports_failure_after_attempts(tmp_path: Path, monkeypatch) -> None:
+    plist = tmp_path / "com.workpanda.api.plist"
+    plist.write_text("<plist/>", encoding="utf-8")
+
+    class Completed:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(deploy.subprocess, "run", lambda *a, **k: Completed())
+    monkeypatch.setattr(deploy.time, "sleep", lambda seconds: None)
+
+    def always_fail(cmd, **kwargs):
+        raise subprocess.CalledProcessError(5, cmd)
+
+    monkeypatch.setattr(deploy, "_run", always_fail)
+    with pytest.raises(subprocess.CalledProcessError):
+        deploy.bootstrap_agent(plist, "com.workpanda.api", attempts=3)
 
 
 def test_migrate_octop_agent_paths_rewrites_old_home(tmp_path: Path) -> None:

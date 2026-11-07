@@ -51,6 +51,11 @@ ALL_SECRET_NAMES = (*API_SECRET_NAMES, *OCTOP_SECRET_NAMES, *OPTIONAL_SECRET_NAM
 # api.env 允许的键：只放非敏感配置。敏感键出现即拒绝，避免有人图省事写进文件。
 API_ENV_ALLOWED_KEYS = frozenset(
     {
+        "WORKPANDA_BIND_HOST",
+        "WORKPANDA_BIND_PORT",
+        "WORKPANDA_ALLOW_NETWORK_BIND",
+        "WORKPANDA_TLS_ENABLED",
+        "WORKPANDA_CORS_ORIGINS",
         "WORKPANDA_STORE_BACKEND",
         "WORKPANDA_SQLITE_PATH",
         "WORKPANDA_MODEL_BASE_URL",
@@ -184,9 +189,12 @@ def _keychain_block(names: tuple[str, ...]) -> str:
     return "\n".join(lines)
 
 
-def render_api_wrapper(layout: Layout, *, host: str = BIND_HOST, port: int = API_PORT) -> str:
-    """WorkPanda 服务的启动脚本：先读非敏感配置，再从钥匙串补凭据。"""
-    bind_host = ensure_loopback(host)
+def render_api_wrapper(layout: Layout) -> str:
+    """WorkPanda 服务的启动脚本：先读非敏感配置，再从钥匙串补凭据。
+
+    监听地址与端口走 ``api.env`` 里的 ``WORKPANDA_BIND_*``，由
+    ``python -m workpanda`` 的绑定门禁校验；脚本这里不另立一份端口定义。
+    """
     return f"""#!/bin/sh
 # 由 deploy/workpanda_deploy.py 生成，请勿手工编辑。
 # 凭据不落盘：每次启动时从登录钥匙串读取。
@@ -194,8 +202,7 @@ set -eu
 ROOT={_shell_quote(str(layout.root))}
 [ -r "$ROOT/api.env" ] && . "$ROOT/api.env"
 {_keychain_block(API_SECRET_NAMES)}
-exec "$ROOT/api-venv/bin/python" -m uvicorn workpanda.main:app \\
-  --host {bind_host} --port {port}
+exec "$ROOT/api-venv/bin/python" -m workpanda
 """
 
 
@@ -226,12 +233,24 @@ exec "$ROOT/octop-venv/bin/octop" run --host {bind_host} --port {port}
 """
 
 
-def api_env_lines(layout: Layout, overrides: dict[str, str] | None = None) -> list[str]:
+def api_env_lines(
+    layout: Layout,
+    overrides: dict[str, str] | None = None,
+    *,
+    host: str = BIND_HOST,
+    port: int = API_PORT,
+) -> list[str]:
     """api.env 的内容：仅非敏感配置。含敏感键直接报错。"""
     defaults = {
         "WORKPANDA_STORE_BACKEND": "sqlite",
         "WORKPANDA_SQLITE_PATH": str(layout.sqlite_path),
         "WORKPANDA_ENABLE_DEMO_FLOW": "true",
+        # 绑定与 TLS 交给 `python -m workpanda` 自己的门禁校验：非回环地址
+        # 必须同时打开 TLS 并显式 allow_network_bind，否则启动即失败。
+        "WORKPANDA_BIND_HOST": ensure_loopback(host),
+        "WORKPANDA_BIND_PORT": str(port),
+        "WORKPANDA_ALLOW_NETWORK_BIND": "false",
+        "WORKPANDA_TLS_ENABLED": "false",
     }
     merged = {**defaults, **(overrides or {})}
     rejected = sorted(key for key in merged if key not in API_ENV_ALLOWED_KEYS)
@@ -428,7 +447,12 @@ def pip_install(
         _run([python, "-m", "pip", "install", *links, *requirements])
 
 
-def bootstrap_agent(plist_path: Path, label: str) -> None:
+def bootstrap_agent(plist_path: Path, label: str, *, attempts: int = 5) -> None:
+    """重新加载 launchd 单元。
+
+    ``bootout`` 是异步的：旧进程还在退出时立刻 ``bootstrap`` 会拿到
+    ``5: Input/output error``。重装（服务正在跑）时必然撞上，所以这里重试。
+    """
     domain = f"gui/{os.getuid()}"
     subprocess.run(
         ["launchctl", "bootout", f"{domain}/{label}"],
@@ -436,7 +460,16 @@ def bootstrap_agent(plist_path: Path, label: str) -> None:
         text=True,
         check=False,
     )
-    _run(["launchctl", "bootstrap", domain, str(plist_path)])
+    last_error: subprocess.CalledProcessError | None = None
+    for attempt in range(attempts):
+        try:
+            _run(["launchctl", "bootstrap", domain, str(plist_path)])
+            return
+        except subprocess.CalledProcessError as exc:
+            last_error = exc
+            time.sleep(1.0 + attempt)
+    assert last_error is not None
+    raise last_error
 
 
 def kickstart(label: str) -> None:
@@ -560,8 +593,11 @@ def cmd_install(args: argparse.Namespace) -> int:
     for item in args.set_env or []:
         key, _, value = item.partition("=")
         overrides[key] = value
-    write_private_file(layout.api_env, "\n".join(api_env_lines(layout, overrides)) + "\n")
-    write_private_file(layout.api_wrapper, render_api_wrapper(layout, host=args.host), mode=0o700)
+    write_private_file(
+        layout.api_env,
+        "\n".join(api_env_lines(layout, overrides, host=args.host)) + "\n",
+    )
+    write_private_file(layout.api_wrapper, render_api_wrapper(layout), mode=0o700)
     write_private_file(
         layout.octop_wrapper, render_octop_wrapper(layout, host=args.host), mode=0o700
     )
