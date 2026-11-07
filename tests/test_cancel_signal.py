@@ -222,5 +222,12 @@ def test_two_containers_share_the_cancel_signal(workdir: Path) -> None:
 
 
 def test_unknown_backend_fails_loudly() -> None:
-    with pytest.raises(ValueError, match="unsupported harness_cancel_backend"):
+    with pytest.raises(ValueError, match="unsupported harness_shared_backend"):
+        build_cancel_registry(Settings(harness_cancel_backend="kafka"))
+
+
+def test_redis_backend_without_url_fails_loudly() -> None:
+    """选了 redis 却没给连接串：启动即失败，不能静默退回进程内信号。"""
+
+    with pytest.raises(ValueError, match="harness_redis_url"):
         build_cancel_registry(Settings(harness_cancel_backend="redis"))

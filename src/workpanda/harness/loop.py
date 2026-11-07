@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from workpanda.harness.budget import Budget, BudgetExhausted
+from workpanda.harness.budget import Budget, BudgetExhausted, BudgetLedger
 from workpanda.harness.cancel import Cancelled, CancelToken
 from workpanda.harness.checkpoint import ExecutionSnapshot
 from workpanda.harness.clients import ModelClient, ModelError, ModelTimeout
@@ -51,6 +51,9 @@ class StopReason(StrEnum):
     NO_PROGRESS = "no_progress"
     # 人取消了这次执行。既不是成功也不是失败：此前可能已经发生过副作用。
     CANCELLED = "cancelled"
+    # 共享预算账本不可用（或没给作用域）：这次执行连"能不能开始"都无法确认。
+    # 与四类超预算区分开：那不是"用超了"，而是"账记不上"。
+    BUDGET_STORE_UNAVAILABLE = "budget_store_unavailable"
 
 
 _BUDGET_REASON: dict[str, tuple[StopReason, str]] = {
@@ -58,6 +61,12 @@ _BUDGET_REASON: dict[str, tuple[StopReason, str]] = {
     "max_tool_calls": (StopReason.MAX_TOOL_CALLS, "budget_max_tool_calls"),
     "max_tokens": (StopReason.MAX_TOKENS, "budget_max_tokens"),
     "deadline": (StopReason.DEADLINE, "budget_deadline"),
+    # 账本不可用与作用域缺失都按"未确认"收口：既没超预算，也没开始花。
+    "budget_store_unavailable": (
+        StopReason.BUDGET_STORE_UNAVAILABLE,
+        "budget_store_unavailable",
+    ),
+    "budget_ledger_scope": (StopReason.BUDGET_STORE_UNAVAILABLE, "budget_ledger_scope"),
 }
 
 
@@ -107,6 +116,7 @@ class AgentLoop:
         model_retries: int = 0,
         model_retry_backoff_seconds: float = 0.5,
         tool_concurrency: int = 1,
+        budget_ledger: BudgetLedger | None = None,
     ) -> None:
         self._client = client
         self._max_steps = max_steps
@@ -118,6 +128,8 @@ class AgentLoop:
         self._model_retry_backoff_seconds = max(0.0, model_retry_backoff_seconds)
         # 1 表示串行（默认）。并发只对幂等工具组生效，见 `_dispatch_tools`。
         self._tool_concurrency = max(1, tool_concurrency)
+        # 跨主机共享的用量账本。None 时预算只在本次执行的进程内累计（默认）。
+        self._budget_ledger = budget_ledger
 
     def run(
         self,
@@ -150,6 +162,9 @@ class AgentLoop:
             initial_steps=resume.steps if resume is not None else 0,
             initial_tool_calls=resume.tool_call_count if resume is not None else 0,
             initial_tokens=resume.tokens if resume is not None else 0,
+            ledger=self._budget_ledger,
+            task_id=context.task_id,
+            step_id=context.step_id,
         )
         if resume is not None:
             messages = [message.model_copy(deep=True) for message in resume.messages]
