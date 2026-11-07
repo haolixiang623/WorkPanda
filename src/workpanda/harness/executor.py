@@ -84,6 +84,31 @@ STOP_MESSAGES: dict[StopReason, str] = {
 }
 
 
+def _collect_sensitive_values(node: Any, redactor: Redactor, found: list[str]) -> None:
+    """递归收集敏感键上的标量值。
+
+    按键名脱敏是递归的（`{user: {password: ...}}` 的内层密码会被遮），取值也必须
+    递归——否则内层密码在 `arguments` 里是掩码、在工具回显的 `content` 里还是明文，
+    遮蔽只做了一半。
+    """
+
+    if isinstance(node, Mapping):
+        for key, value in node.items():
+            if value is None:
+                continue
+            if redactor.is_sensitive(str(key)):
+                if isinstance(value, (Mapping, list, tuple, set)):
+                    # 键敏感但值是结构：取 str(dict) 没有意义，继续往里挖。
+                    _collect_sensitive_values(value, redactor, found)
+                else:
+                    found.append(str(value))
+            else:
+                _collect_sensitive_values(value, redactor, found)
+    elif isinstance(node, (list, tuple, set)):
+        for item in node:
+            _collect_sensitive_values(item, redactor, found)
+
+
 class HarnessExecutor(Executor):
     def __init__(
         self,
@@ -577,11 +602,9 @@ class HarnessExecutor(Executor):
         tool = self._registry.get(name)
         spec = tool.spec if tool is not None else None
         local = redactor.with_extra(spec.sensitive_fields) if spec is not None else redactor
-        return [
-            str(value)
-            for field, value in arguments.items()
-            if value is not None and local.is_sensitive(str(field))
-        ]
+        found: list[str] = []
+        _collect_sensitive_values(arguments, local, found)
+        return found
 
     def _tool_evidence(self, result: LoopResult) -> list[dict[str, str]]:
         evidence: list[dict[str, str]] = []

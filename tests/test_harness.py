@@ -967,6 +967,70 @@ def test_declared_sensitive_field_is_masked_when_key_is_not_a_default() -> None:
     assert "s3cr3t-token-88" not in json.dumps(result.output, ensure_ascii=False)
 
 
+class NestedSecretTool:
+    """敏感值藏在嵌套对象/数组里，工具把内层值回显出来。"""
+
+    spec = ToolSpec(
+        name="test_nested_secret",
+        description="嵌套参数里的密码",
+        parameters={
+            "type": "object",
+            "properties": {
+                "user": {
+                    "type": "object",
+                    "properties": {"password": {"type": "string"}},
+                    "required": ["password"],
+                },
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"token": {"type": "string"}},
+                    },
+                },
+            },
+            "required": ["user"],
+            "additionalProperties": False,
+        },
+    )
+
+    def invoke(self, arguments: dict[str, Any], context: ToolContext) -> str:
+        inner = arguments["user"]["password"]
+        tokens = ",".join(item.get("token", "") for item in arguments.get("items", []))
+        return f"pw={inner};tokens={tokens}"
+
+
+def test_nested_sensitive_values_are_masked_in_echoed_content() -> None:
+    """按键名脱敏是递归的，取值也必须递归——否则遮蔽只做了一半。
+
+    内层 `user.password` 在 arguments 里被遮成掩码，但取值集合为空，
+    工具回显的 content 里那句明文照样落盘。半遮比不遮更危险：看起来生效了。
+    """
+
+    client = ScriptedModelClient(
+        [
+            ModelResponse(
+                tool_calls=[
+                    tool_call(
+                        "test_nested_secret",
+                        call_id="c1",
+                        user={"password": "nested-pw-4417"},
+                        items=[{"token": "arr-token-8823"}],
+                    )
+                ]
+            ),
+            ModelResponse(text=SUCCESS),
+        ]
+    )
+    result = make_executor(client, NestedSecretTool()).execute(
+        request_for(tool="test_nested_secret")
+    )
+
+    serialized = json.dumps(result.output, ensure_ascii=False)
+    assert "nested-pw-4417" not in serialized
+    assert "arr-token-8823" not in serialized
+
+
 def test_tool_timeout_is_reported_as_unknown_not_failed() -> None:
     grant = ToolGrant(registry=registry_with(SleepTool()), allowed=frozenset({"test_sleep"}))
 
