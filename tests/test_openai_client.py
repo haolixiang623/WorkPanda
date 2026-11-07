@@ -11,7 +11,7 @@ import pytest
 
 from workpanda.harness.clients import ModelError, ModelTimeout
 from workpanda.harness.models import HarnessMessage, MessageRole, ToolCall, ToolSpec
-from workpanda.harness.openai_client import OpenAICompatibleClient
+from workpanda.harness.openai_client import MAX_CALL_ID, MAX_TOOL_NAME, OpenAICompatibleClient
 
 SPEC = ToolSpec(
     name="test_echo",
@@ -133,6 +133,96 @@ def test_malformed_arguments_are_kept_for_validation_to_reject() -> None:
 
     # 不猜测畸形参数：原样带入，让参数校验拒绝并把原因回灌给模型
     assert result.tool_calls[0].arguments == {"__raw_arguments__": "{oops"}
+
+
+def _calls_handler(calls: list[dict[str, Any]]) -> Any:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"tool_calls": calls}}]})
+
+    return handler
+
+
+def test_duplicate_call_ids_are_renamed_so_receipts_do_not_cross() -> None:
+    """两条调用共用一个 id，回执就会串到一起；第一条原样保留，后续换键。"""
+
+    result = client_with(
+        _calls_handler(
+            [
+                {"id": "dup", "function": {"name": "test_echo", "arguments": {"text": "a"}}},
+                {"id": "dup", "function": {"name": "test_echo", "arguments": {"text": "b"}}},
+            ]
+        )
+    ).complete(messages=[], tools=[SPEC])
+
+    ids = [call.call_id for call in result.tool_calls]
+    assert ids == ["dup", "dup-2"]
+    assert len(set(ids)) == 2
+
+
+def test_missing_call_id_falls_back_to_a_stable_name_based_key() -> None:
+    result = client_with(
+        _calls_handler([{"function": {"name": "test_echo", "arguments": {"text": "a"}}}])
+    ).complete(messages=[], tools=[SPEC])
+
+    assert result.tool_calls[0].call_id == "call-test_echo"
+
+
+def test_duplicate_ids_at_the_length_limit_still_get_distinct_keys() -> None:
+    """后缀必须落在长度上限内。
+
+    先拼后缀再截断时，恰好 128 字符的 id 会把后缀截掉，重命名结果退化成原 id，
+    去重静默失效——两条调用又共用同一个键。
+    """
+
+    long_id = "x" * MAX_CALL_ID
+    result = client_with(
+        _calls_handler(
+            [
+                {"id": long_id, "function": {"name": "test_echo", "arguments": {"text": "a"}}},
+                {"id": long_id, "function": {"name": "test_echo", "arguments": {"text": "b"}}},
+            ]
+        )
+    ).complete(messages=[], tools=[SPEC])
+
+    ids = [call.call_id for call in result.tool_calls]
+    assert len(set(ids)) == 2
+    assert all(len(call_id) <= MAX_CALL_ID for call_id in ids)
+
+
+def test_overlong_name_and_id_are_truncated_instead_of_raising() -> None:
+    """超长值若不截断，构造 `ToolCall` 会抛 ValidationError，绕过留痕冒到调用方。"""
+
+    result = client_with(
+        _calls_handler(
+            [
+                {
+                    "id": "y" * (MAX_CALL_ID + 40),
+                    "function": {"name": "n" * (MAX_TOOL_NAME + 10), "arguments": {}},
+                }
+            ]
+        )
+    ).complete(messages=[], tools=[SPEC])
+
+    call = result.tool_calls[0]
+    assert len(call.call_id) == MAX_CALL_ID
+    assert len(call.name) == MAX_TOOL_NAME
+
+
+def test_one_broken_call_does_not_discard_the_whole_response() -> None:
+    """模型已经说了话：丢整条等于把一次可能的副作用变成"没发生过"。"""
+
+    result = client_with(
+        _calls_handler(
+            [
+                {"id": "a", "function": {"name": "", "arguments": {}}},
+                {"id": "b", "function": {"name": "test_echo", "arguments": {"text": "ok"}}},
+                {"id": "c", "function": "not-a-dict"},
+                "not-a-dict-either",
+            ]
+        )
+    ).complete(messages=[], tools=[SPEC])
+
+    assert [call.call_id for call in result.tool_calls] == ["b"]
 
 
 def test_http_error_maps_to_model_error() -> None:
