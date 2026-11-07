@@ -32,6 +32,7 @@ from workpanda.infrastructure.event_broker import EventBroker
 from workpanda.infrastructure.memory_store import InMemoryConfirmationStore, InMemoryTaskStore
 from workpanda.infrastructure.octop_runtime import OctopHarnessExecutor, OctopHarnessGateway
 from workpanda.infrastructure.rate_limit import TokenBucketLimiter
+from workpanda.infrastructure.sqlite_cancel_store import SqliteCancelSignalStore
 from workpanda.infrastructure.sqlite_checkpoint_store import SqliteCheckpointStore
 from workpanda.infrastructure.sqlite_store import SqliteStore
 from workpanda.infrastructure.sqlite_trace_store import SqliteTraceStore
@@ -125,6 +126,30 @@ def build_lease_store(
     return InMemoryStepLeaseStore(), []
 
 
+def build_cancel_registry(
+    settings: Settings,
+) -> tuple[CancelRegistry, list[Callable[[], None]]]:
+    """取消登记表。默认只在进程内可见，多实例试点时切到 SQLite 共享信号。
+
+    共享信号写在任务库同一个文件里，因此同机多进程不需要额外部署；
+    写不成功时登记表会抛错，调用方不能把"没送达"当成"已取消"。
+    """
+
+    backend = settings.harness_cancel_backend.strip().lower()
+    kwargs = {
+        "pending_ttl_seconds": settings.harness_cancel_ttl_seconds,
+        "poll_interval": settings.harness_cancel_poll_seconds,
+        "signal_ttl_seconds": settings.harness_cancel_ttl_seconds,
+    }
+    if backend == "sqlite":
+        shared = SqliteCancelSignalStore(settings.sqlite_path)
+        return CancelRegistry(shared=shared, **kwargs), [shared.close]
+    if backend != "memory":
+        # 配置写错时宁可启动失败：静默退化会让多进程部署以为取消是共享的。
+        raise ValueError(f"unsupported harness_cancel_backend: {settings.harness_cancel_backend}")
+    return CancelRegistry(**kwargs), []
+
+
 def build_container(
     settings: Settings | None = None,
     *,
@@ -150,8 +175,9 @@ def build_container(
     registered = flows if flows is not None else (demo_flows() if settings.enable_demo_flow else [])
     registry = FlowRegistry(registered)
     broker = EventBroker()
-    # 取消是执行期信号，不落盘：进程重启后本来就没有"正在跑的执行"可取消。
-    cancellations = CancelRegistry()
+    # 取消默认只在进程内可见；多实例时由配置切到共享信号（见 build_cancel_registry）。
+    cancellations, cancel_closers = build_cancel_registry(settings)
+    closers.extend(cancel_closers)
     # trace 独立于任务结果存放：既能覆盖成功执行，也能做跨任务的聚合指标。
     traces, trace_closers = build_trace_store(settings)
     closers.extend(trace_closers)

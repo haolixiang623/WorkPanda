@@ -62,6 +62,13 @@ class Settings(BaseSettings):
     # 0 表示按 deadline + 余量自动推导 TTL。
     harness_lease_enabled: bool = False
     harness_lease_ttl_seconds: float = 0.0
+    # 取消信号的可见范围：memory（仅本进程，默认）/ sqlite（同机多进程，与任务库同文件）。
+    # 跨主机多实例仍需换成共享后端，这里只解决"另一个进程里的执行看不见取消"。
+    harness_cancel_backend: str = "memory"
+    # 共享取消信号的有效期；过期后不再拦住同一任务的后续执行。
+    harness_cancel_ttl_seconds: float = 600.0
+    # 退避等待里轮询共享信号的粒度（秒）。太大时跨进程取消会显得"点了没反应"。
+    harness_cancel_poll_seconds: float = 0.1
     # 逗号分隔的域名白名单；为空则不注册 http 工具（默认关闭比默认全开安全）。
     harness_allowed_hosts: str = ""
     # 审计归档路径。为空则不归档（默认关闭）。归档只追加、按大小滚动，

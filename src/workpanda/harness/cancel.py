@@ -18,13 +18,20 @@
 
 线程模型：`CancelToken` 与 `CancelRegistry` 都允许跨线程调用。取消方通常来自
 HTTP 请求线程，被取消方是执行线程，两者只通过锁与 `threading.Event` 交互。
+
+跨进程：进程内登记表只在自己的进程里看得见。多实例部署时可以给它接一个共享的
+`CancelSignalStore`，取消时先写共享信号、执行侧在边界上主动拉取。写共享信号失败
+一律报错（不能只翻本地状态假装取消成功），读不到信号一律按"已取消"停下——
+状态不明时继续产生新动作比误停危险得多。
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
 from threading import Event, Lock
 from time import monotonic
+from typing import Protocol
 from uuid import UUID
 
 # 暂存的取消请求保留多久。取消的是"这个任务"而不是"这一次执行"，
@@ -32,6 +39,26 @@ from uuid import UUID
 # 否则一个早就结束的任务会永远被一条陈旧的取消拦住。
 DEFAULT_PENDING_TTL_SECONDS = 600.0
 DEFAULT_MAX_PENDING = 1000
+# 退避等待里轮询共享信号的粒度。太长会让跨进程取消显得"点了没反应"。
+DEFAULT_POLL_SECONDS = 0.1
+# 共享信号读不出来时的取消原因：写入 trace 后能一眼看出这是"状态不明"而非用户本意。
+SIGNAL_UNAVAILABLE_REASON = "cancel_signal_unavailable"
+
+
+class CancelSignalError(RuntimeError):
+    """共享取消信号没写成功：此时不能声称取消已生效。"""
+
+
+class CancelSignalStore(Protocol):
+    """跨进程可见的取消信号。实现必须自己保证并发写与过期清理。"""
+
+    def signal(self, task_id: UUID, reason: str, *, ttl_seconds: float) -> None:
+        """记录一次取消。写失败必须抛异常，让调用方如实报告"没送达"。"""
+        ...
+
+    def reason_for(self, task_id: UUID) -> str | None:
+        """返回仍有效的取消原因；没有或已过期返回 None。"""
+        ...
 
 
 def _utc_now() -> datetime:
@@ -59,15 +86,30 @@ class Cancelled(Exception):
 
 
 class CancelToken:
-    """一次执行对应一个令牌。第一个取消原因生效，后续取消不覆盖。"""
+    """一次执行对应一个令牌。第一个取消原因生效，后续取消不覆盖。
 
-    def __init__(self, *, task_id: UUID | None = None, step_id: str | None = None) -> None:
+    `poll` 是可选的跨进程信号拉取函数：没有它时行为与进程内版本完全一致；
+    有它时，每次边界检查与退避等待都会主动拉一次共享状态，不依赖另一个进程
+    能碰到本进程内存里的 `Event`。
+    """
+
+    def __init__(
+        self,
+        *,
+        task_id: UUID | None = None,
+        step_id: str | None = None,
+        poll: Callable[[], str | None] | None = None,
+        poll_interval: float = DEFAULT_POLL_SECONDS,
+    ) -> None:
         self.task_id = task_id
         self.step_id = step_id
         self._event = Event()
         self._lock = Lock()
         self._reason: str | None = None
         self._cancelled_at: datetime | None = None
+        self._poll = poll
+        # 下限避免"轮询间隔 0"把退避变成忙等；上限避免取消要等一整秒才有反应。
+        self._poll_interval = max(0.01, min(poll_interval, 1.0))
 
     def cancel(self, reason: str = "cancelled") -> bool:
         """请求取消。返回是否是本次真正把状态翻过去的（重复取消返回 False）。"""
@@ -80,8 +122,22 @@ class CancelToken:
             self._event.set()
             return True
 
+    def _refresh(self) -> None:
+        """在边界上拉一次共享信号。读不出来按"已取消"处理，绝不带着疑问继续。"""
+
+        if self._poll is None or self._event.is_set():
+            return
+        try:
+            reason = self._poll()
+        except Exception:  # noqa: BLE001 - 状态不明时停下比继续调用工具安全
+            self.cancel(SIGNAL_UNAVAILABLE_REASON)
+            return
+        if reason:
+            self.cancel(_clean_reason(reason))
+
     @property
     def cancelled(self) -> bool:
+        self._refresh()
         return self._event.is_set()
 
     @property
@@ -95,6 +151,7 @@ class CancelToken:
     def raise_if_cancelled(self, stage: str) -> None:
         """在边界上检查。已取消就抛出 `Cancelled`，由执行循环收尾。"""
 
+        self._refresh()
         if self._event.is_set():
             raise Cancelled(self._reason or "cancelled", stage)
 
@@ -103,11 +160,27 @@ class CancelToken:
 
         返回 True 表示"等到一半被取消了"。用 `Event.wait` 而不是 `sleep`：
         否则取消后仍要把退避时间耗完，用户看到的就是"点了没反应"。
+        接了共享信号时按 `_poll_interval` 切片等待，每片结束拉一次共享状态。
         """
 
+        self._refresh()
+        if self._event.is_set():
+            return True
         if seconds <= 0:
-            return self._event.is_set()
-        return self._event.wait(seconds)
+            return False
+        if self._poll is None:
+            return self._event.wait(seconds)
+
+        deadline = monotonic() + seconds
+        while True:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return False
+            if self._event.wait(min(self._poll_interval, remaining)):
+                return True
+            self._refresh()
+            if self._event.is_set():
+                return True
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -134,9 +207,15 @@ class CancelRegistry:
         *,
         pending_ttl_seconds: float = DEFAULT_PENDING_TTL_SECONDS,
         max_pending: int = DEFAULT_MAX_PENDING,
+        shared: CancelSignalStore | None = None,
+        poll_interval: float = DEFAULT_POLL_SECONDS,
+        signal_ttl_seconds: float = DEFAULT_PENDING_TTL_SECONDS,
     ) -> None:
         self._pending_ttl_seconds = max(1.0, pending_ttl_seconds)
         self._max_pending = max(1, max_pending)
+        self._shared = shared
+        self._poll_interval = poll_interval
+        self._signal_ttl_seconds = max(1.0, signal_ttl_seconds)
         self._tokens: dict[tuple[UUID, str], CancelToken] = {}
         self._pending: dict[UUID, tuple[str, float]] = {}
         self._lock = Lock()
@@ -150,7 +229,12 @@ class CancelRegistry:
         with self._lock:
             token = self._tokens.get(key)
             if token is None:
-                token = CancelToken(task_id=task_id, step_id=step_id)
+                token = CancelToken(
+                    task_id=task_id,
+                    step_id=step_id,
+                    poll=self._poll_for(task_id),
+                    poll_interval=self._poll_interval,
+                )
                 self._tokens[key] = token
             pending = self._take_pending(task_id)
         if pending is not None:
@@ -173,6 +257,13 @@ class CancelRegistry:
         """
 
         cleaned = _clean_reason(reason)
+        if self._shared is not None:
+            # 先写共享信号：写不成功时另一个进程里正在跑的执行不会知道这件事，
+            # 因此必须报错，不能只翻本进程的状态就返回成功。
+            try:
+                self._shared.signal(task_id, cleaned, ttl_seconds=self._signal_ttl_seconds)
+            except Exception as exc:  # noqa: BLE001 - 底层异常类型不属于本层协议
+                raise CancelSignalError("cancel signal could not be delivered") from exc
         with self._lock:
             tokens = [token for (owner, _), token in self._tokens.items() if owner == task_id]
             if not tokens:
@@ -191,6 +282,22 @@ class CancelRegistry:
             return len(self._tokens)
 
     # ---------- 内部 ----------
+
+    def _poll_for(self, task_id: UUID) -> Callable[[], str | None] | None:
+        """给令牌绑一个只查本任务的共享信号拉取函数。
+
+        不在这里主动读一次：读操作统一由令牌在边界上触发，失败也由令牌按
+        "状态不明 = 已取消"收口，装配层不必关心执行循环何时检查。
+        """
+
+        if self._shared is None:
+            return None
+        shared = self._shared
+
+        def poll() -> str | None:
+            return shared.reason_for(task_id)
+
+        return poll
 
     def _take_pending(self, task_id: UUID, *, consume: bool = True) -> str | None:
         entry = self._pending.get(task_id)
