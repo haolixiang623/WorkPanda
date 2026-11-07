@@ -20,7 +20,12 @@ from urllib.parse import urlparse
 import httpx
 
 from workpanda.harness.models import RiskLevel, ToolSpec
-from workpanda.harness.tools import ToolContext, ToolError, ToolRegistry
+from workpanda.harness.tools import (
+    DEFAULT_MAX_STUCK_THREADS,
+    ToolContext,
+    ToolError,
+    ToolRegistry,
+)
 
 
 class SystemClockTool:
@@ -167,13 +172,14 @@ def default_registry(
     *,
     allowed_hosts: Sequence[str] = (),
     http_client: httpx.Client | None = None,
+    max_stuck_threads: int = DEFAULT_MAX_STUCK_THREADS,
 ) -> tuple[ToolRegistry, list[Callable[[], None]]]:
     """构造默认工具注册表。
 
     返回 `(registry, closers)`，由装配层负责关闭需要释放的资源。
     """
 
-    registry = ToolRegistry()
+    registry = ToolRegistry(max_stuck_threads=max_stuck_threads)
     registry.register(SystemClockTool())
 
     closers: list[Callable[[], None]] = []

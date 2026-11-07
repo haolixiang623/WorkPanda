@@ -95,6 +95,24 @@ async def list_traces(
 
 
 @router.get(
+    "/tool-runtime",
+    dependencies=[Depends(require_ops_token)],
+)
+async def tool_runtime(container: Container = Depends(get_container)) -> dict:
+    """工具线程台账。`stuck` 是"已超时、但线程还没退出"的数量。
+
+    超时的工具线程无法被强制终止，只能等它自己结束。这个数接近上限时，
+    新的工具调用会被直接拒绝（`tool_capacity`）——那时该处理的是卡住的工具，
+    不是继续堆线程。未启用 harness 时没有工具线程，返回 `available=false`。
+    """
+
+    stats = container.tool_threads
+    if stats is None:
+        return {"available": False}
+    return {"available": True, **stats()}
+
+
+@router.get(
     "/audit",
     response_model=list[AuditEntry],
     dependencies=[Depends(require_ops_token)],
