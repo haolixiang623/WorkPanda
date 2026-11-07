@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -14,7 +15,7 @@ from workpanda.application.ports import ExecutionOutcome, ExecutionRequest
 from workpanda.bootstrap import build_lease_store
 from workpanda.config import Settings
 from workpanda.harness.clients import ScriptedModelClient, tool_call
-from workpanda.harness.executor import HarnessExecutor
+from workpanda.harness.executor import HarnessExecutor, auto_lease_ttl
 from workpanda.harness.lease import InMemoryStepLeaseStore, SqliteStepLeaseStore
 from workpanda.harness.models import ModelResponse, ToolSpec
 from workpanda.harness.tools import ToolContext, ToolRegistry
@@ -266,3 +267,78 @@ def test_ttl_configuration_is_honoured(ttl: int) -> None:
 
     assert executor.execute(request_for()).outcome is ExecutionOutcome.SUCCEEDED
     assert len(store) == 0
+
+
+class GatedClient:
+    """第一次补全先卡住，直到测试放行：把"执行仍在进行中"这一刻定死。
+
+    压测（`scripts/stress_tool_threads.py`）量到：一次执行可能比 deadline 多跑
+    一段"模型调用时长"，因为已发出的模型调用不会被 deadline 掐断。所以租约
+    TTL 只按 deadline 取时，执行还没结束、租约却已过期——第二个写者就此进来。
+    """
+
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.proceed = threading.Event()
+        self._inner = successful_client()
+
+    def complete(
+        self,
+        *,
+        messages: list[Any],
+        tools: list[Any],
+        temperature: float = 0.0,
+    ) -> ModelResponse:
+        self.started.set()
+        assert self.proceed.wait(5.0), "测试没放行，客户端一直卡着"
+        return self._inner.complete(messages=messages, tools=tools, temperature=temperature)
+
+
+@pytest.mark.parametrize(("ttl", "stealable"), [(0.01, True), (60, False)])
+def test_lease_ttl_must_outlast_the_whole_execution(ttl: float, stealable: bool) -> None:
+    """TTL 短于一次执行的实际耗时时，另一个写者能在执行中途抢到同一步骤。
+
+    这是"TTL 必须长于最坏耗时"的可验证版本：短 TTL 下 `stealable` 必须为真
+    （问题存在），长 TTL 下必须为假（保护生效）。修坏任何一边都会红。
+    """
+
+    store = InMemoryStepLeaseStore()
+    client = GatedClient()
+    tool = SubmitTool()
+    executor = executor_with(client, tool, leases=store, lease_ttl_seconds=ttl)
+    request = request_for()
+
+    results: list[Any] = []
+    runner = threading.Thread(target=lambda: results.append(executor.execute(request)))
+    runner.start()
+    try:
+        assert client.started.wait(5.0), "执行没进入模型调用"
+        # 等过 ttl：租约此时是否还挡得住第二个写者，就是要验证的事。
+        time.sleep(0.05 if stealable else 0.0)
+        stolen = store.acquire(request.task_id, request.step_id, "second-writer", 60)
+        assert stolen is stealable
+        if stolen:
+            # 抢到的一方要自己还，否则下面的"持有者退出即释放"断言会误报。
+            store.release(request.task_id, request.step_id, "second-writer")
+    finally:
+        client.proceed.set()
+        runner.join(timeout=5.0)
+
+    assert results and results[0].outcome is ExecutionOutcome.SUCCEEDED
+    # 不论中途发生过什么，持有者退出时都要把租约释放掉。
+    assert len(store) == 0
+
+
+def test_auto_lease_ttl_covers_model_timeout_and_one_retry() -> None:
+    """自动推导的 TTL 必须盖住「deadline + 模型超时×(1+重试)」。
+
+    已发出的模型调用不受 deadline 约束，旧推导（deadline + 90s）在默认配置下
+    只有 135s，而最坏是 165s——租约会在执行中途过期。这条用例防止余量被改回去。
+    """
+
+    settings = Settings()
+    worst_case = settings.harness_deadline_seconds + settings.model_timeout_seconds * (
+        1 + settings.model_retries
+    )
+
+    assert auto_lease_ttl(settings.harness_deadline_seconds) >= worst_case

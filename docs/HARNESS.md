@@ -380,14 +380,14 @@ sqlite3 workpanda.db "DELETE FROM harness_checkpoints WHERE task_id='...' AND st
 | `WORKPANDA_HARNESS_DEADLINE_SECONDS` | `45` | 单步骤总耗时上限（同时是单次工具调用的兜底超时） |
 | `WORKPANDA_HARNESS_TOOL_RETRIES` | `1` | 可重试失败的额外尝试次数，仅对幂等工具生效 |
 | `WORKPANDA_HARNESS_TOOL_CONCURRENCY` | `1` | 一轮内最多几个幂等工具并发执行；`1` 为串行 |
-| `WORKPANDA_HARNESS_MAX_STUCK_THREADS` | `16` | 允许"已超时但线程仍未退出"的个数上限；触顶拒绝新调用，`0` 为关闭闸门 |
+| `WORKPANDA_HARNESS_MAX_STUCK_THREADS` | `16` | 允许"已超时但线程仍未退出"的个数上限；触顶拒绝新调用，`0` 为关闭闸门。并发 C 时最坏到 `上限+C-1`（第 21 节实测） |
 | `WORKPANDA_HARNESS_REDACT` | `true` | 落盘脱敏开关；除排障外不要关闭 |
 | `WORKPANDA_HARNESS_TRACE_CAPACITY` | `500` | trace 保留条数上限；0 为不淘汰（两种后端都生效） |
 | `WORKPANDA_HARNESS_TRACE_BACKEND` | `auto` | `memory` / `sqlite` / `auto`（跟随 store_backend） |
 | `WORKPANDA_HARNESS_RESUME_ENABLED` | `false` | 断点续跑；开启后每个工具调用都会落 checkpoint |
 | `WORKPANDA_HARNESS_RESUME_TTL_SECONDS` | `900` | 断点保留时限，超时拒绝续跑 |
 | `WORKPANDA_HARNESS_LEASE_ENABLED` | `false` | 启用步骤租约（同一 task+step 同时只允许一个执行者） |
-| `WORKPANDA_HARNESS_LEASE_TTL_SECONDS` | `0` | 租约时长；`0` 表示按 `deadline + 90s` 自动推导 |
+| `WORKPANDA_HARNESS_LEASE_TTL_SECONDS` | `0` | 租约时长；`0` 表示按 `deadline + 120s` 自动推导（余量已含模型超时 60s×含一次重试）。多进程试点建议显式设 `180`（第 21 节） |
 | `WORKPANDA_HARNESS_CANCEL_BACKEND` | `memory` | 取消信号可见范围：`memory` 仅本进程 / `sqlite` 同机多进程共享 |
 | `WORKPANDA_HARNESS_CANCEL_TTL_SECONDS` | `600` | 共享取消信号有效期；过期不再拦住同一任务的后续执行 |
 | `WORKPANDA_HARNESS_CANCEL_POLL_SECONDS` | `0.1` | 退避等待里轮询共享信号的粒度 |
@@ -494,6 +494,7 @@ python scripts/smoke_harness.py     # 真实模型端到端
 - 工具是同步执行。超时用"独立线程 + 放弃等待"实现，**线程本身无法被强制终止**，
   会继续跑到自然结束——所以工具自身仍必须自带超时与幂等。这类线程现在会被记账，
   触顶后拒绝再起新的（第 19 节），但那只是"不再变坏"，不是"把线程收回来"；
+  实测成本与上限取值见第 21 节（16 条约 41KB/条、持连接 2 fd/条）；
 - 并发执行只在幂等工具之间发生，harness 只保证调用顺序语义，不保证工具线程安全；
   非幂等工具即使并发度大于 1 也始终串行；
 - token 预算依赖上游返回 `usage`；网关不返回时该项不生效，也不会用字符数估算；
@@ -664,9 +665,14 @@ checkpoint 假设"同一 (task_id, step_id) 只有一个写者"。两个执行�
   后端跟随任务存储（SQLite 与任务库同文件，同机跨进程互斥；内存后端只挡同进程并发）。
 
 TTL 必须长于一次执行的最坏耗时（步骤 deadline 之外还有模型/工具超时与重试退避），
-否则租约会在执行中途过期，等于没保护。默认按 `deadline + 90s` 推导，实际部署应
-按真实超时显式设置 `WORKPANDA_HARNESS_LEASE_TTL_SECONDS`。进程崩溃时租约靠 TTL
-过期，人工重试才不会被永久挡住。
+否则租约会在执行中途过期，等于没保护。默认按 `deadline + 120s` 推导，实际部署应
+按真实超时显式设置 `WORKPANDA_HARNESS_LEASE_TTL_SECONDS`。
+
+这个余量是第 21 节压测量出来的：已发出的模型调用不受 deadline 约束，一次执行的
+真实耗时是 `deadline + 最后一次模型调用时长`，默认配置下最坏约
+`45 + 60×2 = 165s`。原来的 90s 余量只推出 135s，盖不住；现在 120s 余量刚好持平
+（165s），**没有多余空间**，所以多进程试点仍建议显式设 `180`。代价是进程崩溃后
+最多等 180 秒才能重试同一步骤，比中途被抢、副作用做两遍划算。
 
 边界要说清楚：**跨主机多实例部署仍需把这里的 SQLite/内存实现换成共享锁**
 （Redis、数据库 advisory lock 等），单写者假设本身不变。开启后仍保留的其他
@@ -939,7 +945,8 @@ executor = CancellableExecutor(OctopHarnessExecutor(gateway), cancellations)
 
 - 未启用 harness 时 `available=false`：没有工具线程，就不要编一排 0 出来；
 - `stuck` 持续上涨说明某个工具真的卡住了，处理办法是修工具或重启进程，
-  不是把上限调大。
+  不是把上限调大（实测成本见第 21 节：16 条约 41KB/条，离资源边界很远，
+  这个上限的意义是停止信号，不是资源天花板）。
 
 ### 已验证
 
@@ -1091,3 +1098,77 @@ offset 在这种库上有两个**不会报错**的错法：
 - 归档跨滚动备份翻页不重不漏；旧格式行（无 `entry_id`）两次翻页结果一致；
 - 老库旧格式时间戳在打开时被规范化；
 - 插件的三个列表工具都能把 `next_cursor` 传回去，且路径仍是代码内常量。
+
+## 21. 真实压测：两个上限到底是量出来的
+
+`WORKPANDA_HARNESS_MAX_STUCK_THREADS`（默认 16）与
+`WORKPANDA_HARNESS_LEASE_TTL_SECONDS`（原本按 `deadline + 90s` 推导）此前都是
+"看起来合理"的值。第 19 节自己也写着：上限该取多少，只有在真实长任务压力下量过
+才算数。这一节就是那次测量的记录。
+
+复跑方式（脚本不联网、不读 `.env`、不碰试点实例，全部是进程内合成工具）：
+
+```bash
+python scripts/stress_tool_threads.py            # 全场景，约 15 秒
+python scripts/stress_tool_threads.py --only fd_sleep,fd_socket --max-stuck 64
+python scripts/stress_tool_threads.py --json-out stress.json   # 留原始数据
+```
+
+每个场景跑在独立子进程里：卡住的线程与峰值 RSS 都不可回收，同进程连着跑，
+后一个场景的"基线"就带着前一个场景的债，量出来的增量不作数。
+
+### 数据（macOS / Python 3.13.12，16 条线程，单次调用超时 0.05s）
+
+| 场景 | 观测 |
+|---|---|
+| 顺序触顶 | 第 17 次调用被 `BLOCKED` + `tool_capacity`；`stuck=16`；被挡的另一个工具**一次都没执行** |
+| 并发越界 | cap 16、并发 4 → 卡住 19 条，超出 3，恰好等于 `并发度 - 1` |
+| 内存成本 | 纯等待：16 条 +656KB（41KB/条）；64 条 +2368KB（37KB/条），线性 |
+| 句柄成本 | 每条卡住的线程持连接时 +2 fd（socketpair 两端）；16 条 +32，64 条 +128 |
+| 恢复 | 全部放行后排空 10–15ms，台账 `live`/`stuck` 归零，fd 回到 4 |
+| 三轮反复 | 峰值 RSS 38752 / 38816 / 38848 KB，无累积；每轮都从 0 重新填满 |
+| 租约 | deadline 2s：模型 0s / 1s 时耗时 2.02s / 2.01s；模型 3s 时 3.01s（**超出 deadline 1.01s**） |
+
+### 结论一：16 保留，它不是资源天花板，而是"停止信号"
+
+16 条卡住线程合计不到 1MB、最多 32 个句柄，离任何真实限制都差着两三个数量级
+（本机 `RLIMIT_NOFILE` 软限 1048575，Linux 默认 1024 也够）。把上限调大不会让
+系统更稳，只会让"某个工具已经坏了"这件事更晚被发现——而排查与重启本来就要人来做。
+所以维持默认 16，不因压测上调；反过来，16 条线程已经意味着同一个工具错了十几次，
+这时该修工具或重启进程，而不是调参。
+
+**按资源估算请用 `上限 + 并发度 - 1`**：闸门数的是"已放弃"（`stuck`），在途调用
+还没超时所以不算，并发度 C 时最坏会多挤进 C-1 条。这个超出量有界（不会随调用次数
+继续涨），回归用例 `test_stuck_overshoot_is_bounded_by_concurrency` 钉住了它。
+
+### 结论二：租约 TTL 显式设 180s，自动推导的 135s 不够
+
+压测给出的是结构性结论，而不是某个具体毫秒：**已发出的模型调用不受 deadline 约束**。
+deadline 只能在下一次检查点生效，所以一次执行的真实耗时是
+`deadline + 最后一次模型调用的时长`。按默认配置算最坏情况：
+
+```
+45s（deadline） + 60s × (1 + 1)（模型超时 × 含一次重试） + 15s 余量 ≈ 180s
+```
+
+原来的推导值是 `45 + 90 = 135s`，盖不住 165s 这一档；租约一旦在执行中途过期，
+第二个写者就能进来，第 15 节想挡的重复副作用也就挡不住了。据此把自动余量改成
+120s（`LEASE_TTL_MARGIN_SECONDS`，自动推导得 165s、与最坏情况持平），并把
+`auto_lease_ttl` 纳入回归；由于没有剩余空间，多进程试点仍应显式留出余量：
+
+```bash
+export WORKPANDA_HARNESS_LEASE_ENABLED=true
+export WORKPANDA_HARNESS_LEASE_TTL_SECONDS=180
+```
+
+代价是进程崩溃后最多 180 秒才能重试同一步骤——比"中途被抢、副作用做两遍"划算。
+回归用例 `test_lease_ttl_must_outlast_the_whole_execution` 成对验证了两边：
+TTL 短于实际耗时时租约确实可被中途抢走，TTL 足够长时抢不走。
+
+### 未覆盖的边界
+
+- 句柄成本按"工具自己持连接"估算；不同工具实现（连接池、复用会话）会有差异，
+  真实部署请以 `GET /api/ops/tool-runtime` 的 `stuck` 走势为准；
+- 压测是单机单进程，不覆盖多实例争抢同一租约的时序；跨主机仍需共享锁；
+- 模型超时按配置值推算（真实 60s 超时没有跑，脚本里用缩比 deadline 观察结构）；
+- 峰值 RSS 是进程级指标，只能回答"堆 N 条要多少内存"，不能定位到某一条线程。
