@@ -3,16 +3,18 @@
 控制台替代自建运维界面，但不持有业务状态写入权：
 这里只提供查询，流程推进、确认和副作用仍只能通过群众侧接口完成。
 
-接口默认关闭；必须配置 `WORKPANDA_OPS_TOKEN` 才能访问，避免开放内部数据。
+接口默认关闭；必须配置 `WORKPANDA_OPS_TOKEN` 或 `WORKPANDA_OPS_TOKENS` 才能访问。
+可见范围按主体角色收窄：`viewer` 只看列表与聚合指标，明细（任务详情、事件流、
+留痕原文、审计归档、工具台账）只有 `admin` 能看。角色划分理由见 `ops_auth`。
 """
 
-import hmac
 from datetime import datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
 
 from workpanda.api.dependencies import get_container
+from workpanda.api.ops_auth import OpsDisabled, OpsPrincipal, OpsUnauthenticated
 from workpanda.bootstrap import Container
 from workpanda.domain.models import EventType, TaskEvent, TaskStatus, TaskView
 from workpanda.domain.paging import (
@@ -135,25 +137,51 @@ def _check_window(since: datetime | None, until: datetime | None) -> None:
         )
 
 
-def require_ops_token(
+OPS_TOKEN_HEADER = "X-WorkPanda-Ops-Token"
+
+
+def get_ops_principal(
     x_workpanda_ops_token: str | None = Header(default=None),
     container: Container = Depends(get_container),
-) -> None:
-    expected = container.settings.ops_token
-    if not expected:
-        # 未启用时按不存在处理，避免暴露内部接口存在性。
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-    if not x_workpanda_ops_token or not hmac.compare_digest(x_workpanda_ops_token, expected):
+) -> OpsPrincipal:
+    """把运维凭据换成主体。未配置凭据时按不存在处理，不暴露接口存在性。"""
+
+    try:
+        return container.ops_access.authenticate(x_workpanda_ops_token)
+    except OpsDisabled:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found") from None
+    except OpsUnauthenticated:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"code": "ops_token_invalid", "detail": "运维凭据无效。"},
+        ) from None
+
+
+def require_ops_admin(
+    principal: OpsPrincipal = Depends(get_ops_principal),
+) -> OpsPrincipal:
+    """明细端点只对 admin 开放。
+
+    这里用 403 而不是 404：凭据已经验过，主体确实存在、只是权限不够。运维需要
+    区分"我没有这个角色"和"这个接口不存在"，否则会反复怀疑是不是版本没上。
+    未授权的第三方仍然拿不到任何信息——它连有效凭据都没有，会停在 401。
+    """
+
+    if not principal.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "ops_forbidden",
+                "detail": "当前运维角色无权查看明细数据，请使用 admin 角色凭据。",
+            },
         )
+    return principal
 
 
 @router.get(
     "/tasks",
     response_model=list[TaskView],
-    dependencies=[Depends(require_ops_token)],
+    dependencies=[Depends(get_ops_principal)],
     responses=_CURSOR_RESPONSES,
 )
 async def list_tasks(
@@ -189,7 +217,7 @@ async def list_tasks(
 
 
 @router.get(
-    "/tasks/{task_id}", response_model=TaskView, dependencies=[Depends(require_ops_token)]
+    "/tasks/{task_id}", response_model=TaskView, dependencies=[Depends(require_ops_admin)]
 )
 async def get_task(task_id: UUID, container: Container = Depends(get_container)) -> TaskView:
     return TaskView.from_task(container.tasks.ops_task(task_id))
@@ -198,7 +226,7 @@ async def get_task(task_id: UUID, container: Container = Depends(get_container))
 @router.get(
     "/tasks/{task_id}/events",
     response_model=list[TaskEvent],
-    dependencies=[Depends(require_ops_token)],
+    dependencies=[Depends(require_ops_admin)],
     responses=_CURSOR_RESPONSES,
 )
 async def list_events(
@@ -246,7 +274,7 @@ async def list_events(
 @router.get(
     "/traces/summary",
     response_model=TraceSummary,
-    dependencies=[Depends(require_ops_token)],
+    dependencies=[Depends(get_ops_principal)],
 )
 async def trace_summary(
     task_id: UUID | None = Query(default=None),
@@ -279,7 +307,7 @@ async def trace_summary(
 @router.get(
     "/traces",
     response_model=list[TraceRecord],
-    dependencies=[Depends(require_ops_token)],
+    dependencies=[Depends(require_ops_admin)],
     responses=_CURSOR_RESPONSES,
 )
 async def list_traces(
@@ -321,7 +349,7 @@ async def list_traces(
 
 @router.get(
     "/tool-runtime",
-    dependencies=[Depends(require_ops_token)],
+    dependencies=[Depends(require_ops_admin)],
 )
 async def tool_runtime(container: Container = Depends(get_container)) -> dict:
     """工具线程台账。`stuck` 是"已超时、但线程还没退出"的数量。
@@ -340,7 +368,7 @@ async def tool_runtime(container: Container = Depends(get_container)) -> dict:
 @router.get(
     "/audit",
     response_model=list[AuditEntry],
-    dependencies=[Depends(require_ops_token)],
+    dependencies=[Depends(require_ops_admin)],
     responses=_CURSOR_RESPONSES,
 )
 async def list_audit(

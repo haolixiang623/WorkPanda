@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from workpanda.api.errors import register_error_handlers
 from workpanda.api.ops import router as ops_router
@@ -33,6 +34,18 @@ def create_app(settings: Settings | None = None, container: Container | None = N
     app = FastAPI(title=resolved_settings.app_name, version="0.1.0", lifespan=lifespan)
     if container is not None:
         app.state.container = container
+
+    # 跨域白名单为空时完全不装中间件：没有预检、也不会回带任何 CORS 头。
+    # 校验在启动时做，通配符配错直接失败（见 Settings.cors_origin_list）。
+    origins = resolved_settings.cors_origin_list
+    if origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(origins),
+            allow_credentials=True,
+            allow_methods=["GET", "POST"],
+            allow_headers=["Content-Type", "X-WorkPanda-Session", "X-WorkPanda-Ops-Token"],
+        )
 
     @app.get("/healthz", tags=["system"])
     async def healthz() -> dict[str, str]:
