@@ -202,3 +202,25 @@ python scripts/issue_claim.py guard 27 --sha <sha>   # 合并前复核
 TTL 放宽、精确释放、旧格式释放被忽略、输者撤回、guard 的 CI/竞争分支/
 已合并拒绝。真实 GitHub API 上也做过一次双进程并发认领 + 撤回 + 释放 +
 guard 复核的端到端验证。
+
+### 10.6 跨环境部署清单
+
+协议以 GitHub 为唯一真相源，因此任何能访问同一仓库的云主机都能直接复用，
+无需共享文件系统或中控服务。在新环境启用前，逐项确认：
+
+1. **令牌**：设置 `GITHUB_TOKEN`，或在主机配好 `git credential manager`。
+   脚本优先读 `GITHUB_TOKEN`，否则走 `git credential fill`，绝不入库。
+2. **运行依赖**：`git` + `Python 3`（纯标准库，无需 `pip install`）。
+3. **仓库与脚本路径**：worker prompt 里的仓库路径、脚本绝对路径必须换成
+   新主机的实际路径；脚本本身用 `Path.home()` 与 `WORKPANDA_CLAIM_LOCK`
+   环境变量推导锁与 worktree 位置，是 portable 的。
+4. **本机锁跨平台**：`claim_lock()` 在 Unix 用 `fcntl.flock`、Windows 用
+   `msvcrt.locking`，两者皆缺时退化为「不锁 + 警告」而非崩溃。锁文件默认
+   `~/.workbuddy/locks/workpanda-issue-claim.lock`，可用 `WORKPANDA_CLAIM_LOCK`
+   覆盖；锁按主机各自持有，本就不跨主机共享。
+5. **每 worker 唯一编号**：`WORKPANDA_WORKER_ID` 必须唯一，否则仲裁判定会出错。
+6. **租约 TTL**：`WORKPANDA_CLAIM_TTL_SECONDS`（默认 7200）须长于单次修复的
+   最坏耗时，否则租约中途过期会出现两人同时开工。
+
+跨主机的正确性不依赖本机锁，而依赖服务端 comment id 仲裁；本机锁只是减少
+无效认领的优化，缺失时最多多一条被撤回的 claim。
