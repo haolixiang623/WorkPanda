@@ -561,18 +561,26 @@ class HarnessExecutor(Executor):
         return payload
 
     def _sensitive_values(self, name: Any, arguments: Any) -> list[str]:
-        """取出某工具声明为敏感的入参值。必须在按字段名脱敏之前调用。"""
+        """取出敏感入参值（工具声明的 + 默认敏感键命中的）。必须在按字段名脱敏之前调用。
+
+        默认敏感键是兜底防线：工具作者忘了声明 `sensitive_fields` 时，入参里的
+        密码仍不该被工具回显进返回值、再落进留痕。只看显式声明等于把"忘记声明"
+        变成"明文落盘"——而忘记声明恰恰是最常见的情况。
+        """
 
         if not isinstance(name, str) or not isinstance(arguments, dict):
             return []
+        redactor = self._redactor
+        # 脱敏被显式关闭时不该再遮值，否则"关闭"是假的。
+        if not redactor.enabled:
+            return []
         tool = self._registry.get(name)
         spec = tool.spec if tool is not None else None
-        if spec is None or not spec.sensitive_fields:
-            return []
+        local = redactor.with_extra(spec.sensitive_fields) if spec is not None else redactor
         return [
-            str(arguments[field])
-            for field in spec.sensitive_fields
-            if field in arguments and arguments[field] is not None
+            str(value)
+            for field, value in arguments.items()
+            if value is not None and local.is_sensitive(str(field))
         ]
 
     def _tool_evidence(self, result: LoopResult) -> list[dict[str, str]]:

@@ -31,7 +31,7 @@ from workpanda.harness.models import (
     max_risk,
 )
 from workpanda.harness.openai_client import OpenAICompatibleClient
-from workpanda.harness.redaction import MASK
+from workpanda.harness.redaction import MASK, NO_REDACTION
 from workpanda.harness.tools import (
     ToolContext,
     ToolError,
@@ -878,6 +878,93 @@ class SecretEchoTool:
 
     def invoke(self, arguments: dict[str, Any], context: ToolContext) -> str:
         return f"echo:{arguments['token']}"
+
+
+class UndeclaredSecretTool:
+    """参数名是默认敏感键（`password`），但工具**没有**声明 sensitive_fields。
+
+    默认敏感键是兜底层：工具作者忘了声明时，入参里的密码不该原样落进留痕。
+    """
+
+    spec = ToolSpec(
+        name="test_undeclared_secret",
+        description="提交密码但不声明敏感字段",
+        parameters={
+            "type": "object",
+            "properties": {"password": {"type": "string"}},
+            "required": ["password"],
+            "additionalProperties": False,
+        },
+    )
+
+    def invoke(self, arguments: dict[str, Any], context: ToolContext) -> str:
+        return f"submitted:{arguments['password']}"
+
+
+def test_default_sensitive_key_is_masked_even_without_declaration() -> None:
+    """工具未声明 sensitive_fields 时，默认敏感键（password）也不能漏明文。
+
+    默认敏感键是兜底防线。如果只有显式声明才脱敏，那么"作者忘了写一个字段"
+    就等于把密码写进审计记录和事件流——而忘记声明恰恰是最常见的情况。
+    """
+
+    client = ScriptedModelClient(
+        [
+            ModelResponse(
+                tool_calls=[
+                    tool_call("test_undeclared_secret", call_id="c1", password="p@ssw0rd-9137")
+                ]
+            ),
+            ModelResponse(text=SUCCESS),
+        ]
+    )
+    result = make_executor(client, UndeclaredSecretTool()).execute(
+        request_for(tool="test_undeclared_secret")
+    )
+
+    serialized = json.dumps(result.output, ensure_ascii=False)
+    assert "p@ssw0rd-9137" not in serialized
+    assert MASK in serialized
+
+
+def test_disabling_redaction_really_disables_value_masking() -> None:
+    """显式关掉脱敏时必须真的不遮——否则"关闭"只是看起来关掉了。
+
+    用**已声明** sensitive_fields 的工具来测：只有这条路径会走到按值遮蔽回显文本，
+    也只有在关闭开关时它必须停下来。
+    """
+
+    client = ScriptedModelClient(
+        [
+            ModelResponse(
+                tool_calls=[tool_call("test_secret", call_id="c1", token="s3cr3t-token-88")],
+            ),
+            ModelResponse(text=SUCCESS),
+        ]
+    )
+    result = make_executor(client, SecretEchoTool(), redactor=NO_REDACTION).execute(
+        request_for(tool="test_secret")
+    )
+
+    serialized = json.dumps(result.output, ensure_ascii=False)
+    assert "s3cr3t-token-88" in serialized
+    assert MASK not in serialized
+
+
+def test_declared_sensitive_field_is_masked_when_key_is_not_a_default() -> None:
+    """工具声明的自定义字段名（不命中默认敏感键）同样要脱敏。"""
+
+    client = ScriptedModelClient(
+        [
+            ModelResponse(
+                tool_calls=[tool_call("test_secret", call_id="c1", secret="s3cr3t-token-88")],
+            ),
+            ModelResponse(text=SUCCESS),
+        ]
+    )
+    result = make_executor(client, SecretEchoTool()).execute(request_for(tool="test_secret"))
+
+    assert "s3cr3t-token-88" not in json.dumps(result.output, ensure_ascii=False)
 
 
 def test_tool_timeout_is_reported_as_unknown_not_failed() -> None:
