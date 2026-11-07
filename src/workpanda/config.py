@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -22,7 +23,23 @@ class Settings(BaseSettings):
     rate_limit_per_minute: int = 120
     rate_limit_burst: int = 30
     # 运维只读接口凭据（供 Octop 控制台使用）。未配置时接口整体不可用。
+    # 单主体旧配置，等价于一个 admin 主体；多主体请改用 `ops_tokens`。
     ops_token: str | None = None
+    # 按主体的运维凭据：`主体:角色:密钥`，多个用逗号分隔。
+    # 一个主体可以有多个密钥（轮换期间新旧并存），但不同主体的密钥不能重复。
+    ops_tokens: str = ""
+    # 网络绑定与 TLS。默认只监听回环且不启用 TLS，也就是"不对外暴露"的状态。
+    bind_host: str = "127.0.0.1"
+    bind_port: int = 8000
+    # 绑定到非回环地址属于安全边界变更，必须显式确认；
+    # 未经确认的非回环绑定会在启动时直接失败（见 server.py）。
+    allow_network_bind: bool = False
+    tls_enabled: bool = False
+    tls_certfile: Path | None = None
+    tls_keyfile: Path | None = None
+    # 允许跨域访问的来源，逗号分隔。不接受任何通配符：预检一旦放行，
+    # 浏览器会替任意站点把请求发过来并带上凭据，等于把会话交给全网。
+    cors_origins: str = ""
     # 通用 harness：直连 OpenAI 兼容接口，自带工具循环与预算控制。
     # 优先级高于 Octop 运行时：harness 用我们的受控循环，Octop 只当模型后端。
     harness_enabled: bool = False
@@ -102,6 +119,33 @@ class Settings(BaseSettings):
     @property
     def model_configured(self) -> bool:
         return bool(self.model_base_url and self.model_api_key and self.model_name)
+
+    @property
+    def cors_origin_list(self) -> tuple[str, ...]:
+        """解析并校验跨域来源白名单。
+
+        配置写错时抛错而不是"默默忽略"：被忽略的那一项会让前端收到一个没有
+        `Access-Control-Allow-Origin` 的响应，现象是"接口 200 但浏览器报跨域"，
+        比启动失败难查得多。
+        """
+
+        origins: list[str] = []
+        for raw in self.cors_origins.split(","):
+            origin = raw.strip()
+            if not origin:
+                continue
+            if "*" in origin:
+                raise ValueError(
+                    "cors_origins 不允许通配符：请显式列出每个来源（例如 https://ops.example.gov.cn）。"
+                )
+            parts = urlsplit(origin)
+            if parts.scheme not in {"http", "https"} or not parts.netloc:
+                raise ValueError(f"cors_origins 条目必须是 http(s) 来源，且不带路径：{origin}")
+            if parts.path not in {"", "/"} or parts.query or parts.fragment:
+                raise ValueError(f"cors_origins 条目不能带路径、查询串或片段：{origin}")
+            if origin not in origins:
+                origins.append(origin)
+        return tuple(origins)
 
 
 @lru_cache

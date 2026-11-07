@@ -138,7 +138,9 @@ created → running → waiting_for_user → running
 
 - `OctopHarnessExecutor` 实现 `Executor` 协议，只执行单个受控步骤；
 - 超时与运行时异常映射为 `unconfirmed`，不重试、不报成功；
-- 运维读接口 `/api/ops/*` 由 `WORKPANDA_OPS_TOKEN` 保护，未配置时整体 404；
+- 运维读接口 `/api/ops/*` 由按主体发放的凭据保护（`WORKPANDA_OPS_TOKENS`），
+  未配置时整体 404；`viewer` 只见列表与聚合，明细要求 `admin`，见
+  [OPS-ACCESS-CONTROL.md](OPS-ACCESS-CONTROL.md)；
 - 控制台只读，不写业务状态，避免双写冲突。
 
 ## 4. 接口

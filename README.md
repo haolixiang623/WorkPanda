@@ -67,7 +67,9 @@ uvicorn workpanda.main:app --app-dir src --reload
 | POST | `/api/tasks/{task_id}/cancel` | 取消任务 |
 | GET | `/api/tasks/{task_id}/events` | SSE 事件流，支持 `?after=` 补发 |
 
-运维只读接口（需 `X-WorkPanda-Ops-Token`，未配置 `WORKPANDA_OPS_TOKEN` 时整体 404）：
+运维只读接口（需 `X-WorkPanda-Ops-Token`，未配置 `WORKPANDA_OPS_TOKEN` / `WORKPANDA_OPS_TOKENS`
+时整体 404）。`viewer` 角色只能读任务列表与留痕聚合，其余明细端点要求 `admin`
+（角色说明与轮换步骤见 [docs/OPS-ACCESS-CONTROL.md](docs/OPS-ACCESS-CONTROL.md)）：
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -97,7 +99,15 @@ uvicorn workpanda.main:app --app-dir src --reload
 | `WORKPANDA_SESSION_TTL_SECONDS` | `43200` | 会话有效期 |
 | `WORKPANDA_RATE_LIMIT_PER_MINUTE` | `120` | 每会话每分钟请求数 |
 | `WORKPANDA_RATE_LIMIT_BURST` | `30` | 每会话瞬时突发上限 |
-| `WORKPANDA_OPS_TOKEN` | 空 | 运维只读接口凭据；为空时接口不可用 |
+| `WORKPANDA_OPS_TOKEN` | 空 | 单主体运维凭据（等价 admin）；为空且未配 `OPS_TOKENS` 时接口不可用 |
+| `WORKPANDA_OPS_TOKENS` | 空 | 多主体运维凭据 `主体:角色:密钥`，逗号分隔，角色取 `admin`/`viewer` |
+| `WORKPANDA_BIND_HOST` | `127.0.0.1` | 监听地址；非回环需显式确认并启用 TLS |
+| `WORKPANDA_BIND_PORT` | `8000` | 监听端口 |
+| `WORKPANDA_ALLOW_NETWORK_BIND` | `false` | 确认把服务暴露到非回环地址（安全边界变更） |
+| `WORKPANDA_TLS_ENABLED` | `false` | 启用 TLS；开启时必须提供证书与私钥 |
+| `WORKPANDA_TLS_CERTFILE` | 空 | 证书链路径 |
+| `WORKPANDA_TLS_KEYFILE` | 空 | 私钥路径 |
+| `WORKPANDA_CORS_ORIGINS` | 空 | 跨域来源白名单，逗号分隔；不接受通配符 |
 | `WORKPANDA_HARNESS_ENABLED` | `false` | 启用通用 harness 执行器（优先于 Octop） |
 | `WORKPANDA_MODEL_BASE_URL` | 空 | OpenAI 兼容接口地址 |
 | `WORKPANDA_MODEL_API_KEY` | 空 | 模型凭据；启用 harness 时必填 |
@@ -124,13 +134,19 @@ uvicorn workpanda.main:app --app-dir src --reload
 | `WORKPANDA_OCTOP_TIMEOUT_SECONDS` | `30` | 单步骤执行超时 |
 | `WORKPANDA_ENABLE_DEMO_FLOW` | `true` | 启用骨架自检流程 `demo.generic` |
 
-Octop 集成细节见 [docs/OCTOP-INTEGRATION.md](docs/OCTOP-INTEGRATION.md)。启用运行时时需安装可选依赖：
+Octop 集成细节见 [docs/OCTOP-INTEGRATION.md](docs/OCTOP-INTEGRATION.md)；运维访问控制
+（角色、凭据轮换、TLS、回退）见 [docs/OPS-ACCESS-CONTROL.md](docs/OPS-ACCESS-CONTROL.md)。
+
+启用运行时时需安装可选依赖：
 
 ```bash
 python -m pip install -e '.[octop]'
 ```
 
 `demo.generic` 只用于验证"收集 → 确认 → 执行 → 完成"链路，不代表任何业务规则。正式接入业务前必须设为 `false`。
+
+默认只监听 `127.0.0.1` 且不启用 TLS。绑定非回环地址会因缺少确认或 TLS 直接启动失败，
+这是有意的：把政务服务明文挂到网络上不会有任何报错。
 
 ## 验证
 
