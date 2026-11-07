@@ -1,6 +1,8 @@
 ## 关联任务
 
 - Issue: #
+- [ ] PR 描述已关联 Issue：修复类写 `Closes #N`（合并自动关闭，L4）；基础设施 / 协议类可写 `Refs #N`
+- [ ] 若由自动化 worker 提交：合并前已运行 `python scripts/issue_claim.py guard <N>` 并通过
 
 ## 变更摘要
 

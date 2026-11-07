@@ -135,3 +135,70 @@ AI 生成的代码不降低任何测试、审查、隐私或发布标准。
 7. 运行小范围试点后，再开放真实执行器、确认凭证和更高风险流程。
 
 首期不把多 Agent、长期记忆、复杂向量检索、全面浏览器自动化和自动生产发布设为前置条件。
+
+## 10. 多 worker 并发认领协议
+
+同一仓库可能有多个每小时自动化同时工作。工作日志里记录过：并发 worker 会
+`git commit -a`、切换分支、把别人的 PR squash 合入 main、整体还原文档文件。
+「大家注意别重复」不是控制措施（第 8 节），所以认领必须落成脚本与闸门。
+
+### 10.1 不变量
+
+> 一个 Issue 的**有效 claim 中 comment id 最小者唯一**，因此最多一个 worker 获准。
+
+GitHub 的 `POST /issues/{n}/assignees` 是追加语义而不是排他锁，两个 worker 同时
+认领会都挂上；label 同理。判定权因此放在 **claim comment 的服务端单调 id** 上：
+id 由 GitHub 分配、唯一、单调递增，与并发时序无关。`flock` 只负责本机
+「挑选 Issue → 发 claim」这一段不撞车，跨主机时即使失效也不会造成两人同时开工。
+
+### 10.2 四层控制
+
+| 层 | 控制 | 失败行为 |
+|---|---|---|
+| L1 认领 | `scripts/issue_claim.py next`：`flock` + 发 claim comment + **回读全部** + 最小 id 判定 + 写后再回读确认 | 没领到立即退出本轮，不换题重试 |
+| L2 隔离 | 每个 worker 用独立 `git worktree`，分支 `issue/<n>-<worker_id>`；只 `git add <具体路径>`，禁用 `commit -a` / `add -A` | 物理上无法互相覆盖文件 |
+| L3 合并前复核 | `guard <n>`：Issue 仍 open、自己仍是 winner、无竞争分支、main 未含 `Closes #n`、两项 CI 全 success | 任一不满足即丢弃分支，不合并 |
+| L4 幂等兜底 | PR 正文写 `Closes #n`，squash 合并自动关 Issue；空 diff / 冲突的后来者 PR 直接关闭 | 不 rebase 覆盖别人的成果 |
+
+L3 是唯一不依赖「所有 worker 都守协议」的一道闸门，不能省。
+
+### 10.3 脚本契约
+
+```bash
+export WORKPANDA_WORKER_ID=worker1          # 每个 worker 唯一，必填
+python scripts/issue_claim.py list          # 只读：列出可自动认领的 Issue
+python scripts/issue_claim.py next          # 主入口：领下一个，输出 JSON
+python scripts/issue_claim.py claim 27      # 领指定 Issue
+python scripts/issue_claim.py release 27    # 释放自己当前获准的那条 claim
+python scripts/issue_claim.py guard 27 --sha <sha>   # 合并前复核
+```
+
+退出码：`0` 获准 / 通过，`2` 未获准，`3` guard 拒绝，`4` 配置或 API 错误。
+凭据优先取 `GITHUB_TOKEN`，否则走 `git credential fill`，不入库。
+锁文件默认 `~/.workbuddy/locks/workpanda-issue-claim.lock`，**必须放在仓库之外**。
+
+两条容易写错的地方：
+
+1. **释放必须指向具体的 claim comment id**。按 worker 名释放会跨轮误伤——
+   上一轮的 release 会把同一 worker 下一轮的新 claim 一起作废；
+2. **判输者必须立刻撤回自己的 claim**。否则会留下一条「从没开工却占着位置」
+   的记录，winner 释放后 Issue 仍被锁住（这是真实 API 验证时暴露的缺陷，
+   已由 `tests/test_issue_claim.py::test_loser_withdraws_so_issue_becomes_reclaimable` 覆盖）。
+
+### 10.4 边界
+
+- 只有 `enhancement` 且无 assignee、无 `issue/<n>-*` 远端分支、无有效 claim 的
+  Issue 会被自动认领；`question`（需决策）与 `documentation`（总览/合规前置）
+  不自动领取，对应第 3 节「高风险任务不能由 AI 自行领取」；
+- claim 默认 TTL 7200 秒，过期视为失效，避免 worker 崩溃后永久占位；
+  该 Issue 已有 open PR 时放宽 4 倍，但保留上界；TTL 必须长于一次修复的
+  最坏耗时，否则会出现租约中途过期、两人同时在跑；
+- 这套机制只对**走同一脚本**的 worker 成立；绕过协议时只能靠 L3 兜底。
+
+### 10.5 验证证据
+
+`tests/test_issue_claim.py` 用带锁的 fake GitHub（服务端自增 comment id）跑
+20 轮双线程真并发，断言每轮**有且仅有一个** worker 获准；另覆盖过期、
+TTL 放宽、精确释放、旧格式释放被忽略、输者撤回、guard 的 CI/竞争分支/
+已合并拒绝。真实 GitHub API 上也做过一次双进程并发认领 + 撤回 + 释放 +
+guard 复核的端到端验证。
