@@ -5,6 +5,7 @@ from fastapi.responses import JSONResponse
 
 from workpanda.application.errors import (
     AuthenticationRequired,
+    CancelNotDelivered,
     IntentUnresolved,
     RateLimited,
     RequestRejected,
@@ -65,3 +66,14 @@ def register_error_handlers(app: FastAPI) -> None:
         response = _error(status.HTTP_429_TOO_MANY_REQUESTS, "rate_limited", "请求过于频繁。")
         response.headers["Retry-After"] = str(max(1, exc.retry_after_seconds))
         return response
+
+    @app.exception_handler(CancelNotDelivered)
+    async def _cancel_not_delivered(
+        request: Request, exc: CancelNotDelivered
+    ) -> JSONResponse:
+        # 5xx 而不是 409：这是可重试的临时故障，且任务状态没有被改动。
+        return _error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "cancel_not_delivered",
+            "取消信号未送达，任务状态未改变，请重试。",
+        )

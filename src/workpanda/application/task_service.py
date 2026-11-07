@@ -7,7 +7,12 @@
 from collections.abc import Sequence
 from uuid import UUID
 
-from workpanda.application.errors import IntentUnresolved, RequestRejected, TaskConflict
+from workpanda.application.errors import (
+    CancelNotDelivered,
+    IntentUnresolved,
+    RequestRejected,
+    TaskConflict,
+)
 from workpanda.application.ports import IntentRouter, StepCancellation
 from workpanda.application.runner import FlowRunner
 from workpanda.domain.flow import FlowDefinition, FlowNotFound, FlowNotRunnable, FlowRegistry
@@ -115,12 +120,17 @@ class TaskService:
         if task.status in BLOCKED_STATUSES:
             raise TaskConflict(f"task in {task.status} state cannot be cancelled")
 
-        if task.current_step:
-            self.confirmations.revoke(task.task_id, task.current_step)
         if self.cancellations is not None:
             # 状态翻转只是账面上的。正在跑的执行必须收到信号，否则它会把剩下的
             # 模型轮次和工具调用做完——包括那笔用户刚说"不要了"的提交。
-            self.cancellations.cancel_task(task.task_id, "user_cancelled")
+            # 信号下发失败时**不翻转状态**：多进程部署下别的进程仍在跑，
+            # 界面显示"已取消"会让人误以为可以安全地重新提交。
+            try:
+                self.cancellations.cancel_task(task.task_id, "user_cancelled")
+            except Exception as exc:  # noqa: BLE001 - 底层异常类型不属于应用层协议
+                raise CancelNotDelivered("取消信号未送达，请重试") from exc
+        if task.current_step:
+            self.confirmations.revoke(task.task_id, task.current_step)
         task.status = TaskStatus.CANCELLED
         task.updated_at = utc_now()
         self.store.save(task)

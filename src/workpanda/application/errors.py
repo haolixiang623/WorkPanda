@@ -23,3 +23,7 @@ class RateLimited(Exception):
     def __init__(self, retry_after_seconds: int = 1) -> None:
         super().__init__("too many requests")
         self.retry_after_seconds = retry_after_seconds
+
+
+class CancelNotDelivered(Exception):
+    """取消信号没能送达执行侧：任务状态不得翻转，调用方应重试。"""

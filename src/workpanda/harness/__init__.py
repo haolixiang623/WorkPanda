@@ -15,7 +15,13 @@ from workpanda.harness.audit import (
     NullAuditJournal,
 )
 from workpanda.harness.budget import Budget, BudgetExhausted
-from workpanda.harness.cancel import Cancelled, CancelRegistry, CancelToken
+from workpanda.harness.cancel import (
+    Cancelled,
+    CancelRegistry,
+    CancelSignalError,
+    CancelSignalStore,
+    CancelToken,
+)
 from workpanda.harness.clients import ModelClient, ModelError, ModelTimeout
 from workpanda.harness.contract import OUTCOME_CONTRACT, parse_contract
 from workpanda.harness.effects import (
@@ -56,9 +62,11 @@ __all__ = [
     "AuditKind",
     "Budget",
     "BudgetExhausted",
-    "CancelRegistry",
-    "CancelToken",
     "Cancelled",
+    "CancelRegistry",
+    "CancelSignalError",
+    "CancelSignalStore",
+    "CancelToken",
     "EffectEntry",
     "EffectStatus",
     "EffectSummary",

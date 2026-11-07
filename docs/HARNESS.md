@@ -33,7 +33,8 @@ harness/
 ```
 
 留痕与断点的持久化实现放在 `infrastructure/`：`sqlite_trace_store.py`、
-`sqlite_checkpoint_store.py`。harness 只依赖协议，不反向依赖具体存储。
+`sqlite_checkpoint_store.py`、`sqlite_cancel_store.py`（跨进程取消信号）。
+harness 只依赖协议，不反向依赖具体存储。
 
 依赖方向：`executor → loop → tools/models`，全部单向；本层只依赖 `application.ports`
 与自身，不反向依赖 API、存储或业务代码。
@@ -333,6 +334,9 @@ sqlite3 workpanda.db "DELETE FROM harness_checkpoints WHERE task_id='...' AND st
 | `WORKPANDA_HARNESS_RESUME_TTL_SECONDS` | `900` | 断点保留时限，超时拒绝续跑 |
 | `WORKPANDA_HARNESS_LEASE_ENABLED` | `false` | 启用步骤租约（同一 task+step 同时只允许一个执行者） |
 | `WORKPANDA_HARNESS_LEASE_TTL_SECONDS` | `0` | 租约时长；`0` 表示按 `deadline + 90s` 自动推导 |
+| `WORKPANDA_HARNESS_CANCEL_BACKEND` | `memory` | 取消信号可见范围：`memory` 仅本进程 / `sqlite` 同机多进程共享 |
+| `WORKPANDA_HARNESS_CANCEL_TTL_SECONDS` | `600` | 共享取消信号有效期；过期不再拦住同一任务的后续执行 |
+| `WORKPANDA_HARNESS_CANCEL_POLL_SECONDS` | `0.1` | 退避等待里轮询共享信号的粒度 |
 | `WORKPANDA_HARNESS_ALLOWED_HOSTS` | 空 | 逗号分隔的 http 工具域名白名单 |
 | `WORKPANDA_HARNESS_AUDIT_PATH` | 空 | 审计归档文件路径；为空则不归档 |
 | `WORKPANDA_HARNESS_AUDIT_MAX_BYTES` | `5000000` | 单个归档文件大小上限，超过即滚动 |
@@ -406,14 +410,22 @@ python scripts/smoke_harness.py     # 真实模型端到端
   `evidence` 即 `sys_clock` 返回的时间戳。
 - 真实模型（阿里云百炼 `deepseek-v4.1-flash-1017`）下跑通"调用非幂等工具 → 归档"：
   `model_calls=2`、工具真实执行 1 次，归档得到 1 条 `effect(applied)` + 1 条 `execution`，
-  `requires_manual_check=false`，敏感入参只留指纹、文件里查不到原文。
+  `requires_manual_check=false`，敏感入参只留指纹、文件里查不到原文；
+- 执行进行中收到 HTTP 取消：取消请求在 1 秒内返回、执行线程在同一轮里看见信号，
+  迟到的执行结果不会把 `cancelled` 覆盖回 `completed` 或 `outcome_unconfirmed`；
+- 事件总线从工作线程发布仍能送达订阅者（SSE 队列按订阅时的事件循环投递）；
+- 跨进程取消信号：两个独立 SQLite 连接 / 两个独立容器之间，取消前与开始后写入的信号
+  都能在下一个边界被读到；退避等待 5 秒被 0.1 秒级的跨进程取消打断；信号过期后不再生效；
+- 共享信号写失败返回 503 `cancel_not_delivered` 且任务状态不翻转；读不出来按"已取消"
+  fail-closed 停下；未知后端配置在启动时直接报错，不静默退化。
 
 未验证：
 
 - 真实业务系统工具（尚未接入任何外部 API）；
 - 超时后遗留线程在真实长任务下的资源影响；
 - 跨主机多实例下的预算与限流（预算仍在单进程内累计）；
-- 跨主机多实例下的步骤租约：本实现只覆盖同机多进程（SQLite）与同进程并发。
+- 跨主机多实例下的步骤租约与取消信号：本实现只覆盖同机多进程（SQLite）与同进程并发；
+- 执行结束与持久化之间极窄的窗口内收到取消（见第 16 节）。
 
 ## 12. 已知限制
 
@@ -428,7 +440,7 @@ python scripts/smoke_harness.py     # 真实模型端到端
   同机多进程并发，跨主机部署仍需共享锁；
 - checkpoint 保存未脱敏的对话原文，只应与任务槽位同库同权限存放；
 - 被拒绝的断点会保留，需要人工核实后按第 8 节清理，否则该步骤持续被拒绝；
-- 事件总线与限流器仍在单进程内，横向扩容前需外部化；
+- 事件总线与限流器仍在单进程内（事件总线已支持从工作线程安全发布），横向扩容前需外部化；
 - TraceStore 有界（默认 500 条），超出的旧记录会被淘汰：适合排障，不适合作为审计归档；
   要长期核对副作用请开启审计归档（第 13 节），两者不能互相替代；
 - 审计归档是单机追加文件：多实例同时写需要共享文件系统或换成集中式日志；
@@ -538,14 +550,13 @@ registry.cancel_task(task_id, "user_cancelled")   # 从 HTTP 线程调用
   `duplicate_side_effect` 仍然生效，已提交过的非幂等动作不会被重复提交；
 - 取消不产生"已交付"的假象：只要有工具成功调用过，就仍然需要人工核对。
 
-### 并发前提
+### 并发前提（已落地，见第 16 节）
 
-取消要真正有用，执行必须在不阻塞请求线程的地方跑。当前执行是同步调用，
-若部署在单进程单事件循环上，取消请求本身要排队到执行结束才被处理——那时已经
-没有可取消的东西了。因此：
-
-- 单机试点：接受"取消 = 下一次边界生效"，并把执行放到线程池或独立 worker 里；
-- 多实例：取消信号要跨进程（例如经队列或共享状态广播），进程内的登记表不够。
+取消要真正有用，执行必须在不阻塞请求线程的地方跑。早期执行是同步调用，若部署在
+单进程单事件循环上，取消请求本身要排队到执行结束才被处理——那时已经没有可取消的
+东西了。现在会推进流程的三个接口都放到工作线程，取消接口留在事件循环上；多实例
+部署时可把取消信号切到 SQLite 共享后端。剩下的边界不变：取消仍只在下一个边界生效，
+已经提交的调用仍会跑完并照常留痕。
 
 ### 已验证
 
@@ -557,13 +568,14 @@ registry.cancel_task(task_id, "user_cancelled")   # 从 HTTP 线程调用
 - 并发批次已提交的幂等调用全部留痕，停发生在下一轮模型调用之前；
 - 执行器在开始前被取消时不调模型、不碰工具，仍写 trace 与审计；
 - 执行中被取消：非幂等工具只执行一次，结论未确认，断点保留且可续跑；
-- 取消接口只翻转状态的时代结束：`POST /api/tasks/{id}/cancel` 会把信号交给执行侧。
+- 取消接口只翻转状态的时代结束：`POST /api/tasks/{id}/cancel` 会把信号交给执行侧；
+- 执行进行中收到 HTTP 取消的并发场景、跨进程信号与失败语义见第 16 节。
 
 ### 未验证 / 已知限制
 
-- 没有真正跑过"执行进行中收到 HTTP 取消"的端到端场景（同步执行会先占住事件循环，
-  见上文"并发前提"）；
-- Octop 运行时与脚手架执行器不读这个信号，取消对它们仍是纯状态翻转。
+- Octop 运行时与脚手架执行器不读这个信号，取消对它们仍是纯状态翻转；
+- 跨主机多实例仍需把共享信号后端换成 Redis / advisory lock，SQLite 只覆盖同机多进程；
+- 执行结束到结果持久化之间极窄的窗口内收到取消，仍可能先落一条结果事件（第 16 节）。
 
 ## 15. 步骤租约（单写者保护）
 
@@ -589,3 +601,59 @@ TTL 必须长于一次执行的最坏耗时（步骤 deadline 之外还有模型
 边界要说清楚：**跨主机多实例部署仍需把这里的 SQLite/内存实现换成共享锁**
 （Redis、数据库 advisory lock 等），单写者假设本身不变。开启后仍保留的其他
 限制：预算与限流仍在单进程内、事件总线未外部化。
+
+## 16. 让取消真的落地：执行离环与跨进程信号
+
+第 14 节写了取消的三个边界，但那时有两个前提没兑现：执行占着事件循环，取消请求
+排不上队；取消信号只在自己进程的内存里，另一个 worker 里的执行根本看不见。
+这一节补的就是这两个前提，**不改取消本身的语义**——仍不打断已提交的调用、
+结论仍是"未确认"、断点仍保留。
+
+### 执行离环
+
+`POST /api/tasks`、`/answers`、`/confirm` 都会推进流程，可能真的调用模型与工具，
+耗时可达数十秒。三者改用 `asyncio.to_thread` 在工作线程跑；`POST /cancel` 刻意
+留在事件循环上，只做状态翻转与信号下发，因此执行进行中也能立刻被处理。
+
+配套两件事：
+
+- `EventBroker.publish` 记住订阅者所在的事件循环，从工作线程发布时用
+  `call_soon_threadsafe` 把投递排回那个循环——`asyncio.Queue.put_nowait` 不是线程安全的。
+  推送丢了也不丢事件，SSE 断线重连以 Task Store 为准；
+- `FlowRunner` 拿到执行结果后重读一次任务状态。若已被取消，直接返回那条
+  `cancelled` 任务，**不写结果事件**：一次迟到的执行结果不能把用户刚点的取消
+  覆盖回 `completed` / `failed` / `outcome_unconfirmed`。
+
+### 共享取消信号
+
+`CancelRegistry` 可接一个 `CancelSignalStore`（`signal` / `reason_for`）。
+默认仍是 `memory`，行为与之前完全一致；配 `WORKPANDA_HARNESS_CANCEL_BACKEND=sqlite`
+后信号写到任务库同文件的 `harness_cancel_signals` 表，同机多进程可见：
+
+| 时刻 | 行为 |
+|---|---|
+| 取消请求 | 先写共享信号，再置位本进程令牌；写失败抛 `CancelSignalError` |
+| 边界检查（`cancelled` / `raise_if_cancelled`） | 主动拉一次共享信号，发现取消即置位令牌 |
+| 重试退避 | 按 `CANCEL_POLL_SECONDS` 切片等待，每片拉一次，不等完整退避 |
+| 共享信号读不出来 | 按 `cancel_signal_unavailable` **已取消**收口：状态不明时不再产生新动作 |
+| 信号过期 | 不再拦住同一任务的后续执行；人工确认后可直接删表记录 |
+
+**信号写不成功时不能假装成功**：取消接口返回 503 `cancel_not_delivered`，
+任务状态不翻转，调用方应重试。多进程部署下界面显示"已取消"、另一个进程却还在
+提交，比一次可重试的失败危险得多。`CancelSignalStore` 只是协议，跨主机部署
+换成 Redis / 数据库 advisory lock 即可，执行侧的边界语义不用改。
+
+```bash
+export WORKPANDA_HARNESS_CANCEL_BACKEND=sqlite
+# 人工确认后清理一条陈旧信号，让同一任务可以重新执行：
+sqlite3 workpanda.db "DELETE FROM harness_cancel_signals WHERE task_id='...'"
+```
+
+### 仍然没有承诺的事
+
+- 取消依旧不打断正在进行的模型/工具调用，只保证"不会再有新的动作"；
+- SQLite 只解决同机多进程；跨主机多实例的取消、预算与限流仍需外部化；
+- `asyncio.to_thread` 用的是默认线程池，并发步骤数受池大小约束，这是有意的背压；
+- 结果守卫读状态之后、结果持久化之前这段极窄窗口内收到取消，仍可能先落一条结果
+  记录并短暂覆盖状态。要彻底消除需要在存储层做条件写（compare-and-set），当前未做；
+- Octop 运行时与脚手架执行器仍不读这个信号。
