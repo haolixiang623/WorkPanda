@@ -120,7 +120,14 @@ class FlowRunner:
 
         # 本次推进以库里的状态为准。工作线程与取消请求并发时，这个快照就是
         # 后面所有条件写的期望值：任何别的写者先动过它，我们的结果就不算数。
-        expected_status = self.store.get(task.task_id).status
+        authoritative = self.store.get(task.task_id)
+        if authoritative.is_terminal:
+            # 传进来的对象可能是上一条命令读到的旧快照：在它被处理到这里之前，
+            # 任务已经完成或被取消。终态没有出边，更不该拿它当期望值硬推一步
+            # ——那等于用"旧快照 + 库里恰好没变"把终态盖掉，只要库里正好就是
+            # 这个终态，条件写反而会成功。
+            return authoritative
+        expected_status = authoritative.status
         self._move(task, TaskStatus.RUNNING)
         step = flow.step(task.current_step) if task.current_step else flow.next_step(None)
 
@@ -170,22 +177,33 @@ class FlowRunner:
         """返回任务表示流程已暂停或终止；返回 None 表示该步骤已完成，可继续。"""
 
         if step.kind is StepKind.COLLECT:
-            return self._collect(task, step)
+            return self._collect(task, step, expected_status)
         if step.kind is StepKind.EXECUTE:
             return self._execute(task, flow, step, expected_status)
         return self._handoff(task, step, "flow_requested_handoff", expected_status)
 
-    def _collect(self, task: Task, step: StepDefinition) -> Task | None:
+    def _collect(
+        self, task: Task, step: StepDefinition, expected_status: TaskStatus
+    ) -> Task | None:
         missing = [field for field in step.required_fields if not task.slots.get(field)]
         if missing:
             task.pending_fields = missing
             self._move(task, TaskStatus.WAITING_FOR_USER)
-            self.emit(
+            return self._commit_pause(
                 task,
-                EventType.CLARIFICATION_REQUIRED,
-                {"step_id": step.step_id, "fields": missing, "prompt": step.prompt or ""},
+                [
+                    PendingEvent(
+                        type=EventType.CLARIFICATION_REQUIRED,
+                        status=task.status,
+                        data={
+                            "step_id": step.step_id,
+                            "fields": missing,
+                            "prompt": step.prompt or "",
+                        },
+                    )
+                ],
+                expected_status,
             )
-            return self._persist(task)
 
         task.pending_fields = []
         return None
@@ -204,28 +222,41 @@ class FlowRunner:
                 # 没有有效凭证，或参数在确认后发生变化：必须重新确认，不能直接执行。
                 task.pending_fields = []
                 self._move(task, TaskStatus.WAITING_FOR_CONFIRMATION)
-                self.emit(
+                return self._commit_pause(
                     task,
-                    EventType.CONFIRMATION_REQUIRED,
-                    {
-                        "step_id": step.step_id,
-                        "summary": dict(task.slots),
-                        "message": step.confirm_message or step.title,
-                    },
+                    [
+                        PendingEvent(
+                            type=EventType.CONFIRMATION_REQUIRED,
+                            status=task.status,
+                            data={
+                                "step_id": step.step_id,
+                                "summary": dict(task.slots),
+                                "message": step.confirm_message or step.title,
+                            },
+                        )
+                    ],
+                    expected_status,
                 )
-                return self._persist(task)
 
         if credential is not None:
             try:
                 self.confirmations.consume(credential.token)
             except ConfirmationError:
                 self._move(task, TaskStatus.WAITING_FOR_CONFIRMATION)
-                self.emit(
+                return self._commit_pause(
                     task,
-                    EventType.CONFIRMATION_REQUIRED,
-                    {"step_id": step.step_id, "reason": "credential_already_used"},
+                    [
+                        PendingEvent(
+                            type=EventType.CONFIRMATION_REQUIRED,
+                            status=task.status,
+                            data={
+                                "step_id": step.step_id,
+                                "reason": "credential_already_used",
+                            },
+                        )
+                    ],
+                    expected_status,
                 )
-                return self._persist(task)
 
         result = self.executor.execute(
             ExecutionRequest(
@@ -343,10 +374,22 @@ class FlowRunner:
             task.status = status
             task.updated_at = utc_now()
 
-    def _persist(self, task: Task) -> Task:
-        """只写过程中间态；终态一律走 `commit_guarded`。"""
-        task.updated_at = utc_now()
-        return self.store.save(task)
+    def _commit_pause(
+        self,
+        task: Task,
+        events: Sequence[PendingEvent],
+        expected_status: TaskStatus,
+    ) -> Task:
+        """把「暂停（等输入 / 等确认）+ 待办事件」绑成一笔条件提交。
+
+        暂停看着只是过程中间态，但它同样是一次"谁说了算"的判定：任务若在推进
+        途中被取消，这里就不该再落一条"请补充字段"的待办——否则界面上会出现
+        一条挂在已取消任务上的待输入提示，人还会照着它再填一遍。
+
+        与执行结果落地共用 `_commit_result` 的仲裁：条件写输了就整批丢弃，
+        交回库里的权威状态。
+        """
+        return self._commit_result(task, events, expected_status)
 
 
 def _diagnostics(result: ExecutionResult) -> dict[str, Any]:

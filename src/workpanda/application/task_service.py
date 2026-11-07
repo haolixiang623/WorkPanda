@@ -5,6 +5,7 @@
 """
 
 from collections.abc import Sequence
+from typing import Any
 from uuid import UUID
 
 from workpanda.application.errors import (
@@ -94,8 +95,9 @@ class TaskService:
         task.slots.update({key: value for key, value in request.values.items() if value})
         task.pending_fields = []
         task.updated_at = utc_now()
-        self.store.save(task)
-        self.runner.emit(task, EventType.SLOTS_UPDATED, {"fields": sorted(request.values)})
+        # 回答不是无条件覆盖：期间任务可能已被取消或转人工。状态与"字段已更新"
+        # 事件同生共死，输掉的一方整批丢弃，调用方拿到冲突去刷新。
+        self._commit(task, EventType.SLOTS_UPDATED, {"fields": sorted(request.values)})
         # 参数变化后旧凭证必须失效，执行节点会重新要求确认。
         self.confirmations.revoke(task.task_id, step.step_id)
         return self.runner.advance(task)
@@ -111,8 +113,7 @@ class TaskService:
         if not request.accepted:
             task.pending_fields = []
             task.updated_at = utc_now()
-            self.store.save(task)
-            self.runner.emit(task, EventType.CONFIRMATION_DECLINED, {"step_id": step.step_id})
+            self._commit(task, EventType.CONFIRMATION_DECLINED, {"step_id": step.step_id})
             self.confirmations.revoke(task.task_id, step.step_id)
             return task
 
@@ -182,6 +183,23 @@ class TaskService:
         return self.store.events(task_id, after_sequence)
 
     # ---------- 内部 ----------
+
+    def _commit(self, task: Task, event_type: EventType, data: dict[str, Any]) -> None:
+        """把「当前状态 + 一条过程事件」绑成一笔条件提交。
+
+        回答与拒绝确认都不改变任务状态（前者只补字段，后者只清掉待确认位），
+        所以期望值就是入口读到的这个状态。条件不成立说明期间有别人改过任务，
+        整批丢弃并报冲突——不拿旧快照覆盖，也不留下一条无主事件。
+        """
+        expected_status = task.status
+        try:
+            self.runner.commit_guarded(
+                task,
+                [PendingEvent(type=event_type, status=task.status, data=data)],
+                expected_status=expected_status,
+            )
+        except StaleTaskState as exc:
+            raise TaskConflict("任务状态已变化，本次操作未生效，请刷新后重试") from exc
 
     def _owned(self, task_id: UUID, subject: str) -> Task:
         """任务归属校验：不是自己的任务一律按不存在处理，避免泄露任务存在性。"""

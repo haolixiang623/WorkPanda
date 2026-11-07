@@ -21,6 +21,8 @@ from workpanda.config import Settings
 from workpanda.domain.models import (
     EventType,
     Task,
+    TaskAnswerRequest,
+    TaskConfirmRequest,
     TaskCreateRequest,
     TaskStatus,
     utc_now,
@@ -216,11 +218,12 @@ def _attach(container: Container, inner: Any, winner: TaskStatus) -> RaceBeforeC
     return wrapper
 
 
-def _request(flow_id: str) -> TaskCreateRequest:
+def _request(flow_id: str, slots: dict[str, str] | None = None) -> TaskCreateRequest:
     return TaskCreateRequest(
         conversation_id="conversation-1",
         input_text="我要办理测试事项",
         flow_id=flow_id,
+        slots=dict(slots or {}),
     )
 
 
@@ -297,3 +300,142 @@ def test_cancel_commits_status_and_event_together() -> None:
         ]
     finally:
         container.close()
+
+
+# ---------- 暂停分支：等输入 / 等确认同样要过条件写 ----------
+
+FILLED = {"subject": "主题", "contact": "联系方式"}
+
+
+def _attach_deferred(container: Container, inner: Any, winner: TaskStatus) -> RaceBeforeCommitStore:
+    """挂上竞态包装但先不武装：留给用例自己挑"哪一次提交前"让对手抢先。"""
+    wrapper = RaceBeforeCommitStore(inner, winner)
+    wrapper.armed = False
+    container.store = wrapper
+    container.tasks.store = wrapper
+    container.tasks.runner.store = wrapper
+    return wrapper
+
+
+def test_clarification_pause_never_lands_on_a_task_cancelled_mid_flight() -> None:
+    """推进途中被取消时，"请补充字段"这条待办不能再落下去。"""
+
+    container, inner = _create(ExecutionOutcome.SUCCEEDED, [CONFIRM_FLOW])
+    wrapper = _attach_deferred(container, inner, TaskStatus.CANCELLED)
+    try:
+        wrapper.armed = True
+        task = container.tasks.create_task(_request("test.confirm"), "subject-1")
+        assert wrapper.triggered is True, "竞态没有被触发，用例没有覆盖到目标窗口"
+        assert task.status is TaskStatus.CANCELLED
+        authoritative = container.store.get(task.task_id)
+        assert authoritative.status is TaskStatus.CANCELLED
+        # 已取消的任务上不能挂着"请补充字段"：界面会让人照着一份不存在的待办再填一遍。
+        assert authoritative.pending_fields == []
+        types = [event.type for event in container.store.events(task.task_id)]
+        assert EventType.CLARIFICATION_REQUIRED not in types, types
+    finally:
+        container.close()
+
+
+def test_confirmation_pause_never_lands_on_a_task_cancelled_mid_flight() -> None:
+    container, inner = _create(ExecutionOutcome.SUCCEEDED, [CONFIRM_FLOW])
+    wrapper = _attach_deferred(container, inner, TaskStatus.CANCELLED)
+    try:
+        wrapper.armed = True
+        task = container.tasks.create_task(_request("test.confirm", FILLED), "subject-1")
+        assert wrapper.triggered is True
+        assert task.status is TaskStatus.CANCELLED
+        assert container.store.get(task.task_id).status is TaskStatus.CANCELLED
+        types = [event.type for event in container.store.events(task.task_id)]
+        assert EventType.CONFIRMATION_REQUIRED not in types, types
+    finally:
+        container.close()
+
+
+def test_answer_that_loses_the_race_reports_conflict() -> None:
+    """回答不能覆盖已取消的任务：拿不到状态就报冲突，让人刷新。"""
+
+    container, inner = _create(ExecutionOutcome.SUCCEEDED, [CONFIRM_FLOW])
+    wrapper = _attach_deferred(container, inner, TaskStatus.CANCELLED)
+    try:
+        created = container.tasks.create_task(_request("test.confirm"), "subject-1")
+        assert created.status is TaskStatus.WAITING_FOR_USER
+        wrapper.armed = True
+
+        with pytest.raises(TaskConflict):
+            container.tasks.answer(
+                created.task_id, TaskAnswerRequest(values=FILLED), "subject-1"
+            )
+        assert wrapper.triggered is True
+        assert container.store.get(created.task_id).status is TaskStatus.CANCELLED
+        types = [event.type for event in container.store.events(created.task_id)]
+        assert EventType.SLOTS_UPDATED not in types, types
+    finally:
+        container.close()
+
+
+def test_declined_confirmation_that_loses_the_race_reports_conflict() -> None:
+    container, inner = _create(ExecutionOutcome.SUCCEEDED, [CONFIRM_FLOW])
+    wrapper = _attach_deferred(container, inner, TaskStatus.CANCELLED)
+    try:
+        created = container.tasks.create_task(_request("test.confirm", FILLED), "subject-1")
+        assert created.status is TaskStatus.WAITING_FOR_CONFIRMATION
+        wrapper.armed = True
+
+        with pytest.raises(TaskConflict):
+            container.tasks.confirm(
+                created.task_id,
+                TaskConfirmRequest(step_id="submit", accepted=False),
+                "subject-1",
+            )
+        assert wrapper.triggered is True
+        assert container.store.get(created.task_id).status is TaskStatus.CANCELLED
+        types = [event.type for event in container.store.events(created.task_id)]
+        assert EventType.CONFIRMATION_DECLINED not in types, types
+    finally:
+        container.close()
+
+
+def test_pause_and_answer_keep_event_sequence_contiguous() -> None:
+    """改成条件写之后，断言顺序仍接在即时事件后面，不重号也不跳号。"""
+
+    container, _ = _create(ExecutionOutcome.SUCCEEDED, [CONFIRM_FLOW])
+    try:
+        created = container.tasks.create_task(_request("test.confirm"), "subject-1")
+        assert created.status is TaskStatus.WAITING_FOR_USER
+        events = list(container.store.events(created.task_id))
+        assert [event.sequence for event in events] == list(range(1, len(events) + 1))
+        assert EventType.CLARIFICATION_REQUIRED in [event.type for event in events]
+
+        answered = container.tasks.answer(
+            created.task_id, TaskAnswerRequest(values=FILLED), "subject-1"
+        )
+        assert answered.status is TaskStatus.WAITING_FOR_CONFIRMATION
+        events = list(container.store.events(created.task_id))
+        assert [event.sequence for event in events] == list(range(1, len(events) + 1))
+        assert [event.type for event in events].count(EventType.SLOTS_UPDATED) == 1
+        assert EventType.CONFIRMATION_REQUIRED in [event.type for event in events]
+        assert container.store.get(created.task_id).pending_fields == []
+    finally:
+        container.close()
+
+
+def test_advance_on_a_stale_snapshot_does_not_resurrect_a_cancelled_task() -> None:
+    """调用方手里那份旧快照不能把已取消的任务再推一步。"""
+
+    container, _ = _create(ExecutionOutcome.SUCCEEDED, [CONFIRM_FLOW])
+    try:
+        stale = container.tasks.create_task(_request("test.confirm"), "subject-1")
+        assert stale.status is TaskStatus.WAITING_FOR_USER
+        container.tasks.cancel(stale.task_id, "subject-1")
+
+        advanced = container.tasks.runner.advance(stale)
+        assert advanced.status is TaskStatus.CANCELLED
+        events = list(container.store.events(stale.task_id))
+        # 既不补一条 STEP_STARTED，也不再落第二条"请补充字段"。
+        assert [event.type for event in events].count(EventType.STEP_STARTED) == 1
+        assert [event.type for event in events].count(EventType.CLARIFICATION_REQUIRED) == 1
+        assert container.store.get(stale.task_id).status is TaskStatus.CANCELLED
+    finally:
+        container.close()
+
