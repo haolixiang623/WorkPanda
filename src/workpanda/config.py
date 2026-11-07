@@ -90,9 +90,23 @@ class Settings(BaseSettings):
     # 多进程试点请显式设 180。
     harness_lease_enabled: bool = False
     harness_lease_ttl_seconds: float = 0.0
-    # 取消信号的可见范围：memory（仅本进程，默认）/ sqlite（同机多进程，与任务库同文件）。
-    # 跨主机多实例仍需换成共享后端，这里只解决"另一个进程里的执行看不见取消"。
+    # 取消信号的可见范围：memory（仅本进程，默认）/ sqlite（同机多进程，与任务库同文件）
+    # / redis（跨主机多实例）。选 redis 时租约与预算账本一并走共享后端。
     harness_cancel_backend: str = "memory"
+    # 共享状态后端的总开关。留空表示沿用 `harness_cancel_backend`（向后兼容），
+    # 取值 memory / sqlite / redis。写 redis 时租约、取消信号、预算账本三处同时共享。
+    harness_shared_backend: str = ""
+    # redis 连接串：`redis://[:密码@]主机:端口/库号`。未配置而选了 redis 时启动直接报错。
+    # 只允许内网明文连接：这里是状态面（不含业务数据），但仍不应暴露在公网。
+    harness_redis_url: str | None = None
+    # 单条共享状态命令的超时。取消轮询在退避等待里每 0.1s 一次，超时必须远小于它，
+    # 否则"点了取消没反应"；超时按 fail-closed 处理，不会静默续跑。
+    harness_redis_timeout_seconds: float = 0.5
+    # 键前缀。同一个 Redis 被多套环境共用时，靠它区分，避免串状态。
+    harness_shared_key_prefix: str = "workpanda"
+    # 预算账本 TTL；0 表示按 deadline + 120s 自动推导（与租约同一口径）。
+    # TTL 必须长于一次执行的最坏耗时，否则执行中途账本过期等于预算被重置。
+    harness_budget_ttl_seconds: float = 0.0
     # 共享取消信号的有效期；过期后不再拦住同一任务的后续执行。
     harness_cancel_ttl_seconds: float = 600.0
     # 退避等待里轮询共享信号的粒度（秒）。太大时跨进程取消会显得"点了没反应"。
@@ -116,6 +130,18 @@ class Settings(BaseSettings):
     octop_timeout_seconds: float = 30.0
     # 骨架自检流程，只用于验证任务链路；正式接入业务前必须关闭。
     enable_demo_flow: bool = True
+
+    @property
+    def shared_backend(self) -> str:
+        """实际生效的共享状态后端。
+
+        `harness_shared_backend` 优先，留空时沿用旧的 `harness_cancel_backend`：
+        老部署只改一个环境变量就能把租约、取消、预算一起切到共享后端，而不用
+        同时维护两套开关。
+        """
+
+        chosen = (self.harness_shared_backend or self.harness_cancel_backend or "memory").strip()
+        return chosen.lower() or "memory"
 
     @property
     def allowed_hosts(self) -> tuple[str, ...]:
