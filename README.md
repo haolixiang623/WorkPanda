@@ -2,7 +2,7 @@
 
 WorkPanda 是面向群众的自然语言公共服务入口。当前仓库处于**工程骨架**阶段：已建立统一业务后端、固定流程执行、任务状态与确认凭证机制，并具备受控执行能力（模型可调用受控工具、结果可核验）；尚未接入具体业务事项与外部业务系统。
 
-业务目标见 [business-goals.md](business-goals.md)，目标架构见 [recommended-architecture.md](recommended-architecture.md)。工程实现细节见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，受控执行层见 [docs/HARNESS.md](docs/HARNESS.md)，协作规范见 [AGENTS.md](AGENTS.md) 与 [docs/DEVELOPMENT-OPERATING-MECHANISM.md](docs/DEVELOPMENT-OPERATING-MECHANISM.md)，界面约束见 [design/DESIGN.md](design/DESIGN.md)。
+业务目标见 [business-goals.md](business-goals.md)，目标架构见 [recommended-architecture.md](recommended-architecture.md)。工程实现细节见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，受控执行层见 [docs/HARNESS.md](docs/HARNESS.md)，识别与展示契约（含评测集）见 [docs/INTENT-EVAL.md](docs/INTENT-EVAL.md)，协作规范见 [AGENTS.md](AGENTS.md) 与 [docs/DEVELOPMENT-OPERATING-MECHANISM.md](docs/DEVELOPMENT-OPERATING-MECHANISM.md)，界面约束见 [design/DESIGN.md](design/DESIGN.md)。
 
 ## 已实现
 
@@ -10,6 +10,9 @@ WorkPanda 是面向群众的自然语言公共服务入口。当前仓库处于*
 - 服务端固定流程定义与版本解析；
 - 任务状态机，含澄清、等待确认、待确认结果和转人工；
 - 槽位收集与多轮澄清；
+- 确定性意图识别与槽位抽取：同分跨流程判歧义→澄清、抽不到不编造、
+  未声明字段在创建入口即拒绝（版本化评测集见 [docs/INTENT-EVAL.md](docs/INTENT-EVAL.md)）；
+- 群众可见状态（`ui_state`）由服务端唯一给出，只有"已完成"使用成功语义；
 - 关键动作的服务端一次性确认凭证（绑定任务、流程版本、步骤和参数摘要）；
 - 签名会话令牌、任务归属隔离与按会话限流；
 - **通用 harness 受控执行层**：工具白名单、参数校验、四重预算（步数/调用/token/耗时）、
@@ -27,7 +30,7 @@ WorkPanda 是面向群众的自然语言公共服务入口。当前仓库处于*
 
 ## 未实现
 
-- 任何真实公共服务事项与话术；
+- 任何真实公共服务事项与话术（意图规则目前只挂在自检流程上）；
 - 真实业务系统工具（尚无外部 API 接入）；
 - Octop 控制台插件、Octop Browser；
 - 登录、实名核验、权限分级与审计后台；
@@ -83,6 +86,10 @@ uvicorn workpanda.main:app --app-dir src --reload
 列表接口的响应体是数组，翻页靠 `X-Next-Cursor` 响应头（没有这个头就是到头了）。
 
 任务按会话隔离：访问不属于自己的任务返回 404，不暴露任务是否存在。超限返回 429 并带 `Retry-After`。
+
+任务响应带 `ui_state`（群众可见状态键，与 `status` 一一对应，映射见
+[docs/INTENT-EVAL.md](docs/INTENT-EVAL.md) 第 3.3 节）；`clarification_required`
+错误体同样带 `ui_state: needs_clarification`。
 
 ## 配置
 

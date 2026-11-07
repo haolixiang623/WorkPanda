@@ -13,6 +13,7 @@ from workpanda.application.task_service import TaskService
 from workpanda.config import Settings, get_settings
 from workpanda.domain.flow import FlowDefinition, FlowRegistry
 from workpanda.domain.identity import SessionSigner, new_secret
+from workpanda.domain.intent import IntentRule, RuleIntentRouter
 from workpanda.domain.repository import ConfirmationStore, TaskStore
 from workpanda.harness.audit import AuditJournal, JsonlAuditJournal, NullAuditJournal
 from workpanda.harness.budget import BudgetLedger
@@ -30,8 +31,8 @@ from workpanda.harness.openai_client import OpenAICompatibleClient
 from workpanda.harness.redaction import DEFAULT_REDACTOR, NO_REDACTION
 from workpanda.harness.shared_state import SharedStateStore
 from workpanda.harness.trace import InMemoryTraceStore, TraceStore
-from workpanda.infrastructure.adapters import KeywordIntentRouter, ScriptedExecutor
-from workpanda.infrastructure.demo_flows import demo_flows
+from workpanda.infrastructure.adapters import ScriptedExecutor
+from workpanda.infrastructure.demo_flows import demo_flows, demo_intent_rules
 from workpanda.infrastructure.event_broker import EventBroker
 from workpanda.infrastructure.memory_store import InMemoryConfirmationStore, InMemoryTaskStore
 from workpanda.infrastructure.octop_runtime import OctopHarnessExecutor, OctopHarnessGateway
@@ -214,6 +215,19 @@ def build_budget_ledger(
     return RedisBudgetLedger(shared, ttl_seconds=ttl), []
 
 
+def default_intent_rules(flow_definitions: list[FlowDefinition]) -> tuple[IntentRule, ...]:
+    """按已注册流程裁剪默认意图规则。
+
+    规则指向未注册的流程时，识别"成功"也会在解析流程那一步变成 422——那看起来
+    像群众说错了话，实际是装配错了。因此在装配期就裁掉，不留给运行时。
+    """
+
+    registered = {(flow.flow_id, flow.version) for flow in flow_definitions}
+    return tuple(
+        rule for rule in demo_intent_rules() if (rule.flow_id, rule.flow_version) in registered
+    )
+
+
 def build_container(
     settings: Settings | None = None,
     *,
@@ -326,7 +340,9 @@ def build_container(
     else:
         executor_instance = executor
 
-    router_instance = router or KeywordIntentRouter()
+    # 未显式注入路由器时用确定性规则路由器：没有规则就等于"识别不了"，
+    # 让创建任务走澄清而不是猜一个流程。
+    router_instance = router or RuleIntentRouter(rules=default_intent_rules(registered))
 
     runner = FlowRunner(
         store=store,

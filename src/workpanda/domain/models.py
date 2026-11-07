@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 def utc_now() -> datetime:
@@ -132,6 +132,23 @@ class TaskView(BaseModel):
     failure_message: str | None
     created_at: datetime
     updated_at: datetime
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ui_state(self) -> str:
+        """群众可见状态键，由服务端唯一决定（见 `domain/presentation.py`）。
+
+        放在响应里而不是让前端自己从 `status` 推：前端各推一份，就等于每个端各
+        有一套"什么算办完"的口径，而其中最要命的那条（结果待确认不能显示成功）
+        恰恰是最容易被"看起来更友好"的写法改坏的。
+
+        局部导入是为了避免 `models ↔ presentation` 的循环依赖：presentation 需要
+        `TaskStatus`，而这里只需要它的翻译函数。
+        """
+
+        from workpanda.domain.presentation import ui_state_for
+
+        return ui_state_for(self.status).value
 
     @classmethod
     def from_task(cls, task: Task) -> "TaskView":

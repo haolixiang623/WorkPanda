@@ -5,6 +5,7 @@
 """
 
 from workpanda.domain.flow import FlowDefinition, FlowStatus, StepDefinition, StepKind
+from workpanda.domain.intent import IntentRule
 
 DEMO_FLOW = FlowDefinition(
     flow_id="demo.generic",
@@ -34,6 +35,28 @@ DEMO_FLOW = FlowDefinition(
     ),
 )
 
+# 自检流程的意图规则。只认自检话术，别的话一律不路由——占位规则越"宽容"，
+# 真实试点上线时越容易被误当成业务识别能力。
+DEMO_INTENT_RULES: tuple[IntentRule, ...] = (
+    IntentRule(
+        intent_id="demo.generic.selfcheck",
+        flow_id=DEMO_FLOW.flow_id,
+        flow_version=DEMO_FLOW.version,
+        keywords=("自检", "演示"),
+        slot_patterns={
+            "subject": (
+                r"(?:主题|内容)[:：]\s*([^\s,，。;；]+)",
+                r"自检[:：]\s*([^\s,，。;；]+)",
+            )
+        },
+    ),
+)
+
 
 def demo_flows() -> list[FlowDefinition]:
     return [DEMO_FLOW]
+
+
+def demo_intent_rules() -> tuple[IntentRule, ...]:
+    return DEMO_INTENT_RULES
+

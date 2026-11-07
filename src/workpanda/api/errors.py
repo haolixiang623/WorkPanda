@@ -13,6 +13,7 @@ from workpanda.application.errors import (
 )
 from workpanda.domain.confirmation import ConfirmationError
 from workpanda.domain.flow import FlowNotFound, FlowNotRunnable
+from workpanda.domain.presentation import UiState
 from workpanda.domain.repository import TaskNotFoundError
 from workpanda.domain.state_machine import InvalidTransition
 
@@ -20,8 +21,8 @@ from workpanda.domain.state_machine import InvalidTransition
 UNPROCESSABLE = 422
 
 
-def _error(status_code: int, code: str, message: str) -> JSONResponse:
-    return JSONResponse(status_code=status_code, content={"code": code, "detail": message})
+def _error(status_code: int, code: str, message: str, **extra: object) -> JSONResponse:
+    return JSONResponse(status_code=status_code, content={"code": code, "detail": message, **extra})
 
 
 def register_error_handlers(app: FastAPI) -> None:
@@ -35,7 +36,14 @@ def register_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(IntentUnresolved)
     async def _intent(request: Request, exc: IntentUnresolved) -> JSONResponse:
-        return _error(UNPROCESSABLE, "clarification_required", str(exc))
+        # 带上 UI 状态键，客户端不必自己把"没有任务"翻译成"需要澄清"。
+        # 此时没有任何任务被创建，也没有任何工具被调用。
+        return _error(
+            UNPROCESSABLE,
+            "clarification_required",
+            str(exc),
+            ui_state=UiState.NEEDS_CLARIFICATION.value,
+        )
 
     @app.exception_handler(RequestRejected)
     async def _rejected(request: Request, exc: RequestRejected) -> JSONResponse:
