@@ -23,6 +23,11 @@ from workpanda.harness.models import (
     ToolSpec,
 )
 
+# 本地模型对工具名与调用 id 有长度上限，上游却不受这个约束。超长值在这里截断，
+# 不能留到构造模型时抛 ValidationError——那个异常会绕过留痕直接冒到调用方。
+MAX_TOOL_NAME = 64
+MAX_CALL_ID = 128
+
 
 class OpenAICompatibleClient:
     def __init__(
@@ -157,12 +162,17 @@ def _parse_completion(data: dict[str, Any], *, duration_ms: int = 0) -> ModelRes
 
     message = choices[0].get("message") or {}
     content = message.get("content")
-    tool_calls = [_parse_tool_call(raw) for raw in message.get("tool_calls") or []]
+    raw_calls = message.get("tool_calls")
+    calls = (
+        _parse_tool_calls([raw for raw in raw_calls if isinstance(raw, dict)])
+        if isinstance(raw_calls, list)
+        else []
+    )
 
     return ModelResponse(
         text=content if isinstance(content, str) else "",
         reasoning=_reasoning_of(message),
-        tool_calls=[call for call in tool_calls if call is not None],
+        tool_calls=calls,
         finish_reason=choices[0].get("finish_reason"),
         duration_ms=duration_ms,
         # 有的网关不返回 usage；拿不到就不统计，绝不用字符数估算。
@@ -184,10 +194,50 @@ def _reasoning_of(message: dict[str, Any]) -> str:
     return ""
 
 
+def _parse_tool_calls(raw_calls: list[dict[str, Any]]) -> list[ToolCall]:
+    """把上游给的一组调用转成 `ToolCall`，并保证 id 唯一。
+
+    上游偶尔会给出重复的 `id`（甚至完全不给）。`call_id` 是回灌工具结果时的唯一
+    关联键：两条调用共用一个 id，回执就会串到一起，模型看到的是"两条调用一个结果"，
+    而留痕里也分不清哪条对应哪次执行。这里按出现顺序补后缀去重，语义保持"第一条
+    原样保留"，只为后续重复项换键。
+
+    单个调用解析失败（名字缺失、字段类型不对）只丢这一条，不让整轮响应作废——
+    模型已经说了话，丢整条等于把一次可能的副作用变成"没发生过"。
+    """
+
+    calls: list[ToolCall] = []
+    used: set[str] = set()
+    for raw in raw_calls:
+        call = _parse_tool_call(raw)
+        if call is None:
+            continue
+        calls.append(_dedupe_call_id(call, used))
+    return calls
+
+
+def _dedupe_call_id(call: ToolCall, used: set[str]) -> ToolCall:
+    if call.call_id not in used:
+        used.add(call.call_id)
+        return call
+
+    # 后缀必须落在长度上限之内：先拼后缀再截断，恰好 128 字符的 id 会把后缀截掉，
+    # 重命名结果退化成原 id——去重静默失效，两条调用仍共用同一个键。
+    suffix = 2
+    while True:
+        tail = f"-{suffix}"
+        renamed = f"{call.call_id[: MAX_CALL_ID - len(tail)]}{tail}"
+        if renamed not in used:
+            break
+        suffix += 1
+    used.add(renamed)
+    return call.model_copy(update={"call_id": renamed})
+
+
 def _parse_tool_call(raw: dict[str, Any]) -> ToolCall | None:
     function = raw.get("function") or {}
-    name = function.get("name")
-    if not isinstance(name, str) or not name:
+    name = function.get("name") if isinstance(function, dict) else None
+    if not isinstance(name, str) or not name.strip():
         return None
 
     raw_arguments = function.get("arguments")
@@ -204,8 +254,12 @@ def _parse_tool_call(raw: dict[str, Any]) -> ToolCall | None:
         else:
             arguments = parsed if isinstance(parsed, dict) else {"__raw_arguments__": text[:500]}
 
+    # 名字与 id 都要截断到本地模型允许的长度：上游给超长值时，如果直接构造
+    # `ToolCall` 会抛 ValidationError，一路冒到执行器之外，连 trace 都留不下来。
+    # 截断比整轮作废安全：工具名对不上会被闸门拦成 `tool_not_registered` 并留痕。
+    call_id = str(raw.get("id") or f"call-{name}")
     return ToolCall(
-        call_id=str(raw.get("id") or f"call-{name}"),
-        name=name,
+        call_id=call_id[:MAX_CALL_ID] or f"call-{name}"[:MAX_CALL_ID],
+        name=name[:MAX_TOOL_NAME],
         arguments=arguments,
     )
