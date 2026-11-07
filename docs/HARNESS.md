@@ -388,7 +388,12 @@ sqlite3 workpanda.db "DELETE FROM harness_checkpoints WHERE task_id='...' AND st
 | `WORKPANDA_HARNESS_RESUME_TTL_SECONDS` | `900` | 断点保留时限，超时拒绝续跑 |
 | `WORKPANDA_HARNESS_LEASE_ENABLED` | `false` | 启用步骤租约（同一 task+step 同时只允许一个执行者） |
 | `WORKPANDA_HARNESS_LEASE_TTL_SECONDS` | `0` | 租约时长；`0` 表示按 `deadline + 120s` 自动推导（余量已含模型超时 60s×含一次重试）。多进程试点建议显式设 `180`（第 21 节） |
-| `WORKPANDA_HARNESS_CANCEL_BACKEND` | `memory` | 取消信号可见范围：`memory` 仅本进程 / `sqlite` 同机多进程共享 |
+| `WORKPANDA_HARNESS_CANCEL_BACKEND` | `memory` | 取消信号可见范围：`memory` 仅本进程 / `sqlite` 同机多进程共享 / `redis` 跨主机（需配 URL） |
+| `WORKPANDA_HARNESS_SHARED_BACKEND` | 空 | 共享状态总开关。空表示沿用 `HARNESS_CANCEL_BACKEND`；取 `memory` / `sqlite` / `redis`。选 `redis` 时租约、取消信号、预算账本一起走共享后端（第 22 节） |
+| `WORKPANDA_HARNESS_REDIS_URL` | 空 | `redis://[:密码@]主机:端口/库号`。选 `redis` 却没配时启动直接失败 |
+| `WORKPANDA_HARNESS_REDIS_TIMEOUT_SECONDS` | `0.5` | 单条共享状态命令超时；超时按 fail-closed 处理 |
+| `WORKPANDA_HARNESS_SHARED_KEY_PREFIX` | `workpanda` | 键前缀，同一 Redis 被多套环境共用时靠它区分 |
+| `WORKPANDA_HARNESS_BUDGET_TTL_SECONDS` | `0` | 预算账本 TTL；`0` 表示按 `deadline + 120s` 自动推导 |
 | `WORKPANDA_HARNESS_CANCEL_TTL_SECONDS` | `600` | 共享取消信号有效期；过期不再拦住同一任务的后续执行 |
 | `WORKPANDA_HARNESS_CANCEL_POLL_SECONDS` | `0.1` | 退避等待里轮询共享信号的粒度 |
 | `WORKPANDA_HARNESS_ALLOWED_HOSTS` | 空 | 逗号分隔的 http 工具域名白名单 |
@@ -403,7 +408,8 @@ sqlite3 workpanda.db "DELETE FROM harness_checkpoints WHERE task_id='...' AND st
 ```bash
 pytest tests/test_harness.py tests/test_checkpoint.py tests/test_trace_store.py \
        tests/test_openai_client.py tests/test_redaction.py tests/test_trace.py \
-       tests/test_effects.py tests/test_audit.py tests/test_cancel.py
+       tests/test_effects.py tests/test_audit.py tests/test_cancel.py \
+       tests/test_cancel_signal.py tests/test_step_lease.py tests/test_shared_state_redis.py
 python scripts/smoke_harness.py     # 真实模型端到端
 ```
 
@@ -477,17 +483,24 @@ python scripts/smoke_harness.py     # 真实模型端到端
 - 跨进程取消信号：两个独立 SQLite 连接 / 两个独立容器之间，取消前与开始后写入的信号
   都能在下一个边界被读到；退避等待 5 秒被 0.1 秒级的跨进程取消打断；信号过期后不再生效；
 - 共享信号写失败返回 503 `cancel_not_delivered` 且任务状态不翻转；读不出来按"已取消"
-  fail-closed 停下；未知后端配置在启动时直接报错，不静默退化。
+  fail-closed 停下；未知后端配置在启动时直接报错，不静默退化；
+- 跨主机共享状态（第 22 节，两个独立客户端 + 进程内假 Redis）：同一 `(task, step)`
+  只有一个执行者、非持有者释放无效、TTL 过期可接管、跨主机取消在下一个边界被读到、
+  预算账本跨主机累计而**不重置**、共享上限对两侧同时生效且失败的预约会回滚、
+  账本/信号不可用时分别按"预算耗尽（未确认）"与"已取消"收口、成功执行后租约释放给
+  另一台主机；Redis 连不上或配成 `rediss://` 时启动直接失败。
 
 未验证：
 
 - 真实业务系统工具（尚未接入任何外部 API）；
 - 超时后遗留线程在真实长任务下的资源影响：现在有台账与容量闸门（第 19 节），
   但上限该取多少，只有在真实长任务压力下量过才算数；
-- 跨主机多实例下的预算与限流（预算仍在单进程内累计）；
-- 跨主机多实例下的步骤租约与取消信号：本实现只覆盖同机多进程（SQLite）与同进程并发；
+- 跨主机多实例的**真实部署**：第 22 节的共享后端只在两个独立客户端 + 进程内假 Redis
+  上验证过，没有在两台真实主机、真实 Redis（网络分区、主从切换）上跑过；
+- 限流仍在单进程内，横向扩容前仍需外部化；
 - 执行结束与持久化之间那段窗口已由第 17 节的条件写关掉（含暂停与回答分支）；
-  仍未覆盖的是**跨主机**多实例在同一窗口上的仲裁。
+  仍未覆盖的是**跨主机**多实例在同一窗口上的仲裁——它要求任务库本身共享
+  （PostgreSQL 等），只把租约/取消/预算搬到 Redis 不足以关掉这个窗口。
 
 ## 12. 已知限制
 
@@ -674,9 +687,10 @@ TTL 必须长于一次执行的最坏耗时（步骤 deadline 之外还有模型
 （165s），**没有多余空间**，所以多进程试点仍建议显式设 `180`。代价是进程崩溃后
 最多等 180 秒才能重试同一步骤，比中途被抢、副作用做两遍划算。
 
-边界要说清楚：**跨主机多实例部署仍需把这里的 SQLite/内存实现换成共享锁**
-（Redis、数据库 advisory lock 等），单写者假设本身不变。开启后仍保留的其他
-限制：预算与限流仍在单进程内、事件总线未外部化。
+边界要说清楚：**跨主机多实例部署要把这里的 SQLite/内存实现换成共享锁**。
+第 22 节把这件事做了：`WORKPANDA_HARNESS_SHARED_BACKEND=redis` 时租约改用
+Redis 的 `SET NX PX` + 比较删除，单写者假设本身不变。开启后仍保留的其他限制：
+限流与事件总线仍在单进程内。
 
 ## 16. 让取消真的落地：执行离环与跨进程信号
 
@@ -728,7 +742,8 @@ sqlite3 workpanda.db "DELETE FROM harness_cancel_signals WHERE task_id='...'"
 ### 仍然没有承诺的事
 
 - 取消依旧不打断正在进行的模型/工具调用，只保证"不会再有新的动作"；
-- SQLite 只解决同机多进程；跨主机多实例的取消、预算与限流仍需外部化；
+- SQLite 只解决同机多进程；跨主机多实例的取消、预算与租约已由第 22 节的 Redis
+  后端覆盖，限流仍未外部化；
 - `asyncio.to_thread` 用的是默认线程池，并发步骤数受池大小约束，这是有意的背压；
 - 结果守卫读状态之后、结果持久化之前那段极窄窗口，已由第 17 节的条件写消除：
   取消与结果落地共用一次状态 CAS，状态与结果事件同生共死，谁先写谁生效；
@@ -1169,6 +1184,83 @@ TTL 短于实际耗时时租约确实可被中途抢走，TTL 足够长时抢不
 
 - 句柄成本按"工具自己持连接"估算；不同工具实现（连接池、复用会话）会有差异，
   真实部署请以 `GET /api/ops/tool-runtime` 的 `stuck` 走势为准；
-- 压测是单机单进程，不覆盖多实例争抢同一租约的时序；跨主机仍需共享锁；
+- 压测是单机单进程，不覆盖多实例争抢同一租约的时序；跨主机共享锁见第 22 节；
 - 模型超时按配置值推算（真实 60s 超时没有跑，脚本里用缩比 deadline 观察结构）；
 - 峰值 RSS 是进程级指标，只能回答"堆 N 条要多少内存"，不能定位到某一条线程。
+
+## 22. 跨主机共享状态：租约、取消信号与预算账本
+
+第 15、16 节都写着同一句边界："跨主机仍需换成共享锁"。这一节把它落地，并且
+把三处共享状态收敛到**同一层原语**——它们要回答的其实是同一个问题：这一步现在
+归谁、被叫停没有、还剩多少额度。
+
+### 选型：为什么是 Redis，为什么自己写客户端
+
+| 方案 | 结论 | 理由 |
+|---|---|---|
+| Redis（`SET NX PX` + `WATCH` 比较删除 + `HINCRBY`） | **采用** | 三个原语都是单命令或单事务，语义直接对内；TTL 天然适配"租约/信号过期"；运维面成熟，试点环境已经能起一个实例 |
+| 数据库 advisory lock | 不采用 | 要求任务库先换成共享库（当前默认 SQLite），会把这次改动变成"任务库迁移 + 分布式锁"两件事；而且 advisory lock 没有 TTL 语义，崩溃后要靠连接断开释放，观测性差 |
+| 共享文件系统 + `O_EXCL` | 不采用 | NFS 上 `O_EXCL` 与 `fcntl` 的语义依实现而异，出问题时是"偶发两个执行者"，比不可用更危险 |
+| ZooKeeper / etcd | 不采用 | 能力远超需要，引入的运维成本与试点规模不匹配 |
+
+客户端只用标准库 socket 说 RESP2，不新增运行时依赖：共享后端是**可选路径**，
+为它给整个项目加一个包，等于让所有单机部署一起承担供应链与升级成本。命令面固定
+在 8 条以内，测试里用进程内假服务端（`tests/fake_redis.py`）完整覆盖，CI 不需要
+真实 Redis。
+
+两条明确的取舍：
+
+- **不自动重试**：写命令超时后结果未知，重发可能把预算算两遍、或把已释放的租约
+  再放一次。传输层出错就丢连接、如实报错，由上层按拒绝处理；
+- **不支持 TLS/集群/哨兵**：遇到 `rediss://` 直接报错，不假装连上。试点是内网
+  单实例，能力边界写清楚比"看起来支持"更重要。
+
+### 键布局
+
+| 键 | 类型 | 写入方 | TTL |
+|---|---|---|---|
+| `<prefix>:lease:<task_id>:<step_id>` | string（owner 随机串） | 执行器 | 租约 TTL（默认 `deadline + 120s`） |
+| `<prefix>:cancel:<task_id>` | string（取消原因） | 取消接口 | `HARNESS_CANCEL_TTL_SECONDS` |
+| `<prefix>:budget:<task_id>:<step_id>` | hash（`steps` / `tool_calls` / `tokens`） | 执行循环 | `HARNESS_BUDGET_TTL_SECONDS`（默认同租约口径） |
+
+前缀可配：同一个 Redis 被多套环境共用时，前缀是唯一的分隔手段。
+
+### 语义：三处都按 fail-closed
+
+| 场景 | 行为 |
+|---|---|
+| 租约被他人持有 | `acquire` 返回 False → `unconfirmed` + `checkpoint_busy`，不调模型/工具 |
+| 租约后端不可用 | 同上：状态不明一律拒绝，绝不赌"另一边没在跑" |
+| 释放租约 | 比较删除（`WATCH` + `MULTI`）：**只删自己的**。租约过期被接管后，迟到的释放不能把新持有者的保护抹掉 |
+| 取消信号写入失败 | 接口 503 `cancel_not_delivered`，任务状态不翻转 |
+| 取消信号读不出来 | 令牌按 `cancel_signal_unavailable` 已取消收口 |
+| 预算累加超限 | 原子"先扣再退"，返回 None → `BudgetExhausted`，结论未确认 |
+| 预算后端不可用 | `BudgetExhausted("budget_store_unavailable")`：既没超预算也没开始花，结论未确认、可重试 |
+| 预算续跑/换主机 | 以账本为准，`initial_*` 不再叠加：账本里已经包含此前所有尝试的用量 |
+
+最后一条是这次改动最容易踩的坑：接上账本后如果还把断点里的 `steps` 再当初始值
+加一遍，续跑就会凭空多出一份配额。`Budget` 在有账本时直接忽略 `initial_*`。
+
+### 启用
+
+```bash
+export WORKPANDA_HARNESS_SHARED_BACKEND=redis
+export WORKPANDA_HARNESS_REDIS_URL='redis://:密码@10.0.0.9:6379/0'
+export WORKPANDA_HARNESS_SHARED_KEY_PREFIX=workpanda-pilot
+export WORKPANDA_HARNESS_LEASE_ENABLED=true
+export WORKPANDA_HARNESS_LEASE_TTL_SECONDS=180      # 必须长于一次执行的最坏耗时
+export WORKPANDA_HARNESS_BUDGET_TTL_SECONDS=300     # 同上，宁长不短
+```
+
+启动时先 `PING` 探活：配成共享却连不上，进程直接起不来。这不是苛刻——一个
+"以为自己在共享、实际各写各的"集群，比起不来更危险。
+
+### 运行期注意
+
+- 只允许内网明文连接：这里放的是执行状态（owner 随机串、取消原因、用量计数），
+  不含业务数据，但仍不应暴露在公网；
+- 键前缀一旦变更，旧键会自然过期，不要指望它"迁移"；
+- 观察到 `checkpoint_busy` 持续上升时，先确认租约 TTL 是否短于真实执行耗时
+  （第 21 节压测口径），再怀疑后端；
+- `budget_store_unavailable` 与 `budget_max_tool_calls` 是两件事：前者是账记不上，
+  后者是额度用完。运维要按不同方向处理（前者查 Redis，后者查流程设计）。

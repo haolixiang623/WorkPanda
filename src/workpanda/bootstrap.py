@@ -15,11 +15,12 @@ from workpanda.domain.flow import FlowDefinition, FlowRegistry
 from workpanda.domain.identity import SessionSigner, new_secret
 from workpanda.domain.repository import ConfirmationStore, TaskStore
 from workpanda.harness.audit import AuditJournal, JsonlAuditJournal, NullAuditJournal
+from workpanda.harness.budget import BudgetLedger
 from workpanda.harness.builtin import default_registry
 from workpanda.harness.cancel import CancelRegistry
 from workpanda.harness.cancel_executor import CancellableExecutor
 from workpanda.harness.checkpoint import CheckpointStore, InMemoryCheckpointStore
-from workpanda.harness.executor import HarnessExecutor
+from workpanda.harness.executor import HarnessExecutor, auto_lease_ttl
 from workpanda.harness.lease import (
     InMemoryStepLeaseStore,
     SqliteStepLeaseStore,
@@ -27,6 +28,7 @@ from workpanda.harness.lease import (
 )
 from workpanda.harness.openai_client import OpenAICompatibleClient
 from workpanda.harness.redaction import DEFAULT_REDACTOR, NO_REDACTION
+from workpanda.harness.shared_state import SharedStateStore
 from workpanda.harness.trace import InMemoryTraceStore, TraceStore
 from workpanda.infrastructure.adapters import KeywordIntentRouter, ScriptedExecutor
 from workpanda.infrastructure.demo_flows import demo_flows
@@ -34,6 +36,13 @@ from workpanda.infrastructure.event_broker import EventBroker
 from workpanda.infrastructure.memory_store import InMemoryConfirmationStore, InMemoryTaskStore
 from workpanda.infrastructure.octop_runtime import OctopHarnessExecutor, OctopHarnessGateway
 from workpanda.infrastructure.rate_limit import TokenBucketLimiter
+from workpanda.infrastructure.redis_client import RedisClient
+from workpanda.infrastructure.redis_shared_state import (
+    RedisBudgetLedger,
+    RedisCancelSignalStore,
+    RedisSharedState,
+    RedisStepLeaseStore,
+)
 from workpanda.infrastructure.sqlite_cancel_store import SqliteCancelSignalStore
 from workpanda.infrastructure.sqlite_checkpoint_store import SqliteCheckpointStore
 from workpanda.infrastructure.sqlite_store import SqliteStore
@@ -115,17 +124,45 @@ def build_checkpoint_store(
     return InMemoryCheckpointStore(), []
 
 
+def build_shared_state(
+    settings: Settings,
+) -> tuple[RedisSharedState | None, list[Callable[[], None]]]:
+    """共享状态后端。只有显式选 redis 时才建立连接，其余后端返回 None。
+
+    启动时先探活：配置成共享、实际连不上时，宁可起不来也不能让每个实例
+    各自以为"自己是唯一的执行者"。
+    """
+
+    if settings.shared_backend != "redis":
+        return None, []
+    url = (settings.harness_redis_url or "").strip()
+    if not url:
+        raise ValueError(
+            "harness_shared_backend=redis 时必须配置 harness_redis_url"
+            "（形如 redis://:密码@主机:6379/0）"
+        )
+    client = RedisClient(url, timeout_seconds=settings.harness_redis_timeout_seconds)
+    client.ping()
+    state = RedisSharedState(client, prefix=settings.harness_shared_key_prefix)
+    return state, [state.close]
+
+
 def build_lease_store(
     settings: Settings,
+    shared: SharedStateStore | RedisSharedState | None = None,
 ) -> tuple[StepLeaseStore | None, list[Callable[[], None]]]:
     """步骤租约。默认关闭：单进程顺序执行不需要，多进程试点显式开启。
 
-    开启时后端跟随任务存储：SQLite 与任务库同文件，因此同机跨进程互斥；
-    内存后端只挡同一进程内的并发。跨主机多实例仍需换共享锁。
+    开启时后端跟随共享配置：redis（跨主机）、SQLite（同机跨进程，与任务库同文件）、
+    内存（只挡同一进程内的并发）。
     """
 
     if not settings.harness_lease_enabled:
         return None, []
+    if isinstance(shared, RedisSharedState):
+        return RedisStepLeaseStore(shared), []
+    if shared is not None:
+        raise ValueError("步骤租约只支持 redis 共享后端；其余共享实现尚未提供租约语义")
     if settings.store_backend == "sqlite":
         store = SqliteStepLeaseStore(settings.sqlite_path)
         return store, [store.close]
@@ -134,26 +171,47 @@ def build_lease_store(
 
 def build_cancel_registry(
     settings: Settings,
+    shared: SharedStateStore | RedisSharedState | None = None,
 ) -> tuple[CancelRegistry, list[Callable[[], None]]]:
-    """取消登记表。默认只在进程内可见，多实例试点时切到 SQLite 共享信号。
+    """取消登记表。默认只在进程内可见，多实例试点时切到共享信号。
 
-    共享信号写在任务库同一个文件里，因此同机多进程不需要额外部署；
+    SQLite 写在任务库同一个文件里，同机多进程不需要额外部署；redis 供跨主机使用。
     写不成功时登记表会抛错，调用方不能把"没送达"当成"已取消"。
     """
 
-    backend = settings.harness_cancel_backend.strip().lower()
+    backend = settings.shared_backend
     kwargs = {
         "pending_ttl_seconds": settings.harness_cancel_ttl_seconds,
         "poll_interval": settings.harness_cancel_poll_seconds,
         "signal_ttl_seconds": settings.harness_cancel_ttl_seconds,
     }
     if backend == "sqlite":
-        shared = SqliteCancelSignalStore(settings.sqlite_path)
-        return CancelRegistry(shared=shared, **kwargs), [shared.close]
+        store = SqliteCancelSignalStore(settings.sqlite_path)
+        return CancelRegistry(shared=store, **kwargs), [store.close]
+    if backend == "redis":
+        if not isinstance(shared, RedisSharedState):
+            raise ValueError("取消信号后端为 redis，但没有可用的共享连接（检查 harness_redis_url）")
+        return CancelRegistry(shared=RedisCancelSignalStore(shared), **kwargs), []
     if backend != "memory":
         # 配置写错时宁可启动失败：静默退化会让多进程部署以为取消是共享的。
-        raise ValueError(f"unsupported harness_cancel_backend: {settings.harness_cancel_backend}")
+        raise ValueError(f"unsupported harness_shared_backend: {settings.harness_shared_backend}")
     return CancelRegistry(**kwargs), []
+
+
+def build_budget_ledger(
+    settings: Settings,
+    shared: SharedStateStore | RedisSharedState | None = None,
+) -> tuple[BudgetLedger | None, list[Callable[[], None]]]:
+    """跨主机预算账本。默认 None：预算仍在单进程内累计，行为与之前一致。
+
+    TTL 与租约同口径（deadline + 120s 余量）：账本在执行中途过期等于配额被重置，
+    比多算一点危险得多。连接由共享状态持有，这里不再单独管理生命周期。
+    """
+
+    if not isinstance(shared, RedisSharedState):
+        return None, []
+    ttl = settings.harness_budget_ttl_seconds or auto_lease_ttl(settings.harness_deadline_seconds)
+    return RedisBudgetLedger(shared, ttl_seconds=ttl), []
 
 
 def build_container(
@@ -183,8 +241,11 @@ def build_container(
     registered = flows if flows is not None else (demo_flows() if settings.enable_demo_flow else [])
     registry = FlowRegistry(registered)
     broker = EventBroker()
+    # 共享状态后端先建：取消信号、步骤租约、预算账本三处共用同一个连接与键前缀。
+    shared_state, shared_closers = build_shared_state(settings)
+    closers.extend(shared_closers)
     # 取消默认只在进程内可见；多实例时由配置切到共享信号（见 build_cancel_registry）。
-    cancellations, cancel_closers = build_cancel_registry(settings)
+    cancellations, cancel_closers = build_cancel_registry(settings, shared_state)
     closers.extend(cancel_closers)
     # trace 独立于任务结果存放：既能覆盖成功执行，也能做跨任务的聚合指标。
     traces, trace_closers = build_trace_store(settings)
@@ -214,7 +275,8 @@ def build_container(
                 trust_env=settings.model_trust_env,
             )
             checkpoints, checkpoint_closers = build_checkpoint_store(settings)
-            leases, lease_closers = build_lease_store(settings)
+            leases, lease_closers = build_lease_store(settings, shared_state)
+            budget_ledger, budget_closers = build_budget_ledger(settings, shared_state)
             executor_instance: Executor = HarnessExecutor(
                 model_client,
                 registry=tool_registry,
@@ -235,11 +297,13 @@ def build_container(
                 leases=leases,
                 lease_ttl_seconds=settings.harness_lease_ttl_seconds,
                 cancellations=cancellations,
+                budget_ledger=budget_ledger,
             )
             closers.append(model_client.close)
             closers.extend(tool_closers)
             closers.extend(checkpoint_closers)
             closers.extend(lease_closers)
+            closers.extend(budget_closers)
         elif settings.octop_enabled:
             gateway = OctopHarnessGateway(
                 agent_name=settings.octop_agent_name,

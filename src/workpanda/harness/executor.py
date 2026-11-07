@@ -35,6 +35,7 @@ from workpanda.application.ports import (
     Executor,
 )
 from workpanda.harness.audit import AuditJournal, entries_for_records
+from workpanda.harness.budget import BudgetLedger
 from workpanda.harness.cancel import CancelRegistry, CancelToken
 from workpanda.harness.checkpoint import (
     CheckpointStore,
@@ -85,6 +86,7 @@ STOP_ERROR_CODES: dict[StopReason, str] = {
     StopReason.MODEL_ERROR: "model_error",
     StopReason.NO_PROGRESS: "empty_model_response",
     StopReason.CANCELLED: "cancelled",
+    StopReason.BUDGET_STORE_UNAVAILABLE: "budget_store_unavailable",
 }
 
 STOP_MESSAGES: dict[StopReason, str] = {
@@ -96,6 +98,9 @@ STOP_MESSAGES: dict[StopReason, str] = {
     StopReason.MODEL_ERROR: "模型调用失败，结果无法确认。",
     StopReason.NO_PROGRESS: "模型连续返回空内容，无法确认结果。",
     StopReason.CANCELLED: "执行已被取消，此前的动作可能已经生效，须人工核实。",
+    StopReason.BUDGET_STORE_UNAVAILABLE: (
+        "共享预算账本不可用，无法确认本次执行是否已消耗额度；未开始调用。"
+    ),
 }
 
 
@@ -150,6 +155,7 @@ class HarnessExecutor(Executor):
         leases: StepLeaseStore | None = None,
         lease_ttl_seconds: float = 0.0,
         cancellations: CancelRegistry | None = None,
+        budget_ledger: BudgetLedger | None = None,
         prompt_builder: Callable[[ExecutionRequest, ToolGrant], tuple[str, str]] | None = None,
     ) -> None:
         self._registry = registry
@@ -172,6 +178,8 @@ class HarnessExecutor(Executor):
         # 取消登记表由装配层持有：取消方（HTTP 线程）与执行方（执行线程）
         # 必须看到同一个对象，否则取消只是账面上的一句话。
         self._cancellations = cancellations
+        # 共享预算账本：None 时预算只在本次执行的进程内累计（默认，单机行为不变）。
+        self._budget_ledger = budget_ledger
         self._prompt_builder = prompt_builder or default_step_prompt
         self._loop = AgentLoop(
             client,
@@ -182,6 +190,7 @@ class HarnessExecutor(Executor):
             model_retries=model_retries,
             model_retry_backoff_seconds=model_retry_backoff_seconds,
             tool_concurrency=tool_concurrency,
+            budget_ledger=budget_ledger,
         )
 
     def execute(self, request: ExecutionRequest) -> ExecutionResult:
