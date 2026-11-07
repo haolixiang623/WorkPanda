@@ -40,6 +40,8 @@ class EventType(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    # 运营人员的人工处置备注。只追加事实，不改变任务状态，也不下发给群众。
+    OPERATOR_NOTE = "operator_note"
 
 
 class Task(BaseModel):
@@ -95,6 +97,24 @@ class TaskAnswerRequest(BaseModel):
 class TaskConfirmRequest(BaseModel):
     step_id: str = Field(min_length=1, max_length=128)
     accepted: bool = True
+
+
+class TaskNoteRequest(BaseModel):
+    """运营人员追加的处置备注。
+
+    刻意**没有** `status` 字段：这个入口只能补充事实，不能表达"把任务改成
+    什么"。少一个字段就少一条覆写状态的路径，也就少一类"库里的结论和现实
+    不一致、还查不出是谁改的"事故。
+
+    `operator` 是自述字段而不是鉴权身份——运维凭据当前是共享的，服务端无法
+    证明是谁在操作。它只用于留痕，不能作为追责依据；换成每操作者独立凭据
+    之前，不要把涉及处罚的判断建立在这个字段上。
+    """
+
+    operator: str = Field(min_length=1, max_length=64)
+    note: str = Field(min_length=1, max_length=1000)
+    # 外部依据（工单号、对方系统回执号等），便于日后复核时不必再问一遍。
+    reference: str | None = Field(default=None, max_length=200)
 
 
 class TaskView(BaseModel):

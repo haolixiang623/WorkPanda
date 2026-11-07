@@ -21,6 +21,7 @@ from workpanda.api.security import get_principal
 from workpanda.bootstrap import Container
 from workpanda.domain.identity import Principal
 from workpanda.domain.models import (
+    EventType,
     TaskAnswerRequest,
     TaskConfirmRequest,
     TaskCreateRequest,
@@ -29,6 +30,11 @@ from workpanda.domain.models import (
 )
 
 router = APIRouter(prefix="/api")
+
+# 只给运维看的事件类型：绝不进入群众侧事件流。
+# 运营备注里写的多是"疑似重复申请，已电话核实""对方系统显示已办结，待回单"
+# 这类内部判断，直接推给群众等于把内部口径和核查线索一起泄出去。
+_OPERATOR_ONLY_EVENTS: frozenset[EventType] = frozenset({EventType.OPERATOR_NOTE})
 
 
 def _sse(event: TaskEvent) -> dict[str, str]:
@@ -105,7 +111,11 @@ async def task_events(
         last_sent = after
         async with container.broker.subscribe(task_id) as queue:
             for event in container.tasks.events(task_id, principal.subject, after_sequence=after):
+                # 游标按读到的事件前进，即使这条不发送：否则备注一旦排在末尾，
+                # last_sent 就原地不动，每轮 keepalive 都要把它重扫一遍。
                 last_sent = event.sequence
+                if event.type in _OPERATOR_ONLY_EVENTS:
+                    continue
                 yield _sse(event)
 
             while True:
@@ -120,6 +130,8 @@ async def task_events(
                     task_id, principal.subject, after_sequence=last_sent
                 ):
                     last_sent = event.sequence
+                    if event.type in _OPERATOR_ONLY_EVENTS:
+                        continue
                     yield _sse(event)
 
     return EventSourceResponse(stream())

@@ -103,12 +103,17 @@ export WORKPANDA_OCTOP_WORKSPACE=...          # 必须是绝对路径或可解�
 
 ## 4. 控制台接入
 
-### 4.1 服务端提供的只读接口
+除 `POST /api/ops/tasks/{task_id}/notes`（追加人工处置备注）外，服务端提供的运维接口
+全部只读。备注不改状态、不推进流程、不下发群众，决策依据见
+[`DECISION-OPERATOR-NOTES.md`](DECISION-OPERATOR-NOTES.md)。
+
+### 4.1 服务端提供的运维接口
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/ops/tasks?limit=&status=&flow_id=&since=&until=&cursor=` | 按创建时间倒序列出任务 |
 | GET | `/api/ops/tasks/{task_id}` | 任务详情 |
+| POST | `/api/ops/tasks/{task_id}/notes` | 追加人工处置备注（**唯一写入口**，不改状态） |
 | GET | `/api/ops/tasks/{task_id}/events?after=&type=&since=&until=&limit=&cursor=` | 事件流（含澄清、确认、执行结果、转人工） |
 | GET | `/api/ops/traces?task_id=&limit=&outcome=&stop_reason=&risk=&since=&until=&cursor=` | 执行留痕 |
 | GET | `/api/ops/traces/summary` | 留痕聚合指标（未确认占比、被拦/超时调用、token 等） |
@@ -153,7 +158,18 @@ scope，跨端点复用会得到 `400 invalid_cursor`，不会"看起来正常�
 3. 只透传白名单字段并截断字符串，不展示会话标识、失败原文、槽位内容；
 4. 凭据走 `ops_token` 插件配置或 `WORKPANDA_OPS_TOKEN` 环境变量，
    单独下发、不复用模型 API Key、不硬编码、不回显；
-5. 需要人工处置时走既定转人工渠道，不直接修改 Task Store。
+5. 需要人工处置时走既定转人工渠道，不直接修改 Task Store；只有"补充事实"
+   （`POST /api/ops/tasks/{task_id}/notes`）在服务端存在，并且不改状态。
+
+插件侧仍然没有写工具：备注入口只在服务端 API，控制台 UI 不暴露它。
+原因很实际——插件拿的是同一个共享 `ops_token`，一旦开放写工具，模型也可能
+被说服去调用它。
+
+永久禁止（不得以"运维方便"为由实现，理由见决策文档第 4 节）：
+
+1. **重放** `outcome_unconfirmed` / `failed` 的步骤——可能让已提交的副作用再发生一次；
+2. 把任意状态**覆写**成 `completed` / `failed`——把虚假成功制度化；
+3. 绕过群众确认**签发凭证**——确认语义只能由群众侧完成。
 
 ### 4.3 本机试点部署（持久化）
 

@@ -24,6 +24,7 @@ from workpanda.domain.models import (
     TaskConfirmRequest,
     TaskCreateRequest,
     TaskEvent,
+    TaskNoteRequest,
     TaskStatus,
     utc_now,
 )
@@ -161,6 +162,28 @@ class TaskService:
         except StaleTaskState as exc:
             raise TaskConflict("任务状态已变化，本次取消未生效，请刷新后重试") from exc
         return task
+
+    # ---------- 运维：人工处置备注（只追加事实，不改状态） ----------
+
+    def add_operator_note(self, task_id: UUID, request: TaskNoteRequest) -> TaskEvent:
+        """追加一条运营备注。**任何状态都允许，包括终态。**
+
+        这条能力存在的唯一理由：运营在系统外核实了事实（对方系统其实办成了、
+        群众已电话撤销、单据号对上了），而这件事实在当前系统里没有任何地方可
+        以留痕。它解决的是"记录与现实对不上"，不是"让运营代替群众推进流程"。
+
+        为什么不做条件写：条件写的意义是"我的决策基于我读到的这个状态"。备注
+        不做决策、不改状态，因此不需要这一层；反过来，如果走 `commit` 写整行，
+        就会把入口读到的旧快照里 `slots`、`completed_steps` 一并写回去，覆盖
+        掉期间 `answer` 刚写入的新值。所以这里只 `append_event`：它不是放宽了
+        条件写的门禁，而是根本不碰状态那一路。
+        """
+
+        task = self.store.get(task_id)
+        data: dict[str, Any] = {"operator": request.operator, "note": request.note}
+        if request.reference:
+            data["reference"] = request.reference
+        return self.store.append_event(task_id, EventType.OPERATOR_NOTE, task.status, data)
 
     # ---------- 查询 ----------
 
