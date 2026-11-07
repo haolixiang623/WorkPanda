@@ -138,3 +138,46 @@ def test_ops_traces_require_token() -> None:
 
     assert client.get("/api/ops/traces").status_code == 401
     assert client.get("/api/ops/traces/summary").status_code == 401
+
+
+def test_ops_tool_runtime_reports_absence_without_harness() -> None:
+    """没有 harness 就没有工具线程，接口要说"没有"，而不是编一排 0 出来。"""
+
+    client, _ = make_client(ops_token=OPS_TOKEN)
+
+    response = client.get(
+        "/api/ops/tool-runtime", headers={"X-WorkPanda-Ops-Token": OPS_TOKEN}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"available": False}
+
+
+def test_ops_tool_runtime_reports_the_ledger_when_harness_is_in_use() -> None:
+    container = build_container(
+        Settings(
+            store_backend="memory",
+            enable_demo_flow=False,
+            ops_token=OPS_TOKEN,
+            # 本机 .env 可能配了真实模型凭据；只要分支走 harness 即可，不发真实调用。
+            harness_enabled=True,
+            model_base_url="http://127.0.0.1:9/v1",
+            model_api_key="sk-test-not-a-real-key",
+        ),
+        flows=TEST_FLOWS,
+    )
+    client = TestClient(create_app(container=container))
+    client.headers.update({SESSION_HEADER: container.signer.issue()})
+    try:
+        response = client.get(
+            "/api/ops/tool-runtime", headers={"X-WorkPanda-Ops-Token": OPS_TOKEN}
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["available"] is True
+        assert body["live"] == 0
+        assert body["stuck"] == 0
+        assert body["max_stuck"] == 16
+    finally:
+        container.close()

@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     # 只有整批都是幂等工具、且整批放得进剩余调用预算时才会真的并发；
     # 工具本身必须线程安全，第三方工具有共享状态时保持 1。
     harness_tool_concurrency: int = 1
+    # 允许"已超时但仍未退出"的工具线程数上限；触顶后拒绝发起新的工具调用
+    # （BLOCKED `tool_capacity`，确定没执行）。超时的线程无法被强制终止，
+    # 不设上限时它们会在真实长任务里悄悄堆到耗尽句柄。0 表示关闭这道闸门。
+    harness_max_stuck_threads: int = 16
     # 落盘与运维接口的脱敏开关。默认开启；除非有明确理由，否则不要关。
     harness_redact: bool = True
     # 进程内 trace 保留条数上限，避免留痕变成无限增长的内存占用。

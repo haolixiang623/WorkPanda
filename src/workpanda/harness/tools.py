@@ -46,6 +46,86 @@ class ToolTimeout(Exception):
     """工具未在限期内返回。此时结果未知：可能已产生副作用。"""
 
 
+# 允许"超时后仍在跑"的工具线程数上限。默认给一个不苛刻的值：正常超时是偶发的，
+# 只有在同一个进程里反复卡住工具时才会触顶——那时问题已经不是某一次调用了。
+DEFAULT_MAX_STUCK_THREADS = 16
+
+
+class _RunningCall:
+    """一次已启动的工具调用。超时后线程仍在跑，必须先记着它，才数得清还剩几个。
+
+    `release` 由工作线程在 `finally` 里调用，`abandon` 由放弃等待的主线程调用——
+    两个方向都要能摘账，所以这里持有账本本身的引用，而不是让调用方先查一遍。
+    """
+
+    __slots__ = ("name", "abandoned", "started", "_ledger")
+
+    def __init__(self, ledger: RunningToolThreads, name: str) -> None:
+        self.name = name
+        self.abandoned = False
+        self.started = time.monotonic()
+        self._ledger = ledger
+
+    def release(self) -> None:
+        self._ledger.release(self)
+
+    def abandon(self) -> None:
+        self._ledger.abandon(self)
+
+
+class RunningToolThreads:
+    """在册的工具线程数与"超时后仍在跑"的数量。
+
+    为什么要单独记账：超时的实现是"放弃等待"，线程本身跑到自然结束才消失。
+    只按每次调用新起线程、又只关心返回值，进程里到底堆了多少个卡住的线程就没人
+    知道——真实长任务里这正是内存与句柄被悄悄吃光的路径。
+
+    触顶时**拒绝发起新调用**（`tool_capacity`，BLOCKED，确定没执行），而不是继续
+    起线程：状态不明时不再产生新动作，与租约、取消信号同一个口径。上限设 0 表示
+    关闭这道闸门（行为与加入本机制前一致）。
+    """
+
+    def __init__(self, max_stuck: int = DEFAULT_MAX_STUCK_THREADS) -> None:
+        self._max_stuck = max(0, max_stuck)
+        self._live: dict[int, _RunningCall] = {}
+        self._lock = threading.Lock()
+
+    def acquire(self, name: str) -> _RunningCall | None:
+        """登记一次即将启动的调用。返回 None 表示已触顶，不应再起线程。"""
+
+        with self._lock:
+            if self._max_stuck:
+                stuck = sum(1 for call in self._live.values() if call.abandoned)
+                if stuck >= self._max_stuck:
+                    return None
+            call = _RunningCall(self, name)
+            self._live[id(call)] = call
+            return call
+
+    def release(self, call: _RunningCall) -> None:
+        """线程真正结束时调用（由工作线程自己执行）。超时后也照样要等到这一刻。"""
+
+        with self._lock:
+            self._live.pop(id(call), None)
+
+    def abandon(self, call: _RunningCall) -> None:
+        """主线程放弃等待：调用已超时，但线程可能还在跑，继续计入"卡住"。"""
+
+        with self._lock:
+            moved = self._live.get(id(call))
+            if moved is not None:
+                moved.abandoned = True
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "live": len(self._live),
+                "stuck": sum(1 for call in self._live.values() if call.abandoned),
+                "max_stuck": self._max_stuck,
+            }
+
+
+
 class ToolContext(BaseModel):
     """执行上下文。工具不得读取此对象之外的任何环境信息。"""
 
@@ -65,10 +145,16 @@ class Tool(Protocol):
 
 
 class ToolRegistry:
-    """工具注册表。注册即声明能力，不代表任何步骤都能调用。"""
+    """工具注册表。注册即声明能力，不代表任何步骤都能调用。
 
-    def __init__(self) -> None:
+    `threads` 记账的是"这个进程里还跑着几个工具线程"，属于进程级资源，
+    因此放在注册表而不是单次执行的 `ToolGrant` 上：上一轮卡住没退出的线程，
+    下一轮也必须看得见，否则同一个进程会被反复堆线程直到耗尽。
+    """
+
+    def __init__(self, *, max_stuck_threads: int = DEFAULT_MAX_STUCK_THREADS) -> None:
         self._tools: dict[str, Tool] = {}
+        self.threads = RunningToolThreads(max_stuck=max_stuck_threads)
 
     def register(self, tool: Tool) -> None:
         name = tool.spec.name
@@ -207,11 +293,31 @@ class ToolGrant:
                     risk=spec.risk,
                     attempts=attempts,
                 )
+            # 起线程之前先记账：触顶时不再堆线程。拒绝发生在执行之前，
+            # 因此这是"确定没执行"，可以安全地按 BLOCKED 入账。
+            handle = self.registry.threads.acquire(spec.name)
+            if handle is None:
+                stats = self.registry.threads.stats()
+                return self._record(
+                    call,
+                    ToolOutcome.BLOCKED,
+                    (
+                        f"进程内有 {stats['stuck']} 个已超时但仍未退出的工具线程"
+                        f"（上限 {stats['max_stuck']}），为避免继续堆积，本次调用未执行。"
+                        "请人工核实卡住的工具并重启进程。"
+                    ),
+                    started=started,
+                    error_code="tool_capacity",
+                    risk=spec.risk,
+                    attempts=attempts,
+                )
             try:
                 content = _invoke_with_timeout(
-                    tool, call.arguments, context, remaining, spec.name
+                    tool, call.arguments, context, remaining, spec.name, handle
                 )
             except ToolTimeout:
+                # 线程还在跑：留在册上继续计入"卡住"，等它自己结束时才摘掉。
+                self.registry.threads.abandon(handle)
                 return self._record(
                     call,
                     ToolOutcome.TIMEOUT,
@@ -385,11 +491,15 @@ def _invoke_with_timeout(
     context: ToolContext,
     timeout: float,
     name: str,
+    handle: _RunningCall,
 ) -> str:
     """在独立线程里执行工具并等待，超时即放弃等待。
 
     说明（已知代价）：超时后工作线程无法被强制终止，它会继续跑到自然结束。
     这比"主流程被一个卡死的工具拖住"要好，但工具本身仍必须自带超时与幂等。
+
+    `handle` 是线程记账的凭据：线程结束时自己摘掉（`finally` 里做，异常路径也不漏），
+    主线程超时后只把它标成"已放弃"，不摘——线程还活着，账上就该还记着。
     """
 
     outcome: dict[str, Any] = {}
@@ -402,9 +512,15 @@ def _invoke_with_timeout(
             outcome["error"] = exc
         finally:
             finished.set()
+            handle.release()
 
     thread = threading.Thread(target=runner, name=f"tool-{name}", daemon=True)
-    thread.start()
+    try:
+        thread.start()
+    except BaseException:
+        # 起不了线程（句柄耗尽等）：把账上那条摘掉，否则会永久占掉一个名额。
+        handle.release()
+        raise
     if not finished.wait(timeout):
         raise ToolTimeout(name)
 

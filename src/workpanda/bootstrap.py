@@ -55,6 +55,8 @@ class Container:
     audit: AuditJournal
     # 取消登记表由容器持有：取消方与执行方看到的必须是同一个对象。
     cancellations: CancelRegistry
+    # 工具线程台账：超时后仍在跑的线程数。只有 harness 分支才有，其余为 None。
+    tool_threads: Callable[[], dict[str, int]] | None = None
     closers: list = field(default_factory=list)
 
     def close(self) -> None:
@@ -186,12 +188,19 @@ def build_container(
     audit, audit_closers = build_audit_journal(settings)
     closers.extend(audit_closers)
 
+    # 只有 harness 分支自己起工具线程，台账也只在那里存在。
+    tool_threads: Callable[[], dict[str, int]] | None = None
+
     if executor is None:
         # 优先级：通用 harness > Octop 运行时 > 脚手架执行器。
         # harness 用的是我们自己的受控循环（工具白名单 + 预算 + 留痕），
         # Octop 运行时作为备选：它能执行步骤，但工具循环不由我们控制。
         if settings.harness_enabled and settings.model_configured:
-            tool_registry, tool_closers = default_registry(allowed_hosts=settings.allowed_hosts)
+            tool_registry, tool_closers = default_registry(
+                allowed_hosts=settings.allowed_hosts,
+                max_stuck_threads=settings.harness_max_stuck_threads,
+            )
+            tool_threads = tool_registry.threads.stats
             model_client = OpenAICompatibleClient(
                 base_url=settings.model_base_url or "",
                 api_key=settings.model_api_key or "",
@@ -287,5 +296,6 @@ def build_container(
         traces=traces,
         audit=audit,
         cancellations=cancellations,
+        tool_threads=tool_threads,
         closers=closers,
     )
