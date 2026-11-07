@@ -1,7 +1,7 @@
 # Octop 集成说明
 
 > 范围：说明 WorkPanda 如何接入 Octop-Harness 运行时，以及 Octop 控制台与 WorkPanda 的职责划分。
-> 现状：运行时适配已实现，真实模型端到端已跑通（含结构化结果契约）；控制台对接只完成服务端只读接口，**插件尚未实现**。
+> 现状：运行时适配已实现，真实模型端到端已跑通（含结构化结果契约）；只读控制台插件已实现（`plugins/workpanda-ops/`），并在本机 Octop 实例上完成安装与加载验证（见第 4 节）。Dashboard 浏览器内的真实渲染仍待走查。
 
 ## 1. 相关上游项目
 
@@ -110,6 +110,10 @@ export WORKPANDA_OCTOP_WORKSPACE=...          # 必须是绝对路径或可解�
 | GET | `/api/ops/tasks?limit=&status=` | 按创建时间倒序列出任务 |
 | GET | `/api/ops/tasks/{task_id}` | 任务详情 |
 | GET | `/api/ops/tasks/{task_id}/events?after=` | 事件流（含澄清、确认、执行结果、转人工） |
+| GET | `/api/ops/traces?task_id=&limit=` | 执行留痕 |
+| GET | `/api/ops/traces/summary` | 留痕聚合指标（未确认占比、被拦/超时调用、token 等） |
+| GET | `/api/ops/audit?limit=` | 审计归档条目 |
+| GET | `/api/ops/tool-runtime` | 工具线程台账与容量闸门（第十一轮新增） |
 
 鉴权：请求头 `X-WorkPanda-Ops-Token` 必须等于 `WORKPANDA_OPS_TOKEN`。
 
@@ -117,16 +121,54 @@ export WORKPANDA_OCTOP_WORKSPACE=...          # 必须是绝对路径或可解�
 - 凭据错误返回 401；
 - 群众会话令牌**不能**访问运维接口。
 
-### 4.2 控制台侧的做法
+### 4.2 只读插件（已实现）
 
-Octop 控制台支持通过插件注入自定义 UI 与 Hook/Tool/Skill。推荐：
+插件源码在 `plugins/workpanda-ops/`，遵循 Octop `docs/plugin-package.md`：
 
-1. 写一个只读 Octop 插件，调用上述接口渲染任务列表、状态分布和失败事件；
-2. 插件只展示，不提供"改状态""重试执行"按钮；
-3. 需要人工处置时，跳转到人工工单或联系渠道，而不是直接修改 Task Store；
-4. 插件凭据单独下发，不复用模型 API Key。
+- `plugin.yaml`：`kind: tool`，`ui.entry: ui/dist/index.js`、`ui.manifest: ui/dist/manifest.json`；
+- `main.py`：`setup(ctx)` 注册 4 个读工具（overview / tasks / traces / audit），返回
+  `octop_ui` envelope；零第三方依赖（仅标准库，安装时不会触发 pip 拉包）；
+- `ui/dist/index.js`：自包含 ESM，`setup(host)` 注册 `workpanda_ops` 渲染器，
+  用宿主注入的 `window.__OCTOP_REACT__.createElement` 渲染指标卡片与只读表格。
 
-这部分**尚未实现**：插件属于 Octop 一侧的交付物，需要先有可访问的 Octop 实例。
+规范要点（官方 `plugin-package.md`）：`kind` 是 `tool`/`skill`/`hook`/`channel`
+**四选一**，`setup` 只能注册与该 kind 对应的方法；`ui` 是可选附加项，并非
+「一个插件同时注入 UI + Hook + Tool + Skill」。UI 必须是预构建 ESM，
+安装时不跑 `npm install`，不能有相对 import。
+
+只读边界：
+
+1. 只发 `GET`，URL 路径是代码内常量，不接受调用方传入地址；
+2. 不注册改状态、重试执行、取消任务等任何写入口；
+3. 只透传白名单字段并截断字符串，不展示会话标识、失败原文、槽位内容；
+4. 凭据走 `ops_token` 插件配置或 `WORKPANDA_OPS_TOKEN` 环境变量，
+   单独下发、不复用模型 API Key、不硬编码、不回显；
+5. 需要人工处置时走既定转人工渠道，不直接修改 Task Store。
+
+### 4.3 本机试点部署与验证
+
+- Octop 平台：`octop 1.0.2`（PyPI wheel，隔离 venv `/tmp/wp-octop-venv`），
+  数据目录 `/tmp/wp-octop-home/.octop`；端口 **8090**（本机 8088 已被
+  Apache Tomcat 占用，不能用默认值）；
+- WorkPanda 服务：`uvicorn workpanda.main:app --app-dir src --port 8010`，
+  插件经 `WORKPANDA_OPS_BASE_URL=http://127.0.0.1:8010` 访问；
+- 凭据：admin 口令由 `octop init --yes` 非交互创建，运维凭据经环境变量注入，
+  两者都不入库；
+- 安装：`octop plugin install <插件目录> --force`（1.0.2 的 `plugin install`
+  只接受目录或 URL，**不接受本地 zip 路径**）；随后调用
+  `POST /api/plugins/reload` 使插件进入 loaded 状态。CLI `octop plugin list`
+  的 `[not loaded]` 是离线读 DB 的静态字段，应以 `/api/plugins` 的
+  `loaded` / `registration_error` 为准。
+
+已验证（本机）：`/api/plugins` 返回 `loaded: true`、`registration_error: null`、
+4 个工具与 `ui` 声明齐全；UI ESM 与 manifest 端点均 200；在 Octop 自身 venv
+里 4 个工具真实取到 WorkPanda 数据（聚合指标、任务 6 条、留痕 2 条）；
+缺凭据时如实报错而非伪装成功；源码无写操作；`ruff check .` 全过、
+`pytest` 303 passed。
+
+未验证：Dashboard 浏览器内的真实渲染与交互（需登录控制台并在聊天中调用工具）、
+多用户权限隔离、以及生产部署形态。当前实例位于 `/tmp`，重启或清理后不持久，
+正式试点需换成持久数据目录并配置 HTTPS 与访问控制。
 
 ## 5. 已验证与未验证
 
@@ -139,7 +181,7 @@ Octop 控制台支持通过插件注入自定义 UI 与 Hook/Tool/Skill。推荐
 
 未验证：
 
-- **Octop 控制台插件**：未实现，也未在真实 Octop 实例上验证；
+- **Octop 控制台插件**：已实现并在本机 Octop 1.0.2 实例上完成安装、加载与工具取数验证（第 4.3 节）；浏览器内真实渲染、多用户隔离与生产部署形态仍未验证；
 - **并发与多实例**：运行时每个进程各建一个 Agent，多实例的会话与限流一致性未验证；
 - **浏览器类工具**：`octop-browser` 随 SDK 安装，但 WorkPanda 尚未启用，也未做域白名单与用户隔离验证；
 - **真实业务工具**：当前步骤由模型按 `instruction` 直接完成，尚未接入任何外部业务系统；接入时需补工具白名单与幂等设计。

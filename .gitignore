@@ -37,3 +37,8 @@ out/
 
 # Octop 运行时工作区
 .octop/
+
+# Octop 插件 UI 是手写的自包含 ESM 源码（安装时不跑 npm build），不是构建产物，
+# 必须纳入版本控制；上面的 dist/ 规则会误伤。
+!plugins/workpanda-ops/ui/dist/
+!plugins/workpanda-ops/ui/dist/*

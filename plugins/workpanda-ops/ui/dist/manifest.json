@@ -1,0 +1,13 @@
+{
+  "renderers": [
+    {
+      "id": "workpanda_ops",
+      "tools": [
+        "workpanda_ops_overview",
+        "workpanda_ops_tasks",
+        "workpanda_ops_traces",
+        "workpanda_ops_audit"
+      ]
+    }
+  ]
+}

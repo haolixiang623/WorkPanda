@@ -1,0 +1,11 @@
+id: workpanda-ops
+version: 0.1.0
+name: WorkPanda 运维只读
+description: 只读查看 WorkPanda 的任务、执行留痕与聚合指标；不写业务状态
+icon: "🐼"
+kind: tool
+entry: main.py
+group: ops
+ui:
+  entry: ui/dist/index.js
+  manifest: ui/dist/manifest.json
