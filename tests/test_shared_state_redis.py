@@ -278,6 +278,44 @@ def test_budget_ledger_failure_is_refused(redis_server: FakeRedisServer) -> None
     assert caught.value.reason == "budget_store_unavailable"
 
 
+def test_zero_limit_still_refuses_instead_of_becoming_unlimited(
+    host_a: RedisSharedState,
+) -> None:
+    """`limit=0` 必须照旧拒绝，不能被账本读成"不限"。
+
+    进程内语义里步数与调用次数的 0 是"一次都不许"（`_steps >= 0` 立刻拒绝），
+    只有 token 的 0 才是"不限"。账本若把两者混为一谈，配错一个 0 就会把上限
+    整条抹掉——那是 fail-open，比拒绝危险得多。
+    """
+
+    task_id = uuid.uuid4()
+    budget = Budget(
+        max_steps=0, max_tool_calls=0, ledger=_ledger(host_a), task_id=task_id, step_id="s"
+    )
+
+    with pytest.raises(BudgetExhausted) as caught:
+        budget.consume_step()
+    assert caught.value.reason == "max_steps"
+    with pytest.raises(BudgetExhausted) as caught:
+        budget.consume_tool_call()
+    assert caught.value.reason == "max_tool_calls"
+    # 被拒的那次必须回滚，不能留下用量把后续真额度也算歪。
+    assert _ledger_total(host_a, task_id, "steps") == 0
+    assert _ledger_total(host_a, task_id, "tool_calls") == 0
+
+
+def test_zero_token_limit_is_unlimited_through_the_ledger(host_a: RedisSharedState) -> None:
+    """`max_tokens=0` 是"不限"：接上账本后这个语义不能变。"""
+
+    task_id = uuid.uuid4()
+    budget = Budget(max_tokens=0, ledger=_ledger(host_a), task_id=task_id, step_id="s")
+
+    budget.consume_tokens(10_000)
+    budget.consume_tokens(10_000)
+    assert budget.tokens == 20_000
+    assert _ledger_total(host_a, task_id, "tokens") == 20_000
+
+
 def test_budget_without_ledger_is_unchanged() -> None:
     """默认路径必须与之前完全一致：没有账本时仍按进程内计数。"""
 

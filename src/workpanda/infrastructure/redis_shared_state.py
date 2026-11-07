@@ -146,7 +146,9 @@ class RedisBudgetLedger:
             return 0
         key = budget_key(self._state.prefix, task_id, step_id)
         total = self._state.add(key, counter, delta, self._ttl_seconds)
-        if limit > 0 and total > limit:
+        # `limit` 为负才是"不限"；0 是"一点额度都没有"，必须照常拒绝。
+        # 把 0 当不限会静默抹掉上限：进程内 0 步立刻拒绝，账本里却放行任意多。
+        if limit >= 0 and total > limit:
             self._state.add(key, counter, -delta, self._ttl_seconds)
             return None
         return total

@@ -25,12 +25,19 @@ class BudgetExhausted(Exception):
         self.reason = reason
 
 
+# 账本里"不限"的写法。必须与 0 区分开：步数与调用次数的 0 在进程内语义是
+# "一次都不许"（`_steps >= 0` 立刻拒绝），只有 token 的 0 才是"不限"。
+# 如果把两者都写成 0，账本会把它读成"不限"，等于把上限整条抹掉——那是 fail-open。
+UNLIMITED_LEDGER_LIMIT = -1
+
+
 class BudgetLedger(Protocol):
     """跨主机共享的用量账本。
 
-    `reserve` 必须原子累加并返回累加后的总量；超过 `limit`（0 表示不限）时回滚
-    并返回 None，让调用方按"预算耗尽"收口。后端不可用时抛异常——调用方会把它
-    翻译成 `budget_store_unavailable`，结论是未确认，绝不"先跑了再说"。
+    `reserve` 必须原子累加并返回累加后的总量；超过 `limit` 时回滚并返回 None，
+    让调用方按"预算耗尽"收口。`limit` 为负数表示不限（见
+    `UNLIMITED_LEDGER_LIMIT`），0 表示一点额度都没有。后端不可用时抛异常——
+    调用方会把它翻译成 `budget_store_unavailable`，结论是未确认，绝不"先跑了再说"。
     """
 
     def reserve(
@@ -174,7 +181,10 @@ class Budget:
         if tokens <= 0:
             return
         if self.ledger is not None:
-            self._tokens = self._reserve("tokens", tokens, self.max_tokens, "max_tokens")
+            # token 的 0 是"不限"，要换成账本能理解的负数；其余计数器直接传，
+            # 0 在那里表示"一次都不许"，由账本按拒绝处理。
+            limit = self.max_tokens if self.max_tokens > 0 else UNLIMITED_LEDGER_LIMIT
+            self._tokens = self._reserve("tokens", tokens, limit, "max_tokens")
             return
         self._tokens += tokens
         if self.max_tokens > 0 and self._tokens > self.max_tokens:
