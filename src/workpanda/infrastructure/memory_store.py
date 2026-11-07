@@ -8,7 +8,7 @@ from uuid import UUID
 
 from workpanda.domain.confirmation import Confirmation, ConfirmationError
 from workpanda.domain.models import EventType, Task, TaskEvent, TaskStatus, utc_now
-from workpanda.domain.repository import TaskNotFoundError
+from workpanda.domain.repository import PendingEvent, StaleTaskState, TaskNotFoundError
 
 
 class InMemoryTaskStore:
@@ -35,6 +35,40 @@ class InMemoryTaskStore:
                 raise TaskNotFoundError(str(task.task_id))
             self._tasks[task.task_id] = task.model_copy(deep=True)
         return task
+
+    def commit(
+        self,
+        task: Task,
+        events: Sequence[PendingEvent] = (),
+        *,
+        expected_status: TaskStatus | None = None,
+    ) -> Sequence[TaskEvent]:
+        with self._lock:
+            current = self._tasks.get(task.task_id)
+            if current is None:
+                raise TaskNotFoundError(str(task.task_id))
+            # 校验必须早于任何写入：状态不符时连一条事件都不能留下。
+            if expected_status is not None and current.status is not expected_status:
+                raise StaleTaskState(
+                    f"task {task.task_id} is {current.status.value}, "
+                    f"expected {expected_status.value}"
+                )
+            stream = self._events[task.task_id]
+            sequence = len(stream)
+            written: list[TaskEvent] = []
+            for pending in events:
+                sequence += 1
+                event = TaskEvent(
+                    task_id=task.task_id,
+                    type=pending.type,
+                    status=pending.status,
+                    sequence=sequence,
+                    data=dict(pending.data),
+                )
+                stream.append(event)
+                written.append(event)
+            self._tasks[task.task_id] = task.model_copy(deep=True)
+        return tuple(written)
 
     def append_event(
         self,

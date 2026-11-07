@@ -26,7 +26,13 @@ from workpanda.domain.models import (
     TaskStatus,
     utc_now,
 )
-from workpanda.domain.repository import ConfirmationStore, TaskNotFoundError, TaskStore
+from workpanda.domain.repository import (
+    ConfirmationStore,
+    PendingEvent,
+    StaleTaskState,
+    TaskNotFoundError,
+    TaskStore,
+)
 
 BLOCKED_STATUSES: frozenset[TaskStatus] = frozenset(
     {
@@ -117,8 +123,9 @@ class TaskService:
 
     def cancel(self, task_id: UUID, subject: str) -> Task:
         task = self._owned(task_id, subject)
-        if task.status in BLOCKED_STATUSES:
-            raise TaskConflict(f"task in {task.status} state cannot be cancelled")
+        expected_status = task.status
+        if expected_status in BLOCKED_STATUSES:
+            raise TaskConflict(f"task in {expected_status} state cannot be cancelled")
 
         if self.cancellations is not None:
             # 状态翻转只是账面上的。正在跑的执行必须收到信号，否则它会把剩下的
@@ -133,8 +140,24 @@ class TaskService:
             self.confirmations.revoke(task.task_id, task.current_step)
         task.status = TaskStatus.CANCELLED
         task.updated_at = utc_now()
-        self.store.save(task)
-        self.runner.emit(task, EventType.CANCELLED, {"step_id": task.current_step})
+        # 与执行结果落地用同一套仲裁：只有库里的状态仍是我们读到的那一版，
+        # 这次取消才生效。执行侧若先一步写出终态，说明它已经完成，取消必须
+        # 失败让调用方刷新，而不是反过来把完成覆盖掉。CANCELLED 事件与状态
+        # 同生共死，绝不出现"界面显示已取消、事件里却没有这条记录"的错位。
+        try:
+            self.runner.commit_guarded(
+                task,
+                [
+                    PendingEvent(
+                        type=EventType.CANCELLED,
+                        status=TaskStatus.CANCELLED,
+                        data={"step_id": task.current_step},
+                    )
+                ],
+                expected_status=expected_status,
+            )
+        except StaleTaskState as exc:
+            raise TaskConflict("任务状态已变化，本次取消未生效，请刷新后重试") from exc
         return task
 
     # ---------- 查询 ----------
