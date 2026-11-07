@@ -71,11 +71,14 @@ uvicorn workpanda.main:app --app-dir src --reload
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/ops/tasks` | 列出任务，支持 `limit`、`status` |
+| GET | `/api/ops/tasks` | 列出任务，支持 `limit`、`status`、`flow_id`、`since`/`until`、`cursor` |
 | GET | `/api/ops/tasks/{task_id}` | 任务详情 |
-| GET | `/api/ops/tasks/{task_id}/events` | 事件列表 |
-| GET | `/api/ops/traces` | 执行留痕，支持 `task_id`、`limit` |
+| GET | `/api/ops/tasks/{task_id}/events` | 事件列表，支持 `after`、`type`、`since`/`until`、`limit` |
+| GET | `/api/ops/traces` | 执行留痕，支持 `task_id`、`limit`、`outcome`/`stop_reason`/`risk`、`cursor` |
 | GET | `/api/ops/traces/summary` | 执行指标聚合，支持 `task_id` |
+| GET | `/api/ops/audit` | 审计归档，支持 `task_id`、`kind`、`since`/`until`、`cursor` |
+
+列表接口的响应体是数组，翻页靠 `X-Next-Cursor` 响应头（没有这个头就是到头了）。
 
 任务按会话隔离：访问不属于自己的任务返回 404，不暴露任务是否存在。超限返回 429 并带 `Retry-After`。
 

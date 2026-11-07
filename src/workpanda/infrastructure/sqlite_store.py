@@ -15,6 +15,14 @@ from uuid import UUID
 
 from workpanda.domain.confirmation import Confirmation, ConfirmationError
 from workpanda.domain.models import EventType, Task, TaskEvent, TaskStatus, utc_now
+from workpanda.domain.paging import (
+    EventPage,
+    EventQuery,
+    TaskPage,
+    TaskQuery,
+    canonical_stamp,
+    encode_token,
+)
 from workpanda.domain.repository import PendingEvent, StaleTaskState, TaskNotFoundError
 
 SCHEMA = """
@@ -58,15 +66,102 @@ CREATE TABLE IF NOT EXISTS confirmations (
     expires_at TEXT NOT NULL,
     consumed_at TEXT
 );
+
+-- 键集翻页按 (created_at, task_id) 倒序走，这条索引让"比锚点更旧"不必全表扫。
+CREATE INDEX IF NOT EXISTS idx_tasks_cursor
+    ON tasks (created_at DESC, task_id DESC);
+-- 事件时间窗过滤按 (task_id, occurred_at)；序号翻页由主键覆盖。
+CREATE INDEX IF NOT EXISTS idx_task_events_occurred
+    ON task_events (task_id, occurred_at);
 """
 
 
 def _iso(value: datetime | None) -> str | None:
-    return value.isoformat() if value else None
+    """时间列统一写规范化文本。
+
+    翻页与时间窗都靠字符串比较，而 `datetime.isoformat()` 的长度是变的：微秒恰好
+    为 0 时是 `...:26+00:00`，否则是 `...:26.000001+00:00`。两种写法在同一秒内
+    比较，`'+'`(43) 比 `'.'`(46) 小，于是"同一时刻"被排成两个位置，翻页经过那一刻
+    时要么漏一条、要么重复一条——而且不报错。写入口只认 `canonical_stamp()`。
+    """
+
+    return canonical_stamp(value) if value else None
 
 
 def _dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
+
+
+def _normalize_timestamps(conn: sqlite3.Connection) -> None:
+    """把旧行的 `created_at` / `occurred_at` 改写一次成规范文本。
+
+    老版本写的是裸 `isoformat()`，行长不一致，字符串排序在"微秒为 0"的行上会
+    排错位置。打开库时改写一次（幂等）；读不出来的值保持原样——猜一个时间比
+    留着一个异常值更危险。
+    """
+
+    for table, column in (
+        ("tasks", "created_at"),
+        ("tasks", "updated_at"),
+        ("task_events", "occurred_at"),
+    ):
+        rows = conn.execute(f"SELECT rowid AS rid, {column} AS value FROM {table}").fetchall()
+        for row in rows:
+            current = row["value"]
+            try:
+                fixed = canonical_stamp(datetime.fromisoformat(current))
+            except (ValueError, TypeError):
+                continue
+            if fixed != current:
+                conn.execute(
+                    f"UPDATE {table} SET {column} = ? WHERE rowid = ?", (fixed, row["rid"])
+                )
+
+
+def _task_where(query: TaskQuery) -> tuple[str, list[object]]:
+    """把任务查询条件翻译成 WHERE。
+
+    这里是内存后端 `task_matches()` 的 SQL 翻译，两边必须给出同样的集合；
+    `tests/test_ops_paging.py` 里的跨后端一致性用例盯着这件事。
+    """
+
+    clauses: list[str] = []
+    params: list[object] = []
+    if query.flow_id is not None:
+        clauses.append("flow_id = ?")
+        params.append(query.flow_id)
+    if query.status is not None:
+        clauses.append("status = ?")
+        params.append(query.status.value)
+    if query.since is not None:
+        clauses.append("created_at >= ?")
+        params.append(canonical_stamp(query.since))
+    if query.until is not None:
+        clauses.append("created_at < ?")
+        params.append(canonical_stamp(query.until))
+    if query.cursor is not None:
+        # 严格"比锚点更旧"：时间更早，或同一时刻但 task_id 更小。
+        anchor = query.cursor.stamp
+        clauses.append("(created_at < ? OR (created_at = ? AND task_id < ?))")
+        params.extend([anchor, anchor, str(query.cursor.task_id)])
+    return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+
+def _event_where(query: EventQuery) -> tuple[str, list[object]]:
+    """事件查询条件的 SQL 翻译，与内存后端 `event_matches()` 同一口径。"""
+
+    clauses = ["task_id = ?", "sequence > ?"]
+    params: list[object] = [str(query.task_id), max(0, query.after_sequence)]
+    if query.kind is not None:
+        clauses.append("type = ?")
+        params.append(query.kind.value)
+    if query.since is not None:
+        clauses.append("occurred_at >= ?")
+        params.append(canonical_stamp(query.since))
+    if query.until is not None:
+        clauses.append("occurred_at < ?")
+        params.append(canonical_stamp(query.until))
+    return " WHERE " + " AND ".join(clauses), params
 
 
 class SqliteStore:
@@ -80,6 +175,7 @@ class SqliteStore:
         # trace / checkpoint 与任务数据共用同一个文件，短暂写冲突应等待而不是直接抛 locked。
         self._conn.execute("PRAGMA busy_timeout = 3000")
         self._conn.executescript(SCHEMA)
+        _normalize_timestamps(self._conn)
         self._conn.commit()
 
     def close(self) -> None:
@@ -290,6 +386,41 @@ class SqliteStore:
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()
         return tuple(self._to_task(row) for row in rows)
+
+    def query_tasks(self, query: TaskQuery) -> TaskPage:
+        where, params = _task_where(query)
+        limit = max(0, query.limit)
+        # 多取一条用来判断"后面还有没有"：这条不返回给调用方，也避免再发一次
+        # COUNT——多一次查询就多一个"两次结果不一致"的窗口。
+        sql = (
+            f"SELECT * FROM tasks{where}"
+            " ORDER BY created_at DESC, task_id DESC LIMIT ?"
+        )
+        with self._lock:
+            rows = self._conn.execute(sql, [*params, limit + 1]).fetchall()
+
+        items = tuple(self._to_task(row) for row in rows[:limit])
+        next_cursor = None
+        if len(rows) > limit and items:
+            last = items[-1]
+            next_cursor = encode_token(
+                "tasks", [canonical_stamp(last.created_at), str(last.task_id)]
+            )
+        return TaskPage(items=items, next_cursor=next_cursor)
+
+    def query_events(self, query: EventQuery) -> EventPage:
+        where, params = _event_where(query)
+        limit = max(0, query.limit)
+        sql = (
+            f"SELECT * FROM task_events{where}"
+            " ORDER BY sequence LIMIT ?"
+        )
+        with self._lock:
+            rows = self._conn.execute(sql, [*params, limit + 1]).fetchall()
+
+        items = tuple(self._to_event(row) for row in rows[:limit])
+        next_cursor = str(items[-1].sequence) if len(rows) > limit and items else None
+        return EventPage(items=items, next_cursor=next_cursor)
 
     # ---------- 确认凭证 ----------
 

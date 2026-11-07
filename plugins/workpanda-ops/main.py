@@ -10,6 +10,10 @@
   失败原文、槽位内容等可能含用户数据的字段。
 - **零第三方依赖**：仅用标准库，安装插件时不触发 pip 安装。
 
+**翻页**：三个列表工具都把服务端的 `X-Next-Cursor` 原样回传成 `next_cursor`，
+调用方再把它作为 `cursor` 参数传入即可继续。游标只作为查询串的值，插件不接受
+任何 URL，因此翻页也开不出新的网络去向。
+
 工具返回 Octop 的 ``octop_ui`` envelope，由 ``ui/dist/index.js`` 渲染。
 """
 
@@ -53,8 +57,8 @@ SUMMARY_FIELDS = (
 )
 RUNTIME_FIELDS = ("available", "live", "stuck", "max_stuck")
 AUDIT_FIELDS = (
-    "entry_id", "task_id", "flow_id", "step_id", "kind", "effect",
-    "outcome", "risk", "requires_manual_check", "created_at",
+    "entry_id", "at", "task_id", "flow_id", "step_id", "kind", "effect",
+    "outcome", "risk", "requires_manual_check",
 )
 
 # 控制台可配置（Octop 的 config_fields）；环境变量作为无控制台配置时的兜底。
@@ -90,8 +94,12 @@ def _connection() -> tuple[str, str]:
     return base, token
 
 
-def _get(path: str, params: dict) -> object:
-    """只读 GET。path 是代码内常量，参数来自白名单，避免 SSRF 与注入。"""
+def _fetch(path: str, params: dict) -> tuple[object, str]:
+    """只读 GET，返回 (响应体, X-Next-Cursor)。
+
+    path 是代码内常量，参数来自白名单，避免 SSRF 与注入；游标只是查询串里的
+    一个值，不携带地址——调用方给不了 URL，也就改不了请求去哪。
+    """
 
     base, token = _connection()
     if not token:
@@ -105,7 +113,9 @@ def _get(path: str, params: dict) -> object:
     )
     try:
         with urlopen(request, timeout=TIMEOUT_SECONDS) as response:
-            return json.loads(response.read().decode("utf-8"))
+            body = json.loads(response.read().decode("utf-8"))
+            # 没有这个头就是"到头了"，不是"这一页是空的"：两者必须能分开。
+            return body, str(response.headers.get("X-Next-Cursor") or "")
     except HTTPError as exc:
         # 只回传状态码，不回显响应体（可能含内部信息），更不带凭据。
         raise RuntimeError(f"运维接口返回 HTTP {exc.code}") from exc
@@ -113,6 +123,10 @@ def _get(path: str, params: dict) -> object:
         raise RuntimeError(f"无法连接 WorkPanda 运维接口：{type(exc.reason).__name__}") from exc
     except (TimeoutError, OSError) as exc:
         raise RuntimeError(f"运维接口请求失败：{type(exc).__name__}") from exc
+
+
+def _get(path: str, params: dict) -> object:
+    return _fetch(path, params)[0]
 
 
 def _pick(value: object, fields: tuple[str, ...]) -> object:
@@ -168,6 +182,25 @@ def _clean_token(value: object) -> str:
     return "".join(ch for ch in text if ch.isalnum() or ch in "._-")
 
 
+def _clean_cursor(value: object) -> str:
+    """游标是服务端发的不透明串：只放行 base64url 字符。
+
+    `urlencode` 已经会转义，这里再白名单一次是有意的：游标会被原样拼进查询串，
+    而它来自上一轮响应体（可被转发、可被改写）。多一道校验，坏值在插件侧就变成
+    空串，而不是去请求一个语义不明的地址。
+    """
+
+    text = str(value or "")[:512]
+    return "".join(ch for ch in text if ch.isalnum() or ch in "-_=")
+
+
+def _paged_text(what: str, count: int, next_cursor: str) -> str:
+    """统一的一句话：多少条、还有没有下一页、下一页怎么拿。"""
+
+    tail = "；还有下一页，把返回的 next_cursor 原样作为 cursor 参数再调一次" if next_cursor else ""
+    return f"{what}（只读），返回 {count} 条{tail}"
+
+
 async def workpanda_ops_overview() -> str:
     """查看执行留痕聚合指标与工具线程状态（只读）。"""
 
@@ -188,48 +221,76 @@ async def workpanda_ops_overview() -> str:
     )
 
 
-async def workpanda_ops_tasks(limit: int = 20, status: str = "") -> str:
+async def workpanda_ops_tasks(limit: int = 20, status: str = "", cursor: str = "") -> str:
     """按创建时间倒序列出任务（只读，不含用户输入内容）。"""
 
     try:
-        tasks = await asyncio.to_thread(
-            _get,
+        tasks, next_cursor = await asyncio.to_thread(
+            _fetch,
             "/api/ops/tasks",
-            {"limit": _limit(limit), "status": _clean_token(status)},
+            {
+                "limit": _limit(limit),
+                "status": _clean_token(status),
+                "cursor": _clean_cursor(cursor),
+            },
         )
     except Exception as exc:
         return _failure("tasks", exc)
     items = _pick(tasks, TASK_FIELDS)
     count = len(items) if isinstance(items, list) else 0
-    return _envelope("tasks", {"items": items}, f"任务列表（只读），返回 {count} 条")
+    return _envelope(
+        "tasks",
+        {"items": items, "next_cursor": next_cursor},
+        _paged_text("任务列表", count, next_cursor),
+    )
 
 
-async def workpanda_ops_traces(task_id: str = "", limit: int = 20) -> str:
+async def workpanda_ops_traces(task_id: str = "", limit: int = 20, cursor: str = "") -> str:
     """列出执行留痕（只读，不含模型原文与工具入参）。"""
 
     try:
-        traces = await asyncio.to_thread(
-            _get,
+        traces, next_cursor = await asyncio.to_thread(
+            _fetch,
             "/api/ops/traces",
-            {"task_id": _clean_token(task_id), "limit": _limit(limit)},
+            {
+                "task_id": _clean_token(task_id),
+                "limit": _limit(limit),
+                "cursor": _clean_cursor(cursor),
+            },
         )
     except Exception as exc:
         return _failure("traces", exc)
     items = _pick(traces, TRACE_FIELDS)
     count = len(items) if isinstance(items, list) else 0
-    return _envelope("traces", {"items": items}, f"执行留痕（只读），返回 {count} 条")
+    return _envelope(
+        "traces",
+        {"items": items, "next_cursor": next_cursor},
+        _paged_text("执行留痕", count, next_cursor),
+    )
 
 
-async def workpanda_ops_audit(limit: int = 20) -> str:
+async def workpanda_ops_audit(limit: int = 20, kind: str = "", cursor: str = "") -> str:
     """列出审计归档条目（只读）。"""
 
     try:
-        audit = await asyncio.to_thread(_get, "/api/ops/audit", {"limit": _limit(limit)})
+        audit, next_cursor = await asyncio.to_thread(
+            _fetch,
+            "/api/ops/audit",
+            {
+                "limit": _limit(limit),
+                "kind": _clean_token(kind),
+                "cursor": _clean_cursor(cursor),
+            },
+        )
     except Exception as exc:
         return _failure("audit", exc)
     items = _pick(audit, AUDIT_FIELDS)
     count = len(items) if isinstance(items, list) else 0
-    return _envelope("audit", {"items": items}, f"审计归档（只读），返回 {count} 条")
+    return _envelope(
+        "audit",
+        {"items": items, "next_cursor": next_cursor},
+        _paged_text("审计归档", count, next_cursor),
+    )
 
 
 def _register(ctx, name: str, fn, description: str) -> None:
@@ -250,8 +311,8 @@ def setup(ctx) -> None:
     _register(ctx, "workpanda_ops_overview", workpanda_ops_overview,
               "查看 WorkPanda 执行留痕聚合指标与工具线程状态（只读）")
     _register(ctx, "workpanda_ops_tasks", workpanda_ops_tasks,
-              "列出 WorkPanda 任务及状态（只读，不含用户输入内容）")
+              "列出 WorkPanda 任务及状态（只读，不含用户输入内容，可用 cursor 翻页）")
     _register(ctx, "workpanda_ops_traces", workpanda_ops_traces,
-              "列出 WorkPanda 执行留痕（只读，可按 task_id 过滤）")
+              "列出 WorkPanda 执行留痕（只读，可按 task_id 过滤，可用 cursor 翻页）")
     _register(ctx, "workpanda_ops_audit", workpanda_ops_audit,
-              "列出 WorkPanda 审计归档条目（只读）")
+              "列出 WorkPanda 审计归档条目（只读，可用 kind 过滤与 cursor 翻页）")

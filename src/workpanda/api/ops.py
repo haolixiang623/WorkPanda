@@ -14,8 +14,14 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, 
 
 from workpanda.api.dependencies import get_container
 from workpanda.bootstrap import Container
-from workpanda.domain.models import TaskEvent, TaskStatus, TaskView
-from workpanda.harness.audit import AuditEntry
+from workpanda.domain.models import EventType, TaskEvent, TaskStatus, TaskView
+from workpanda.domain.paging import (
+    EventQuery,
+    TaskCursor,
+    TaskQuery,
+    decode_token,
+)
+from workpanda.harness.audit import AuditCursor, AuditEntry, AuditKind, AuditQuery
 from workpanda.harness.trace import (
     TraceCursor,
     TracePage,
@@ -26,6 +32,25 @@ from workpanda.harness.trace import (
 )
 
 router = APIRouter(prefix="/api/ops", tags=["ops"])
+
+CURSOR_HEADER = "X-Next-Cursor"
+_CURSOR_RESPONSES = {
+    200: {
+        "headers": {
+            CURSOR_HEADER: {
+                "description": "下一页游标；为空表示已到末尾。作为下一页的 cursor 参数回传。",
+                "schema": {"type": "string"},
+            }
+        }
+    }
+}
+
+
+def _invalid_cursor() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={"code": "invalid_cursor", "detail": "游标无效，请从第一页重新获取。"},
+    )
 
 
 def _parse_cursor(raw: str | None) -> TraceCursor | None:
@@ -40,10 +65,51 @@ def _parse_cursor(raw: str | None) -> TraceCursor | None:
     try:
         return decode_cursor(raw)
     except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"code": "invalid_cursor", "detail": "游标无效，请从第一页重新获取。"},
-        ) from exc
+        raise _invalid_cursor() from exc
+
+
+def _parse_task_cursor(raw: str | None) -> TaskCursor | None:
+    """任务游标。带 scope 校验：拿 trace 的游标查任务必须 400。"""
+
+    if raw is None:
+        return None
+    try:
+        stamp, task_id = decode_token(raw, scope="tasks", arity=2)
+        return TaskCursor(created_at=datetime.fromisoformat(stamp), task_id=UUID(task_id))
+    except (ValueError, TypeError) as exc:
+        raise _invalid_cursor() from exc
+
+
+def _parse_audit_cursor(raw: str | None) -> AuditCursor | None:
+    """归档游标，同样按 scope 拒绝跨端点复用。"""
+
+    if raw is None:
+        return None
+    try:
+        stamp, entry_id = decode_token(raw, scope="audit", arity=2)
+        return AuditCursor(at=datetime.fromisoformat(stamp), entry_id=entry_id)
+    except (ValueError, TypeError) as exc:
+        raise _invalid_cursor() from exc
+
+
+def _parse_sequence_cursor(raw: str | None) -> int | None:
+    """事件翻页锚点就是序号本身，不做 base64 包装。
+
+    序号已经是任务内唯一、单调的全序，套一层不透明串只会让调用方多一层猜谜；
+    非法值仍然报 400，不会静默回到第一条。
+    """
+
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text.isdigit():
+        raise _invalid_cursor()
+    return int(text)
+
+
+def _set_cursor(response: Response, cursor: str | None) -> None:
+    if cursor is not None:
+        response.headers[CURSOR_HEADER] = cursor
 
 
 def _check_window(since: datetime | None, until: datetime | None) -> None:
@@ -84,16 +150,42 @@ def require_ops_token(
         )
 
 
-@router.get("/tasks", response_model=list[TaskView], dependencies=[Depends(require_ops_token)])
+@router.get(
+    "/tasks",
+    response_model=list[TaskView],
+    dependencies=[Depends(require_ops_token)],
+    responses=_CURSOR_RESPONSES,
+)
 async def list_tasks(
+    response: Response,
     limit: int = Query(default=50, ge=1, le=200),
     task_status: TaskStatus | None = Query(default=None, alias="status"),
+    flow_id: str | None = Query(default=None, max_length=128),
+    since: datetime | None = Query(default=None),
+    until: datetime | None = Query(default=None),
+    cursor: str | None = Query(default=None),
     container: Container = Depends(get_container),
 ) -> list[TaskView]:
-    return [
-        TaskView.from_task(task)
-        for task in container.tasks.list_tasks(limit=limit, status=task_status)
-    ]
+    """按创建时间倒序列出任务，条件之间是"与"。
+
+    响应体保持数组（控制台与插件都在按数组解析），翻页信息放在
+    `X-Next-Cursor` 头里：把"还有下一页"变成调用方拿得到的事实，而不是
+    它从 `len(items) == limit` 猜出来的猜测——猜法在"刚好整页"时必然猜错。
+    """
+
+    _check_window(since, until)
+    page = container.tasks.query_tasks(
+        TaskQuery(
+            flow_id=flow_id,
+            status=task_status,
+            since=since,
+            until=until,
+            limit=limit,
+            cursor=_parse_task_cursor(cursor),
+        )
+    )
+    _set_cursor(response, page.next_cursor)
+    return [TaskView.from_task(task) for task in page.items]
 
 
 @router.get(
@@ -107,13 +199,48 @@ async def get_task(task_id: UUID, container: Container = Depends(get_container))
     "/tasks/{task_id}/events",
     response_model=list[TaskEvent],
     dependencies=[Depends(require_ops_token)],
+    responses=_CURSOR_RESPONSES,
 )
 async def list_events(
     task_id: UUID,
+    response: Response,
     after: int = Query(default=0, ge=0),
+    kind: EventType | None = Query(default=None, alias="type"),
+    since: datetime | None = Query(default=None),
+    until: datetime | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    cursor: str | None = Query(default=None),
     container: Container = Depends(get_container),
 ) -> list[TaskEvent]:
-    return list(container.tasks.ops_events(task_id, after_sequence=after))
+    """按序号升序列出一个任务的事件。
+
+    `after` 与 `cursor` 是同一件事的两种写法：前者是既有参数（控制台在用），
+    后者接收 `X-Next-Cursor`。同时给就 400——两种来源各指一处时，"谁优先"
+    会变成靠猜的规则，翻页也就有了两套答案。
+    """
+
+    _check_window(since, until)
+    if cursor is not None and after:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "invalid_cursor",
+                "detail": "after 与 cursor 不能同时使用，请只回传 X-Next-Cursor。",
+            },
+        )
+    anchor = _parse_sequence_cursor(cursor)
+    page = container.tasks.query_events(
+        EventQuery(
+            task_id=task_id,
+            after_sequence=anchor if anchor is not None else after,
+            kind=kind,
+            since=since,
+            until=until,
+            limit=limit,
+        )
+    )
+    _set_cursor(response, page.next_cursor)
+    return list(page.items)
 
 
 @router.get(
@@ -153,16 +280,7 @@ async def trace_summary(
     "/traces",
     response_model=list[TraceRecord],
     dependencies=[Depends(require_ops_token)],
-    responses={
-        200: {
-            "headers": {
-                "X-Next-Cursor": {
-                    "description": "下一页游标；为空表示已到末尾。作为下一页的 cursor 参数回传。",
-                    "schema": {"type": "string"},
-                }
-            }
-        }
-    },
+    responses=_CURSOR_RESPONSES,
 )
 async def list_traces(
     response: Response,
@@ -197,7 +315,7 @@ async def list_traces(
         )
     )
     if page.next_cursor is not None:
-        response.headers["X-Next-Cursor"] = page.next_cursor
+        response.headers[CURSOR_HEADER] = page.next_cursor
     return page.items
 
 
@@ -223,10 +341,16 @@ async def tool_runtime(container: Container = Depends(get_container)) -> dict:
     "/audit",
     response_model=list[AuditEntry],
     dependencies=[Depends(require_ops_token)],
+    responses=_CURSOR_RESPONSES,
 )
 async def list_audit(
+    response: Response,
     task_id: UUID | None = Query(default=None),
+    kind: AuditKind | None = Query(default=None),
+    since: datetime | None = Query(default=None),
+    until: datetime | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
+    cursor: str | None = Query(default=None),
     container: Container = Depends(get_container),
 ) -> list[AuditEntry]:
     """审计归档：只追加、不被容量淘汰，用于核对"某次提交到底发出去没有"。
@@ -235,4 +359,16 @@ async def list_audit(
     免得运维看到 404 时误判成"这版还没上这个能力"。
     """
 
-    return container.audit.read(task_id=task_id, limit=limit)
+    _check_window(since, until)
+    page = container.audit.query(
+        AuditQuery(
+            task_id=task_id,
+            kind=kind,
+            since=since,
+            until=until,
+            limit=limit,
+            cursor=_parse_audit_cursor(cursor),
+        )
+    )
+    _set_cursor(response, page.next_cursor)
+    return list(page.items)

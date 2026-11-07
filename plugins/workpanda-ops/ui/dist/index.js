@@ -40,6 +40,7 @@ const STYLE = {
     color: "rgb(220,60,60)",
   },
   note: { color: MUTED, fontSize: 12, marginTop: 10 },
+  more: { color: MUTED, fontSize: 12, marginTop: 8, wordBreak: "break-all" },
   grid: {
     display: "grid",
     gridTemplateColumns: "repeat(auto-fill, minmax(132px, 1fr))",
@@ -158,6 +159,13 @@ function WorkpandaOps(props) {
     }));
   } else {
     children.push(h(Table, { key: "table", items: data.items }));
+    const next = typeof data.next_cursor === "string" ? data.next_cursor.trim() : "";
+    if (next) {
+      // 截断只影响展示，不影响回传：游标必须原样送回服务端。
+      children.push(h("div", { key: "more", style: STYLE.more },
+        `还有下一页（cursor: ${short(next)}）。把 next_cursor 原样作为 cursor 参数再调一次即可。`,
+      ));
+    }
   }
 
   children.push(h("div", { key: "note", style: STYLE.note },
