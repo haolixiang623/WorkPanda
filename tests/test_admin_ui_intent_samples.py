@@ -82,7 +82,6 @@ def ui_container(**settings_overrides: object) -> tuple[object, TestClient]:
     """带确定性路由器的容器：正例命中本流程这一版，其余样例不被路由。"""
 
     settings = Settings(
-        _env_file=None,
         store_backend="memory",
         enable_demo_flow=False,
         admin_tokens=f"boss:admin:{ADMIN_TOKEN}",

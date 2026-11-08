@@ -1,0 +1,13 @@
+# WorkPanda 开发与 CI 的固定工具版本（#72，D4）。
+#
+# 与 pyproject.toml [project.optional-dependencies].dev 的区间一致：区间表达兼容
+# 上限，真正装哪个版本由本文件决定。这让「本机跑了不同版本的 tool、CI 跑了另一
+# 版本、同一份代码两边行为不同」这种问题失去产生条件——典型例子是 pytest 从 8.4
+# 变成 9.2 后与 pytest-asyncio 不兼容、收集期直接崩掉（#72 实测）。
+#
+# 升级工具版本时的次序：先改这里，跑本地 + CI 确认，再顺手把 pyproject.toml 的区
+# 间宽到能容纳它。两个地方都动，别只改一个（否则声明和实际不符）。
+
+pytest==8.4.2
+pytest-asyncio==0.26.0
+ruff==0.17.4

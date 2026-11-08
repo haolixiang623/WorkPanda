@@ -199,6 +199,11 @@ python scripts/issue_claim.py guard 27 --sha <sha>   # 合并前复核
   悬空 PR 不能永久锁死 Issue；TTL 必须长于一次修复的最坏耗时，否则会出现
   租约中途过期、两人同时在跑；
 - 这套机制只对**走同一脚本**的 worker 成立；绕过协议时只能靠 L3 兜底。
+- **本地验证不依赖口头约定的环境变量**：运行 `pytest` / `ruff` 时用不着先在
+  shell 里 `unset` 或 `-e` 任何 `WORKPANDA_` 变量——测试进程在 `conftest` 加载
+  时已屏蔽本机 `.env`（`tests/conftest.py`），所以即使仓库里混进了
+  `.env`，全量测试也照样按代码默认值跑、行为与 CI 一致（#72）。开发与 CI 的
+  语言工具版本由 `requirements-dev.txt` 固定，同名工具本机与远端必然同版本。
 
 ### 10.5 验证证据
 
