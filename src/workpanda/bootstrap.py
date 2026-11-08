@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from workpanda.api.ops_auth import OpsAccessPolicy, build_ops_policy
+from workpanda.application.admin_flows import AdminFlowService
 from workpanda.application.ports import Executor, IntentRouter
 from workpanda.application.release import FlowReleaseService
 from workpanda.application.replay import FlowReplay
@@ -75,6 +76,8 @@ class Container:
     limiter: TokenBucketLimiter
     # 运维接口的凭据与角色。构造时就校验配置，写错则启动失败。
     ops_access: OpsAccessPolicy
+    # 管理侧配置台的凭据与角色，与运维凭据完全独立（见 api/admin.py）。
+    admin_access: OpsAccessPolicy
     traces: TraceStore
     audit: AuditJournal
     # 取消登记表由容器持有：取消方与执行方看到的必须是同一个对象。
@@ -87,6 +90,8 @@ class Container:
     replay_cases: ReplayCaseStore | None = None
     # 发布门禁。没有版本库时无从裁决，为 None。
     release: FlowReleaseService | None = None
+    # 管理侧配置台服务。同样只在有版本库时成立（注入定义时没有版本库）。
+    admin_flows: AdminFlowService | None = None
     closers: list = field(default_factory=list)
 
     def close(self) -> None:
@@ -303,6 +308,9 @@ def build_container(
     settings = settings or get_settings()
     # 凭据配置在打开任何存储之前校验：配置写错时不该先占住数据库连接再抛错。
     ops_access = build_ops_policy(settings.ops_token, settings.ops_tokens)
+    # 管理侧只接受「主体:角色:密钥」多主体格式，不引入 legacy 单密钥：
+    # 能改流程语义的凭据必须能定位到具体主体。配置为空时接口整体关闭。
+    admin_access = build_ops_policy(None, settings.admin_tokens)
 
     store: TaskStore
     confirmations: ConfirmationStore
@@ -338,6 +346,18 @@ def build_container(
             gate_enabled=settings.replay_release_gate,
         )
         if flow_store is not None
+        else None
+    )
+    # 管理侧服务与发布门禁共用同一份版本库与用例库：配置台看到的版本、门禁
+    # 裁决时读的用例、发布后 registry 重载的版本，必须是同一份状态。
+    admin_flows = (
+        AdminFlowService(
+            flows=flow_store,
+            cases=replay_cases,
+            release=release,
+            registry=registry,
+        )
+        if flow_store is not None and release is not None
         else None
     )
     registered = registry.versions()
@@ -454,6 +474,7 @@ def build_container(
             per_minute=settings.rate_limit_per_minute, burst=settings.rate_limit_burst
         ),
         ops_access=ops_access,
+        admin_access=admin_access,
         traces=traces,
         audit=audit,
         cancellations=cancellations,
@@ -461,5 +482,6 @@ def build_container(
         flow_store=flow_store,
         replay_cases=replay_cases,
         release=release,
+        admin_flows=admin_flows,
         closers=closers,
     )

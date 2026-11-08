@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     # 按主体的运维凭据：`主体:角色:密钥`，多个用逗号分隔。
     # 一个主体可以有多个密钥（轮换期间新旧并存），但不同主体的密钥不能重复。
     ops_tokens: str = ""
+    # 管理侧 SOP 配置台凭据，格式与 ops_tokens 相同，但**独立发放**：
+    # 运维只读凭据能看任务明细，不能改流程的确认语义与工具白名单。
+    # 未配置时 /api/admin/* 整体不可用（404），不接受 ops_tokens 代用。
+    admin_tokens: str = ""
     # 网络绑定与 TLS。默认只监听回环且不启用 TLS，也就是"不对外暴露"的状态。
     bind_host: str = "127.0.0.1"
     bind_port: int = 8000

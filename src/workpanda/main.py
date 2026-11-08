@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from workpanda.api.admin import router as admin_router
 from workpanda.api.errors import register_error_handlers
 from workpanda.api.ops import router as ops_router
 from workpanda.api.routes import router
@@ -44,7 +45,12 @@ def create_app(settings: Settings | None = None, container: Container | None = N
             allow_origins=list(origins),
             allow_credentials=True,
             allow_methods=["GET", "POST"],
-            allow_headers=["Content-Type", "X-WorkPanda-Session", "X-WorkPanda-Ops-Token"],
+            allow_headers=[
+                "Content-Type",
+                "X-WorkPanda-Session",
+                "X-WorkPanda-Ops-Token",
+                "X-WorkPanda-Admin-Token",
+            ],
         )
 
     @app.get("/healthz", tags=["system"])
@@ -54,6 +60,7 @@ def create_app(settings: Settings | None = None, container: Container | None = N
     register_error_handlers(app)
     app.include_router(router)
     app.include_router(ops_router)
+    app.include_router(admin_router)
     return app
 
 

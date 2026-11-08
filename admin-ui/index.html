@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WorkPanda 管理侧 SOP 配置台</title>
+  <style>
+    :root { color-scheme: light; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 24px; background: #f7f8fa; color: #1f2329;
+           font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    h2 { font-size: 16px; margin: 0 0 12px; }
+    .hint { color: #646a73; margin: 0 0 20px; }
+    .card { background: #fff; border: 1px solid #e5e6eb; border-radius: 8px;
+            padding: 16px; margin-bottom: 16px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+    .field { display: flex; flex-direction: column; gap: 4px; min-width: 180px; flex: 1; }
+    label { font-size: 12px; color: #4e5969; }
+    input, select, textarea { padding: 7px 9px; border: 1px solid #c9cdd4; border-radius: 5px;
+                              background: #fff; color: #1f2329; font: inherit; width: 100%; }
+    input[type="checkbox"] { width: auto; }
+    button { padding: 7px 13px; border: 1px solid #c9cdd4; border-radius: 5px;
+             background: #fff; color: #1f2329; cursor: pointer; font: inherit; }
+    button:hover { border-color: #4080ff; color: #4080ff; }
+    button.primary { background: #4080ff; border-color: #4080ff; color: #fff; }
+    button.danger { color: #d03050; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #f0f1f3;
+             vertical-align: middle; }
+    th { color: #4e5969; font-weight: 500; font-size: 12px; }
+    .tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 12px; }
+    .tag.on { background: #e8f7ee; color: #1a7f43; }
+    .tag.off { background: #f2f3f5; color: #86909c; }
+    .step { display: grid; grid-template-columns: 1fr .8fr 1.1fr 1fr 1fr 1fr 1fr 1fr auto auto;
+            gap: 8px; align-items: end; padding: 8px 0; border-bottom: 1px dashed #e5e6eb; }
+    .step .field { min-width: 0; }
+    .step label { font-size: 11px; }
+    .invalid { border-color: #d03050 !important; background: #fff5f6 !important; }
+    #message { padding: 10px 12px; border-radius: 6px; margin-bottom: 16px; display: none;
+               white-space: pre-wrap; word-break: break-word; }
+    #message.ok { display: block; background: #e8f7ee; color: #1a7f43; }
+    #message.err { display: block; background: #fff0f1; color: #b0273f; }
+    #message ul { margin: 6px 0 0; padding-left: 20px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .muted { color: #86909c; font-size: 12px; }
+    .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  </style>
+</head>
+<body>
+  <h1>WorkPanda 管理侧 SOP 配置台</h1>
+  <p class="hint">独立管理侧页面，仅调用 <span class="mono">/api/admin/flows/*</span>。
+     凭据只在本次页面会话的内存里保存，不写入页面、不持久化、不随构建产物分发。</p>
+
+  <div class="card">
+    <h2>连接</h2>
+    <div class="row">
+      <div class="field">
+        <label for="api-base">服务端地址</label>
+        <input id="api-base" type="url" placeholder="https://admin.example.gov.cn" />
+      </div>
+      <div class="field">
+        <label for="admin-token">管理侧凭据（admin 可写，viewer 只读）</label>
+        <input id="admin-token" type="password" autocomplete="off" placeholder="主体密钥" />
+      </div>
+      <button id="refresh" class="primary">读取版本列表</button>
+    </div>
+    <p class="muted">跨域部署时服务端需把本页来源加入 WORKPANDA_CORS_ORIGINS 白名单。</p>
+  </div>
+
+  <div id="message"></div>
+
+  <div class="card">
+    <h2>版本与发布指针</h2>
+    <table>
+      <thead><tr><th>流程</th><th>版本</th><th>标题</th><th>状态</th><th>用例</th><th>操作</th></tr></thead>
+      <tbody id="flow-list"><tr><td colspan="6" class="muted">尚未读取</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>新建流程草稿</h2>
+    <div class="row">
+      <div class="field"><label for="draft-flow">flow_id</label><input id="draft-flow" data-loc="flow_id" /></div>
+      <div class="field"><label for="draft-version">version</label><input id="draft-version" data-loc="version" /></div>
+      <div class="field"><label for="draft-title">标题</label><input id="draft-title" data-loc="title" /></div>
+    </div>
+    <p class="muted">版本一经保存不可修改；改流程请新建一个版本号。status 由服务端固定为草稿，只有发布指针能让流程生效。</p>
+    <div id="steps"></div>
+    <div class="row" style="margin-top: 12px">
+      <button id="add-step">添加步骤</button>
+      <button id="save-draft" class="primary">保存草稿</button>
+      <button id="clear-draft">清空表单</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>回放用例与测试</h2>
+    <div class="row">
+      <div class="field"><label for="case-flow">flow_id</label><input id="case-flow" /></div>
+      <div class="field"><label for="case-version">version</label><input id="case-version" /></div>
+      <div class="field"><label for="case-id">case_id</label><input id="case-id" /></div>
+    </div>
+    <div class="row" style="margin-top: 10px">
+      <div class="field"><label for="case-slots">slots（JSON 对象）</label><textarea id="case-slots" rows="2">{}</textarea></div>
+      <div class="field"><label for="case-steps">期望步骤（逗号分隔，留空为不约束）</label><input id="case-steps" /></div>
+      <div class="field"><label for="case-tools">期望工具（逗号分隔，留空为不约束）</label><input id="case-tools" /></div>
+      <div class="field"><label for="case-terminal">期望终态（留空为不约束）</label><input id="case-terminal" placeholder="outcome_unconfirmed" /></div>
+    </div>
+    <div class="row" style="margin-top: 10px">
+      <button id="add-case">新增用例</button>
+      <button id="load-cases">读取该版本用例</button>
+      <button id="run-replay" class="primary">运行回放</button>
+    </div>
+    <div id="cases" style="margin-top: 12px"></div>
+    <div id="replay-result" style="margin-top: 12px"></div>
+  </div>
+
+  <div class="card">
+    <h2>发布 / 停用 / 回滚</h2>
+    <div class="row">
+      <div class="field"><label for="action-flow">flow_id</label><input id="action-flow" /></div>
+      <div class="field"><label for="action-version">version</label><input id="action-version" /></div>
+      <button id="dry-run">预演发布（不移动指针）</button>
+      <button id="do-publish" class="primary">发布</button>
+      <button id="do-rollback" class="danger">回滚到此版本</button>
+      <button id="do-disable" class="danger">停用流程</button>
+    </div>
+    <p class="muted">发布会先跑回放门禁；被拦下时返回具体用例与判定，指针保持不动。预演与发布的结果会明确写出「尚未发布 / 已发布」。</p>
+  </div>
+
+  <script type="module" src="./dist/main.js"></script>
+</body>
+</html>
