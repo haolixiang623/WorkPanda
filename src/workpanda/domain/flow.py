@@ -15,6 +15,7 @@ from typing import Protocol
 
 from pydantic import BaseModel, Field
 
+from workpanda.domain.intent import IntentRule
 from workpanda.domain.intent_sample import IntentSample
 
 
@@ -55,6 +56,15 @@ class FlowDefinition(BaseModel):
     # 而不是单独一张可改的表——"发布时校验的样例"必须就是"这一版生效的样例"。
     # 草稿允许为空，条数要求由发布门禁（`application/intent_eval.py`）裁决。
     intent_samples: tuple[IntentSample, ...] = ()
+    # 意图规则（D2=B）：识别规则是**流程版本的一部分**，不是装配期代码里的常量。
+    #
+    # 放在这里的原因是"发布"这件事必须一次生效：规则若留在代码里，运维发布一个
+    # 新版本只移动了指针，识别口径还是旧的——群众说的话仍被路由到上一版，甚至
+    # 路由到一个已不存在的版本（#73 的复现就是这样：发布后群众侧直接
+    # `FlowNotRunnable`）。
+    #
+    # 规则只能指向**自己所属的版本**，由 `flow_field_errors()` 强制。
+    intent_rules: tuple[IntentRule, ...] = ()
 
     def step(self, step_id: str) -> StepDefinition | None:
         for step in self.steps:
@@ -119,6 +129,9 @@ class FlowRegistry:
 
     def __init__(self, flows: list[FlowDefinition] | None = None) -> None:
         self._flows: dict[tuple[str, str], FlowDefinition] = {}
+        # 目录的代数：每次装载/替换 +1。识别路由器靠它判断"我手里的规则过期了没有"，
+        # 这样"发布后重建路由器"就不需要任何一个调用方记得去做（#73）。
+        self._generation = 0
         for flow in flows or []:
             self.register(flow)
 
@@ -142,6 +155,7 @@ class FlowRegistry:
     def register(self, flow: FlowDefinition) -> None:
         validate_flow(flow)
         self._flows[(flow.flow_id, flow.version)] = flow
+        self._generation += 1
 
     def reload(self, store: FlowStore) -> None:
         """从版本库重新装载，**原地替换**字典，保持本对象身份不变。
@@ -156,15 +170,40 @@ class FlowRegistry:
         """
 
         self._flows = type(self).from_store(store)._flows
+        self._generation += 1
+
+    @property
+    def generation(self) -> int:
+        """目录的代数。变了就说明"当前有哪些版本、哪一版已发布"变了。
+
+        给"必须跟着目录走"的派生对象用：识别路由器靠它判断缓存是否过期，
+        少一个"记得在发布后重建"的人工步骤，也就少一处会忘掉的地方。
+        """
+
+        return self._generation
 
     def versions(self) -> list[FlowDefinition]:
         """全部版本（含未发布），按 `(flow_id, version)` 排序。
 
-        装配期裁剪意图规则时用：规则要指向**已注册**的流程，而不是"已发布"的
-        流程——后者会让一条草稿版本把规则悄悄裁掉。
+        这是"目录里有什么"，不是"现在跑什么"。运行时识别口径取
+        `published()`——草稿的规则不该生效。
         """
 
         return [flow for _, flow in sorted(self._flows.items())]
+
+    def published(self) -> list[FlowDefinition]:
+        """当前发布指针指向的版本，按 `(flow_id, version)` 排序。
+
+        识别规则只从这些版本收集：一条草稿版本的规则若参与路由，群众的话会被
+        路由到一个 `resolve()` 必然拒绝的版本上——识别"成功"却建不了任务，
+        看起来像群众说错了话（#73）。
+        """
+
+        return [
+            flow
+            for _, flow in sorted(self._flows.items())
+            if flow.status is FlowStatus.PUBLISHED
+        ]
 
     def resolve(self, flow_id: str, version: str | None = None) -> FlowDefinition:
         """取**可执行**的流程：新任务只能落在发布指针上。
@@ -272,6 +311,7 @@ def flow_field_errors(flow: FlowDefinition) -> list[FlowFieldError]:
                 )
 
     errors.extend(_intent_sample_errors(flow))
+    errors.extend(_intent_rule_errors(flow))
     return errors
 
 
@@ -288,6 +328,54 @@ def validate_flow(flow: FlowDefinition) -> None:
     errors = flow_field_errors(flow)
     if errors:
         raise ValueError(errors[0].message)
+
+
+def _intent_rule_errors(flow: FlowDefinition) -> list[FlowFieldError]:
+    """意图规则必须指向**自己所属的那一版**，且标识唯一、关键词非空。
+
+    规则指向别的版本是装配错误里最难查的一种：识别那一侧看起来完全正常（命中了、
+    置信度够高），失败发生在后来的"取可执行流程"上，报出来的却像是群众说错了话。
+    在这里拦住，错误就落在写流程的人面前（#73）。
+    """
+
+    rules = flow.intent_rules
+    if not rules:
+        return []
+
+    errors: list[FlowFieldError] = []
+    seen_ids: set[str] = set()
+    for index, rule in enumerate(rules):
+        if (rule.flow_id, rule.flow_version) != (flow.flow_id, flow.version):
+            errors.append(
+                FlowFieldError(
+                    loc=("intent_rules", index, "flow_id"),
+                    message=(
+                        f"intent rule {rule.intent_id!r} targets "
+                        f"{rule.flow_id!r}@{rule.flow_version} but is declared by "
+                        f"{flow.flow_id!r}@{flow.version}"
+                    ),
+                )
+            )
+        if rule.intent_id in seen_ids:
+            errors.append(
+                FlowFieldError(
+                    loc=("intent_rules", index, "intent_id"),
+                    message=(
+                        f"duplicate intent_id {rule.intent_id!r} in flow "
+                        f"{flow.flow_id!r}@{flow.version}"
+                    ),
+                )
+            )
+        seen_ids.add(rule.intent_id)
+        if not any(keyword.strip() for keyword in rule.keywords):
+            # 没有关键词的规则永远不会命中，留着只会让"为什么这句话没被识别"更难查。
+            errors.append(
+                FlowFieldError(
+                    loc=("intent_rules", index, "keywords"),
+                    message=f"intent rule {rule.intent_id!r} must declare a keyword",
+                )
+            )
+    return errors
 
 
 def _intent_sample_errors(flow: FlowDefinition) -> list[FlowFieldError]:

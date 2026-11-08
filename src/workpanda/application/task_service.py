@@ -290,8 +290,14 @@ class TaskService:
         if match is None or match.confidence < self.confidence_threshold:
             raise IntentUnresolved("无法确定办理事项，需要先向群众澄清，或转人工处理。")
         try:
-            # 新建任务走 resolve（只认发布指针）；require 只给已建任务用。
-            return self.flows.resolve(match.flow_id, match.flow_version), dict(match.slots)
+            # 按 flow_id 取**当前发布指针**，不再带 `match.flow_version`。
+            #
+            # 规则现在从已发布版本收集（D2=B），识别命中的版本号是"装配这台路由器
+            # 时的那一版"。若带上它去 resolve，发布指针在"识别"与"解析"之间移动
+            # 一次（运维正在发布），就会把一次正常识别变成 422 —— 那看起来像群众
+            # 说错了话，实际是版本号过期。群众的话表达的是**办哪件事**，不是"办哪
+            # 一版"，落到当前发布版才是对的。
+            return self.flows.resolve(match.flow_id), dict(match.slots)
         except (FlowNotFound, FlowNotRunnable) as exc:
             raise RequestRejected(str(exc)) from exc
 

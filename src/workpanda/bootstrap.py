@@ -10,6 +10,7 @@ from workpanda.api.ops_auth import OpsAccessPolicy, build_ops_policy
 from workpanda.application.admin_flows import AdminFlowService
 from workpanda.application.deeplink_confirm import ConfirmationLinkService
 from workpanda.application.intent_eval import IntentEvalRunner, IntentReleaseGate
+from workpanda.application.intent_routing import RegistryIntentRouter, router_for
 from workpanda.application.ports import Executor, IntentRouter
 from workpanda.application.release import FlowReleaseService
 from workpanda.application.replay import FlowReplay
@@ -21,7 +22,7 @@ from workpanda.config import Settings, get_settings
 from workpanda.domain.deeplink import ConfirmationLinkStore
 from workpanda.domain.flow import FlowDefinition, FlowRegistry, FlowStore, FlowVersionExists
 from workpanda.domain.identity import SessionSigner, new_secret
-from workpanda.domain.intent import IntentRule, RuleIntentRouter
+from workpanda.domain.intent import RuleIntentRouter
 from workpanda.domain.replay import ReplayCaseStore
 from workpanda.domain.repository import ConfirmationStore, TaskStore
 from workpanda.domain.staff import STAFF_ROLE, StaffStore
@@ -46,7 +47,7 @@ from workpanda.infrastructure.deeplink_store import (
     InMemoryConfirmationLinkStore,
     SqliteConfirmationLinkStore,
 )
-from workpanda.infrastructure.demo_flows import demo_flows, demo_intent_rules
+from workpanda.infrastructure.demo_flows import demo_flows
 from workpanda.infrastructure.event_broker import EventBroker
 from workpanda.infrastructure.memory_store import (
     InMemoryConfirmationStore,
@@ -334,27 +335,16 @@ def build_budget_ledger(
     return RedisBudgetLedger(shared, ttl_seconds=ttl), []
 
 
-def default_intent_rules(flow_definitions: list[FlowDefinition]) -> tuple[IntentRule, ...]:
-    """按已注册流程裁剪默认意图规则。
-
-    规则指向未注册的流程时，识别"成功"也会在解析流程那一步变成 422——那看起来
-    像群众说错了话，实际是装配错了。因此在装配期就裁掉，不留给运行时。
-    """
-
-    registered = {(flow.flow_id, flow.version) for flow in flow_definitions}
-    return tuple(
-        rule for rule in demo_intent_rules() if (rule.flow_id, rule.flow_version) in registered
-    )
-
-
 def build_intent_router(flow_definitions: list[FlowDefinition]) -> RuleIntentRouter:
-    """装配识别路由器。服务端与运维脚本共用这一个函数，避免两处规则口径不同。
+    """按一组流程定义装配识别路由器。服务端与运维脚本共用这一个函数。
 
-    评测必须评"线上真的会用的那个路由器"：如果 CI 自己拼一台路由器，评测通过
-    只能证明评测代码对，证明不了服务能听懂群众说话。
+    规则现在来自流程版本自身（`FlowDefinition.intent_rules`），所以"传进来的
+    定义集合"就是口径本身：运行时传已发布版本、发布门禁传"发布后会生效的那一
+    组"。评测必须评"线上真的会用的那个路由器"——如果 CI 自己拼一台路由器，评测
+    通过只能证明评测代码对，证明不了服务能听懂群众说话。
     """
 
-    return RuleIntentRouter(rules=default_intent_rules(flow_definitions))
+    return router_for(flow_definitions)
 
 
 def build_container(
@@ -404,15 +394,20 @@ def build_container(
         registry = FlowRegistry.from_store(flow_store)
     replay_cases, replay_closers = build_replay_case_store(settings)
     closers.extend(replay_closers)
-    registered = registry.versions()
-    # 未显式注入路由器时用确定性规则路由器：没有规则就等于"识别不了"，
-    # 让创建任务走澄清而不是猜一个流程。它在发布门禁之前装配，因为门禁要评的
-    # 正是"线上会用的这个路由器"。
-    router_instance = router or build_intent_router(registered)
+    # 未显式注入路由器时用跟着发布指针自刷新的规则路由器：没有规则就等于"识别不了"，
+    # 让创建任务走澄清而不是猜一个流程。它必须在"读指针"这一步之后建，因为规则
+    # 取自当前已发布的版本；之后每次发布都会由 generation 变化触发重建（#73）。
+    router_instance = router or RegistryIntentRouter(registry)
     # 识别样例门禁只在有版本库时成立：注入定义的场景没有"发布"这回事。
+    #
+    # 门禁要评的是"这个版本发布**之后**线上会用的那台路由器"。两种装配制度分开：
+    # - 未注入（默认）：路由由流程版本派生（D2=B），发布后就是 `已发布 + 这一版`，
+    #   所以传 None 让门禁按待评语料自己装配。此刻运行时的 `RegistryIntentRouter`
+    #   还只认得旧版本，拿它去评新版本必然全判漏路由，新版本永远发不上去（#73）；
+    # - 显式注入：路由由调用方掌握，发布不会改变它，发布后仍是这一台，那就评它。
     intent_gate = (
         IntentReleaseGate(
-            router=router_instance,
+            router=router,
             runner=IntentEvalRunner(timeout_seconds=settings.intent_eval_timeout_seconds),
             min_positive=settings.intent_eval_min_positive,
             min_near_miss=settings.intent_eval_min_near_miss,
