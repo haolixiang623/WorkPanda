@@ -290,7 +290,8 @@ class TaskService:
         if match is None or match.confidence < self.confidence_threshold:
             raise IntentUnresolved("无法确定办理事项，需要先向群众澄清，或转人工处理。")
         try:
-            return self.flows.require(match.flow_id, match.flow_version), dict(match.slots)
+            # 新建任务走 resolve（只认发布指针）；require 只给已建任务用。
+            return self.flows.resolve(match.flow_id, match.flow_version), dict(match.slots)
         except (FlowNotFound, FlowNotRunnable) as exc:
             raise RequestRejected(str(exc)) from exc
 

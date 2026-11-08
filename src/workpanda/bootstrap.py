@@ -11,7 +11,7 @@ from workpanda.application.ports import Executor, IntentRouter
 from workpanda.application.runner import FlowRunner
 from workpanda.application.task_service import TaskService
 from workpanda.config import Settings, get_settings
-from workpanda.domain.flow import FlowDefinition, FlowRegistry
+from workpanda.domain.flow import FlowDefinition, FlowRegistry, FlowStore, FlowVersionExists
 from workpanda.domain.identity import SessionSigner, new_secret
 from workpanda.domain.intent import IntentRule, RuleIntentRouter
 from workpanda.domain.repository import ConfirmationStore, TaskStore
@@ -34,7 +34,11 @@ from workpanda.harness.trace import InMemoryTraceStore, TraceStore
 from workpanda.infrastructure.adapters import ScriptedExecutor
 from workpanda.infrastructure.demo_flows import demo_flows, demo_intent_rules
 from workpanda.infrastructure.event_broker import EventBroker
-from workpanda.infrastructure.memory_store import InMemoryConfirmationStore, InMemoryTaskStore
+from workpanda.infrastructure.memory_store import (
+    InMemoryConfirmationStore,
+    InMemoryFlowStore,
+    InMemoryTaskStore,
+)
 from workpanda.infrastructure.rate_limit import TokenBucketLimiter
 from workpanda.infrastructure.redis_client import RedisClient
 from workpanda.infrastructure.redis_shared_state import (
@@ -45,6 +49,7 @@ from workpanda.infrastructure.redis_shared_state import (
 )
 from workpanda.infrastructure.sqlite_cancel_store import SqliteCancelSignalStore
 from workpanda.infrastructure.sqlite_checkpoint_store import SqliteCheckpointStore
+from workpanda.infrastructure.sqlite_flow_store import SqliteFlowStore
 from workpanda.infrastructure.sqlite_store import SqliteStore
 from workpanda.infrastructure.sqlite_trace_store import SqliteTraceStore
 
@@ -122,6 +127,39 @@ def build_checkpoint_store(
         store = SqliteCheckpointStore(settings.sqlite_path)
         return store, [store.close]
     return InMemoryCheckpointStore(), []
+
+
+def build_flow_store(settings: Settings) -> tuple[FlowStore, list[Callable[[], None]]]:
+    """流程版本库。跟随任务存储：sqlite 时与任务库同文件，memory 时进程内。
+
+    同文件而非独立库：发布是"写版本 + 移指针"两步，同库才能一次事务收口。
+    """
+
+    if settings.store_backend == "sqlite":
+        store = SqliteFlowStore(settings.sqlite_path)
+        return store, [store.close]
+    return InMemoryFlowStore(), []
+
+
+def seed_demo_flows(store: FlowStore, *, enabled: bool) -> None:
+    """把骨架自检流程同步到库里的真实状态。
+
+    开启时确保版本存在、指针指向它；关闭时**清空指针**。只"不写入"是不够的：
+    上一次开着跑过的库里还留着指针，那等于关不掉——而"正式接入业务前必须关闭"
+    这条要求必须真的生效。
+
+    已存在的同版本内容一律沿用、不覆盖：版本不可变是回滚能成立的前提。
+    """
+
+    for flow in demo_flows():
+        if not enabled:
+            store.disable(flow.flow_id)
+            continue
+        try:
+            store.add_version(flow)
+        except FlowVersionExists:
+            pass
+        store.publish(flow.flow_id, flow.version)
 
 
 def build_shared_state(
@@ -251,8 +289,16 @@ def build_container(
         store = InMemoryTaskStore()
         confirmations = InMemoryConfirmationStore()
 
-    registered = flows if flows is not None else (demo_flows() if settings.enable_demo_flow else [])
-    registry = FlowRegistry(registered)
+    if flows is not None:
+        # 测试与嵌入场景直接给定义：不落库，也不碰库里已有的版本。
+        registry = FlowRegistry(flows)
+    else:
+        # 流程定义以库为准：进程内不再有"代码里那一份"作为第二个真相。
+        flow_store, flow_closers = build_flow_store(settings)
+        closers.extend(flow_closers)
+        seed_demo_flows(flow_store, enabled=settings.enable_demo_flow)
+        registry = FlowRegistry.from_store(flow_store)
+    registered = registry.versions()
     broker = EventBroker()
     # 共享状态后端先建：取消信号、步骤租约、预算账本三处共用同一个连接与键前缀。
     shared_state, shared_closers = build_shared_state(settings)
