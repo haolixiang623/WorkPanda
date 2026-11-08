@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 from workpanda.api.ops_auth import OpsAccessPolicy, build_ops_policy
 from workpanda.application.admin_flows import AdminFlowService
+from workpanda.application.deeplink_confirm import ConfirmationLinkService
 from workpanda.application.intent_eval import IntentEvalRunner, IntentReleaseGate
 from workpanda.application.ports import Executor, IntentRouter
 from workpanda.application.release import FlowReleaseService
@@ -17,6 +18,7 @@ from workpanda.application.staff_access import ImIdentityResolver, StaffDirector
 from workpanda.application.task_service import TaskService
 from workpanda.capacity import validate_deployment_topology
 from workpanda.config import Settings, get_settings
+from workpanda.domain.deeplink import ConfirmationLinkStore
 from workpanda.domain.flow import FlowDefinition, FlowRegistry, FlowStore, FlowVersionExists
 from workpanda.domain.identity import SessionSigner, new_secret
 from workpanda.domain.intent import IntentRule, RuleIntentRouter
@@ -40,6 +42,10 @@ from workpanda.harness.redaction import DEFAULT_REDACTOR, NO_REDACTION
 from workpanda.harness.shared_state import SharedStateStore
 from workpanda.harness.trace import InMemoryTraceStore, TraceStore
 from workpanda.infrastructure.adapters import ScriptedExecutor
+from workpanda.infrastructure.deeplink_store import (
+    InMemoryConfirmationLinkStore,
+    SqliteConfirmationLinkStore,
+)
 from workpanda.infrastructure.demo_flows import demo_flows, demo_intent_rules
 from workpanda.infrastructure.event_broker import EventBroker
 from workpanda.infrastructure.memory_store import (
@@ -89,6 +95,8 @@ class Container:
     staff_store: StaffStore
     # IM 身份 → 工作人员的解析器。N4 网关唯一该用的入口，未映射一律拒绝并留痕。
     im_resolver: ImIdentityResolver
+    # 卡片深链（N5）。它只做导航，不签发确认凭证；确认仍走 tasks.confirm。
+    confirmation_links: ConfirmationLinkService
     traces: TraceStore
     audit: AuditJournal
     # 取消登记表由容器持有：取消方与执行方看到的必须是同一个对象。
@@ -183,6 +191,21 @@ def build_staff_store(settings: Settings) -> tuple[StaffStore, list[Callable[[],
         store = SqliteStaffStore(settings.sqlite_path)
         return store, [store.close]
     return InMemoryStaffStore(), []
+
+
+def build_confirmation_link_store(
+    settings: Settings,
+) -> tuple[ConfirmationLinkStore, list[Callable[[], None]]]:
+    """卡片深链与留痕。跟随任务存储：sqlite 时与任务库同文件。
+
+    深链本身丢了不影响正确性（旧卡片打不开，重发一张即可），但留痕必须和业务
+    数据同库：排障要回答"这张卡发出去没有"，两边分家就永远对不上。
+    """
+
+    if settings.store_backend == "sqlite":
+        store = SqliteConfirmationLinkStore(settings.sqlite_path)
+        return store, [store.close]
+    return InMemoryConfirmationLinkStore(), []
 
 
 def build_replay_case_store(
@@ -427,6 +450,9 @@ def build_container(
     closers.extend(staff_closers)
     staff_directory = StaffDirectoryService(staff_store)
     im_resolver = ImIdentityResolver(staff_store)
+    # 深链存储与任务库同后端，装配点紧挨着工作人员目录：两者都只描述"谁能办事"。
+    link_store, link_closers = build_confirmation_link_store(settings)
+    closers.extend(link_closers)
     broker = EventBroker()
     # 共享状态后端先建：取消信号、步骤租约、预算账本三处共用同一个连接与键前缀。
     shared_state, shared_closers = build_shared_state(settings)
@@ -540,6 +566,12 @@ def build_container(
         staff_access=staff_access,
         staff_store=staff_store,
         im_resolver=im_resolver,
+        confirmation_links=ConfirmationLinkService(
+            store=store,
+            links=link_store,
+            ttl_seconds=settings.confirmation_link_ttl_seconds,
+            base_url=settings.confirmation_link_base,
+        ),
         traces=traces,
         audit=audit,
         cancellations=cancellations,

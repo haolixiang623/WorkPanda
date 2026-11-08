@@ -205,6 +205,9 @@ created → running → waiting_for_user → running
 | GET | `/api/tasks/{task_id}/events` | SSE 事件流，支持 `after` 断线补发 |
 | GET | `/api/staff/me` | 工作人员自查主体与授权（`X-WorkPanda-Staff-Token`） |
 | GET | `/api/staff/flows` | 本人被授权办理的流程与动作 |
+| POST | `/api/staff/tasks/{task_id}/confirmation-links` | 为待确认步骤发一次性深链（需 `handle` 授权）；不发凭证 |
+| GET | `/api/staff/tasks/{task_id}/confirmation-links/attempts` | 深链留痕（谁发的 / 谁点开的 / 为什么打不开） |
+| POST | `/api/tasks/{task_id}/confirmation-link` | 深链落地：只回答"该确认哪一步"，**不签发凭证** |
 | * | `/api/admin/identities/*` | 工作人员目录与 IM 身份映射维护（管理侧凭据） |
 
 客户端不直接指定工具、步骤或流程推进方式。
@@ -219,6 +222,7 @@ created → running → waiting_for_user → running
 | 409 | `task_state_conflict` | 当前状态不允许该操作 |
 | 409 | `invalid_transition` | 非法状态转换 |
 | 409 | `confirmation_invalid` | 确认凭证不可用 |
+| 409 | `confirmation_link_invalid` | 深链不可用（一次性、过期、跨任务、非任务会话统一这一条） |
 | 422 | `request_rejected` | 参数或流程不满足约束 |
 | 422 | `clarification_required` | 无法确定事项，需澄清或转人工 |
 | 422 | `flow_not_published` | 流程存在但未发布 |
@@ -237,8 +241,9 @@ created → running → waiting_for_user → running
   脚本 `scripts/replay_flow.py`，不是界面；
 - 意图路由是确定性规则（`domain/intent.py`），默认无规则即"识别不了→澄清"，
   尚未接入模型分类，也没有同义改写能力；
-- 工作人员侧目前只有"我是谁 / 我能对哪些流程做什么"，没有能推进流程的入口
-  （企业微信网关与深链确认见 Issue #64、#65）；IM 身份映射需手工维护，未做组织架构同步；
+- 工作人员侧目前只有"我是谁 / 我能对哪些流程做什么 / 为待确认步骤发深链"，仍然没有
+  任何能推进流程状态或签发确认凭证的入口（企业微信网关见 Issue #64）；深链落地页与
+  卡片投递由前端与网关实现，本仓库只提供接口；IM 身份映射需手工维护，未做组织架构同步；
 - 群众可见状态由服务端映射（`domain/presentation.py`，随 `TaskView.ui_state` 下发），
   但只到状态键与文案，组件与无障碍由前端实现；
 - harness 的工具是同步执行，预算按调用次数与耗时计（不按 token），无 checkpoint 恢复；
