@@ -1,0 +1,22 @@
+{
+  "case_id": "demo.generic.happy",
+  "flow_id": "demo.generic",
+  "flow_version": "1",
+  "inputs": {
+    "subject": "社保缴费记录查询"
+  },
+  "tool_results": [
+    {
+      "tool": "model_echo",
+      "outcome": "succeeded",
+      "output": {
+        "echo": "社保缴费记录查询"
+      }
+    }
+  ],
+  "expect_steps": ["collect_input", "execute_demo"],
+  "expect_tools": ["model_echo"],
+  "expect_outcome": "succeeded",
+  "expect_status": "completed",
+  "expect_confirmations": 1
+}

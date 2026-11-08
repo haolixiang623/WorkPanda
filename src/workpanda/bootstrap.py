@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 from workpanda.api.ops_auth import OpsAccessPolicy, build_ops_policy
 from workpanda.application.ports import Executor, IntentRouter
+from workpanda.application.replay import FlowReplayer
 from workpanda.application.runner import FlowRunner
 from workpanda.application.task_service import TaskService
 from workpanda.config import Settings, get_settings
@@ -160,6 +161,22 @@ def seed_demo_flows(store: FlowStore, *, enabled: bool) -> None:
         except FlowVersionExists:
             pass
         store.publish(flow.flow_id, flow.version)
+
+
+def build_replayer(settings: Settings) -> FlowReplayer:
+    """流程回放器。确认凭证 TTL 跟随主配置，其余端口由 `replay_ports()` 现做一套。"""
+
+    return FlowReplayer(confirmation_ttl_seconds=settings.confirmation_ttl_seconds)
+
+
+def replay_ports() -> tuple[InMemoryTaskStore, InMemoryConfirmationStore, EventBroker]:
+    """回放专用的一整套内存端口。
+
+    每次回放都要新的：回放绝不能落在生产库上，也不该让上一条用例的残留状态
+    影响下一条。返回三元组而不是对象，是为了让"必须是全新的"这件事写在调用点。
+    """
+
+    return InMemoryTaskStore(), InMemoryConfirmationStore(), EventBroker()
 
 
 def build_shared_state(

@@ -162,6 +162,33 @@ created → running → waiting_for_user → running
   [OPS-ACCESS-CONTROL.md](OPS-ACCESS-CONTROL.md)；
 - 控制台只读，不写业务状态，避免双写冲突。
 
+### 3.10 流程回放（`application/replay.py`）
+
+发布前回答一个问题：这个版本还能不能按设计走完。三条约束：
+
+| 约束 | 做法 |
+|---|---|
+| 不碰真实系统 | `ReplayExecutor` 是独立执行器，手里只有用例脚本，没有工具注册表、没有 HTTP、没有模型客户端 |
+| 走真实链路 | 复用 `TaskService` / `FlowRunner` / 状态机 / 确认凭证，不另写一条"简化执行" |
+| 不知道不算成功 | 用例没给脚本的工具返回 `unconfirmed`，该用例判为"不完整"而不是通过 |
+
+待测版本通常是**草稿**。回放把它临时当作已发布放进一份**局部**注册表，绝不移动真实发布
+指针：回放失败不该影响线上，回放通过也不代表已经发布。
+
+报告同时给出观测值（step 序列、工具调用序列、末次结论、终态、确认次数）与逐项检查。
+其中两项检查**永远执行**、不依赖用例是否写期望：`tools_declared`（只能调用流程声明的
+工具）、`tools_scripted`（不许出现没有脚本的调用）。其余期望（steps / tools / outcome /
+status / confirmations）写了才比对，且严格比对，不做"大致相等"。
+
+用例是数据，不是代码：
+
+```bash
+python scripts/replay_flow.py cases/*.json --sqlite-path workpanda.db
+```
+
+退出码：`0` 全部通过；`1` 有未通过或"用例不完整"；`2` 前置条件不满足（用例读不出来、
+库里找不到该版本）。样式见 `cases/demo.generic.json`。
+
 ## 4. 接口
 
 | 方法 | 路径 | 说明 |
@@ -213,6 +240,7 @@ created → running → waiting_for_user → running
 3. 审计日志与指标（含 harness trace 的检索与聚合）；
 4. 把 SQLite 替换为 PostgreSQL，并引入迁移工具；
 5. 意图分类与槽位抽取的语义泛化（接入受约束模型分类）——规则版与版本化评测集已交付；
-6. ~~流程定义持久化（版本、发布、停用、回滚）~~ —— 已交付（Issue #49）。后续：发布前回放
-   测试（Issue #50）、新流程强制携带意图样例（Issue #52）、管理侧配置台（Issue #51）；
+6. ~~流程定义持久化（版本、发布、停用、回滚）~~ —— 已交付（Issue #49）。回放引擎已交付
+   （Issue #50 第一切片，见 3.10）；后续：回放的发布门禁与用例管理入口、新流程强制携带
+   意图样例（Issue #52）、管理侧配置台（Issue #51）；
 7. Octop 控制台插件、灰度发布。
