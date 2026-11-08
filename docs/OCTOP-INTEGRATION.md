@@ -122,6 +122,7 @@ WorkPanda 只依赖 **Octop-Harness SDK**，不整体部署 Octop 产品。控�
 | GET | `/api/ops/traces/summary` | 留痕聚合指标（未确认占比、被拦/超时调用、token 等） |
 | GET | `/api/ops/audit?task_id=&kind=&since=&until=&limit=&cursor=` | 审计归档条目 |
 | GET | `/api/ops/tool-runtime` | 工具线程台账与容量闸门（第十一轮新增） |
+| GET | `/api/ops/metrics` | 容量基线指标与部署形态（要求 `admin`）；采不到的项为 `value=null` + 原因，不返回 0（Issue #53） |
 
 所有列表接口的响应体都是**数组**，翻页信息放在 `X-Next-Cursor` 响应头：把这个值
 原样作为下一页的 `cursor` 参数回传即可；头不存在就是到头了。游标不透明且带端点
@@ -133,7 +134,7 @@ scope，跨端点复用会得到 `400 invalid_cursor`，不会"看起来正常�
 - 未配置任何凭据时，整个 `/api/ops` 返回 404，不暴露内部接口存在；
 - 凭据错误返回 401；
 - 凭据有效但角色不够返回 403：`viewer` 只能读任务列表与留痕聚合，任务详情、
-  事件流、留痕明细、审计归档、工具台账要求 `admin`；
+  事件流、留痕明细、审计归档、工具台账与容量指标要求 `admin`；
 - `POST /tasks/{id}/notes` 要求 `admin`。事件里的 `operator` 取凭据主体
   （`OpsPrincipal.subject`），**不读请求体**：可自报的署名等于没有署名。
   单主体旧配置 `WORKPANDA_OPS_TOKEN` 下主体固定为 `legacy`，此时署名只到

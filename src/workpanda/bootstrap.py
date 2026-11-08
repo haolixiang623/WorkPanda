@@ -14,6 +14,7 @@ from workpanda.application.release import FlowReleaseService
 from workpanda.application.replay import FlowReplay
 from workpanda.application.runner import FlowRunner
 from workpanda.application.task_service import TaskService
+from workpanda.capacity import validate_deployment_topology
 from workpanda.config import Settings, get_settings
 from workpanda.domain.flow import FlowDefinition, FlowRegistry, FlowStore, FlowVersionExists
 from workpanda.domain.identity import SessionSigner, new_secret
@@ -317,6 +318,9 @@ def build_container(
     router: IntentRouter | None = None,
 ) -> Container:
     settings = settings or get_settings()
+    # 部署形态门禁最先跑：声明多实例却仍用进程内状态时，不能先占住存储/连接
+    # 再抛错。它只做纯配置校验，选 redis 后的探活仍由 build_shared_state 负责。
+    validate_deployment_topology(settings)
     # 凭据配置在打开任何存储之前校验：配置写错时不该先占住数据库连接再抛错。
     ops_access = build_ops_policy(settings.ops_token, settings.ops_tokens)
     # 管理侧只接受「主体:角色:密钥」多主体格式，不引入 legacy 单密钥：

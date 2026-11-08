@@ -2,7 +2,7 @@
 
 WorkPanda 是面向群众的自然语言公共服务入口。当前仓库处于**工程骨架**阶段：已建立统一业务后端、固定流程执行、任务状态与确认凭证机制，并具备受控执行能力（模型可调用受控工具、结果可核验）；尚未接入具体业务事项与外部业务系统。
 
-业务目标见 [business-goals.md](business-goals.md)，目标架构见 [recommended-architecture.md](recommended-architecture.md)。工程实现细节见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，受控执行层见 [docs/HARNESS.md](docs/HARNESS.md)，识别与展示契约（含评测集）见 [docs/INTENT-EVAL.md](docs/INTENT-EVAL.md)，发布前回放与发布门禁见 [docs/SOP-REPLAY.md](docs/SOP-REPLAY.md)，管理侧配置台见 [docs/ADMIN-CONSOLE.md](docs/ADMIN-CONSOLE.md)，协作规范见 [AGENTS.md](AGENTS.md) 与 [docs/DEVELOPMENT-OPERATING-MECHANISM.md](docs/DEVELOPMENT-OPERATING-MECHANISM.md)，界面约束见 [design/DESIGN.md](design/DESIGN.md)。
+业务目标见 [business-goals.md](business-goals.md)，目标架构见 [recommended-architecture.md](recommended-architecture.md)。工程实现细节见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，受控执行层见 [docs/HARNESS.md](docs/HARNESS.md)，识别与展示契约（含评测集）见 [docs/INTENT-EVAL.md](docs/INTENT-EVAL.md)，发布前回放与发布门禁见 [docs/SOP-REPLAY.md](docs/SOP-REPLAY.md)，管理侧配置台见 [docs/ADMIN-CONSOLE.md](docs/ADMIN-CONSOLE.md)，容量基线与扩容 runbook 见 [docs/CAPACITY-RUNBOOK.md](docs/CAPACITY-RUNBOOK.md)，协作规范见 [AGENTS.md](AGENTS.md) 与 [docs/DEVELOPMENT-OPERATING-MECHANISM.md](docs/DEVELOPMENT-OPERATING-MECHANISM.md)，界面约束见 [design/DESIGN.md](design/DESIGN.md)。
 
 ## 已实现
 
@@ -46,7 +46,10 @@ WorkPanda 是面向群众的自然语言公共服务入口。当前仓库处于*
 - 多级审批流、意图样例的运行时路由（Issue #52）与多实例发布同步（Issue #53）；
   管理侧配置台已可用（Issue #51），但启用前仍需业务与安全责任人确认权限边界，
   且真实浏览器里的一次完整操作走查仍待人工完成；
-- PostgreSQL、多实例部署、监控告警。
+- PostgreSQL 生产存储（Issue #34）、完整的多实例部署（限流与事件总线仍是单进程语义）、
+  监控告警平台。容量指标端点 `/api/ops/metrics`、实例数声明与多实例启动一致性门禁
+  已可用，但阈值待业务/安全责任人确认、双实例真实冒烟未跑，详见
+  [docs/CAPACITY-RUNBOOK.md](docs/CAPACITY-RUNBOOK.md)。
 
 ## 环境要求
 
@@ -92,9 +95,15 @@ uvicorn workpanda.main:app --app-dir src --reload
 | GET | `/api/ops/tasks/{task_id}/events` | 事件列表，支持 `after`、`type`、`since`/`until`、`limit` |
 | GET | `/api/ops/traces` | 执行留痕，支持 `task_id`、`limit`、`outcome`/`stop_reason`/`risk`、`cursor` |
 | GET | `/api/ops/traces/summary` | 执行指标聚合，支持 `task_id` |
+| GET | `/api/ops/tool-runtime` | 工具线程台账与容量闸门（要求 `admin`） |
+| GET | `/api/ops/metrics` | 容量基线指标与部署形态（要求 `admin`）；不可测项为 `value=null` + 原因，不返回 0 |
 | GET | `/api/ops/audit` | 审计归档，支持 `task_id`、`kind`、`since`/`until`、`cursor` |
 
 列表接口的响应体是数组，翻页靠 `X-Next-Cursor` 响应头（没有这个头就是到头了）。
+
+`/api/ops/metrics` 返回逐项指标状态（`ok` / `not_applicable` / `not_instrumented` /
+`error`）、`degraded` 与埋点缺口清单；阈值与「超过后必须做什么」不写在接口里，
+见 [docs/CAPACITY-RUNBOOK.md](docs/CAPACITY-RUNBOOK.md)（阈值属待确认的工程初值）。
 
 管理侧配置台接口 `/api/admin/flows/*` 使用第三套独立凭据
 `X-WorkPanda-Admin-Token`（`WORKPANDA_ADMIN_TOKENS`），未配置时整体 404；
@@ -116,6 +125,7 @@ uvicorn workpanda.main:app --app-dir src --reload
 |---|---|---|
 | `WORKPANDA_STORE_BACKEND` | `memory` | `memory` 或 `sqlite` |
 | `WORKPANDA_SQLITE_PATH` | `workpanda.db` | SQLite 文件路径 |
+| `WORKPANDA_EXPECTED_INSTANCES` | `1` | 部署方声明的实例数（非探测值）；`>= 2` 时启动强制要求 `redis` 共享后端、步骤租约与非 `memory` 任务存储，见 [docs/CAPACITY-RUNBOOK.md](docs/CAPACITY-RUNBOOK.md) |
 | `WORKPANDA_INTENT_CONFIDENCE_THRESHOLD` | `0.6` | 意图匹配最低置信度 |
 | `WORKPANDA_CONFIRMATION_TTL_SECONDS` | `300` | 确认凭证有效期 |
 | `WORKPANDA_EVENT_KEEPALIVE_SECONDS` | `15` | SSE 心跳间隔 |
