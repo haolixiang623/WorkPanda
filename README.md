@@ -54,14 +54,15 @@ WorkPanda 是面向群众的自然语言公共服务入口。当前仓库处于*
 ## 环境要求
 
 - Python 3.12 或更高版本
-- 依赖与工具配置在 `pyproject.toml`
+- 依赖与工具配置在 `pyproject.toml` 和 `requirements-dev.txt`（开发工具固定版本）
 
 ## 快速开始
 
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
-python -m pip install -e '.[dev]'
+python -m pip install -e .
+python -m pip install -r requirements-dev.txt
 uvicorn workpanda.main:app --app-dir src --reload
 ```
 

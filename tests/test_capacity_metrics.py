@@ -50,10 +50,13 @@ def redis_server() -> Iterator[FakeRedisServer]:
 
 
 def make_settings(**overrides: object) -> Settings:
-    """隔离本机 .env：容量测试必须只由显式参数决定。"""
+    """容量测试用到的值全部由显式参数决定，不读本机 .env。
+
+    测试进程在 conftest 加载时已屏蔽 `.env`（#72），本函数的职责是把用到的
+    key 枚举清楚，而不是再单独传 `_env_file=None`。详见 conftest 的注释。
+    """
 
     base = {
-        "_env_file": None,
         "store_backend": "memory",
         "enable_demo_flow": False,
         "ops_tokens": f"boss:admin:{ADMIN_TOKEN},duty:viewer:{VIEWER_TOKEN}",

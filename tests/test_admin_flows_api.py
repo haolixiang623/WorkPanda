@@ -60,7 +60,6 @@ def draft(version: str = "1", **overrides) -> dict:
 @pytest.fixture
 def admin_client() -> Iterator[tuple[TestClient, Container]]:
     settings = Settings(
-        _env_file=None,
         store_backend="memory",
         enable_demo_flow=False,
         admin_tokens=f"boss:admin:{ADMIN_TOKEN},duty:viewer:{VIEWER_TOKEN}",
@@ -110,7 +109,7 @@ def citizen_create(client: TestClient, container: Container) -> dict:
 
 def test_admin_api_is_hidden_when_not_configured() -> None:
     container = build_container(
-        Settings(_env_file=None, store_backend="memory", enable_demo_flow=False)
+        Settings(store_backend="memory", enable_demo_flow=False)
     )
     client = TestClient(create_app(container=container))
     try:

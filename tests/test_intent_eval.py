@@ -651,7 +651,6 @@ def test_admin_publish_without_samples_returns_actionable_409() -> None:
     header = {"X-WorkPanda-Admin-Token": token}
     container = build_container(
         Settings(
-            _env_file=None,
             store_backend="memory",
             enable_demo_flow=False,
             admin_tokens=f"boss:admin:{token}",
