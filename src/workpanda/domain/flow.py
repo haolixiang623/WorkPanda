@@ -102,24 +102,75 @@ class FlowReleaseMissing(LookupError):
     """发布指针指向的版本不存在。"""
 
 
+# 署名长度上限。主体名（`OpsPrincipal.subject`）本身已被限制在 64 字符内，这个上限
+# 是针对命令行与脚本入口的：宁可写不进去，也不要让一条被粘贴进来的整段日志冒充人名。
+MAX_ACTOR_LENGTH = 128
+
+
+def require_actor(actor: str) -> str:
+    """校验并规范化署名，返回去掉首尾空白的值。
+
+    空串与纯空白一律拒绝：库里留下一个空署名，事后与"没有署名"无法区分，却会让
+    读者以为"这件事有人负责"。发布、回滚、停用都是不可撤销的责任锚点，这里不做
+    静默默认值——默认值等于把"忘了传"变成一条查不出来的历史。
+    """
+
+    cleaned = (actor or "").strip()
+    if not cleaned:
+        raise ValueError("actor must not be blank; 发布/回滚/停用必须记录署名")
+    if len(cleaned) > MAX_ACTOR_LENGTH:
+        raise ValueError(f"actor must be at most {MAX_ACTOR_LENGTH} characters")
+    return cleaned
+
+
+@dataclass(frozen=True, slots=True)
+class FlowRelease:
+    """一条发布指针行的只读视图，带署名。
+
+    `version` 是指针最后一次指向的版本。停用后仍保留它：删行会同时删掉
+    "谁停用的"这条线索，而停用恰恰是最需要追责的动作。判断"现在到底跑不跑"
+    只能看 `published`，不能看 `version` 是否存在。
+    """
+
+    flow_id: str
+    version: str
+    published: bool
+    published_by: str | None
+    # 指针最后一次移动（发布/回滚）的时间。停用**不**改它：停用不移动指针，
+    # 若覆盖成停用时刻，`published_by` 与这个时间就指向两件不同的事。
+    updated_at: str
+    disabled_by: str | None
+
+
 class FlowStore(Protocol):
     """流程定义的持久化端口。
 
     只表达两件事：**有哪些版本**、**哪个版本是当前发布指针**。发布状态不写进
     版本内容——否则"发布"要改两条记录，改一半就是两种真相。
+
+    移动指针与停用都必须带署名：本轮不做双人复核，署名是这条链路唯一的责任锚点。
     """
 
     def add_version(self, flow: FlowDefinition) -> None:
         """新增一个版本。已存在则抛 `FlowVersionExists`，绝不覆盖。"""
 
-    def publish(self, flow_id: str, version: str) -> None:
-        """把发布指针移向指定版本。版本不存在则抛 `FlowReleaseMissing`。"""
+    def publish(self, flow_id: str, version: str, *, actor: str) -> None:
+        """把发布指针移向指定版本，并记下是谁做的。版本不存在则抛 `FlowReleaseMissing`。
 
-    def disable(self, flow_id: str) -> None:
-        """清空发布指针。历史版本保留，回滚就是再把指针移回去。"""
+        `actor` 是**仅关键字必填**参数：漏传是类型错误，不会被静默补成空串。
+        """
+
+    def disable(self, flow_id: str, *, actor: str) -> None:
+        """停用：在指针行上打标记，历史版本与发布署名都保留。
+
+        不做物理删除——删掉那一行会连"谁发布的、谁停用的"一起抹掉。
+        """
 
     def published_versions(self) -> dict[str, str]:
-        """`flow_id -> 已发布版本`。没有指针的流程不出现在结果里。"""
+        """`flow_id -> 已发布版本`。没有指针（含已停用）的流程不出现在结果里。"""
+
+    def releases(self) -> list[FlowRelease]:
+        """每一条指针行（含已停用的），按 `flow_id` 排序。供署名台账只读查询。"""
 
     def list_versions(self, flow_id: str | None = None) -> list[FlowDefinition]:
         """按 `(flow_id, version)` 排序返回版本，不做发布状态过滤。"""

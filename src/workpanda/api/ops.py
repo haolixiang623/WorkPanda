@@ -6,13 +6,15 @@
 
 接口默认关闭；必须配置 `WORKPANDA_OPS_TOKEN` 或 `WORKPANDA_OPS_TOKENS` 才能访问。
 可见范围按主体角色收窄：`viewer` 只看列表与聚合指标，明细（任务详情、事件流、
-留痕原文、审计归档、工具台账）只有 `admin` 能看。角色划分理由见 `ops_auth`。
+留痕原文、审计归档、工具台账、发布署名台账）只有 `admin` 能看。角色划分理由见
+`ops_auth`。
 """
 
 from datetime import datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
+from pydantic import BaseModel
 
 from workpanda.api.dependencies import get_container
 from workpanda.api.ops_auth import OpsDisabled, OpsPrincipal, OpsUnauthenticated
@@ -54,6 +56,23 @@ _CURSOR_RESPONSES = {
         }
     }
 }
+
+
+class FlowReleaseView(BaseModel):
+    """一条发布指针行的对外视图（含署名）。
+
+    `version` 是最后一次指向的版本，停用后仍然给出：只知道"被停用了"却不知道停的是
+    哪一版，事后核对时还得回管理侧再查一次。判断"现在跑不跑"只能看 `published`。
+    `updated_at` 是最后一次发布 / 回滚的时间；停用不改它，所以停用时间不在本视图里
+    ——那个时刻没有独立的列，不编一个。
+    """
+
+    flow_id: str
+    version: str
+    published: bool
+    published_by: str | None
+    updated_at: str
+    disabled_by: str | None
 
 
 def _invalid_cursor() -> HTTPException:
@@ -427,6 +446,43 @@ async def capacity_metrics(container: Container = Depends(get_container)) -> Cap
     """
 
     return collect_capacity(container)
+
+
+@router.get(
+    "/flows/releases",
+    response_model=list[FlowReleaseView],
+    dependencies=[Depends(require_ops_admin)],
+)
+async def list_flow_releases(
+    container: Container = Depends(get_container),
+) -> list[FlowReleaseView]:
+    """发布 / 回滚 / 停用的署名台账（Issue #61）。
+
+    与管理侧的版本列表是**两个问题**：管理侧回答"现在跑的是哪一版"，这里回答
+    "谁在什么时候把哪一版推上线、谁把它停了"。因此返回每一条指针行（含已停用的），
+    而不只是 `published=true` 的那些。
+
+    只读：不移动指针、不跑门禁、不触达外部服务。未配置版本库（测试直接注入流程
+    定义）时返回空数组而不是 404——接口存在性不随配置变化，与 `/audit` 一致。
+
+    要求 `admin`：署名是责任归属信息，与运维明细同级；`viewer` 是日常值班角色，
+    看到"谁发的"却不该看到明细，权限边界会随数据形状漂移。
+    """
+
+    store = container.flow_store
+    if store is None:
+        return []
+    return [
+        FlowReleaseView(
+            flow_id=release.flow_id,
+            version=release.version,
+            published=release.published,
+            published_by=release.published_by,
+            updated_at=release.updated_at,
+            disabled_by=release.disabled_by,
+        )
+        for release in store.releases()
+    ]
 
 
 @router.get(

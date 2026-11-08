@@ -43,8 +43,8 @@ export WORKPANDA_ADMIN_TOKENS='duty01:viewer:<随机串>,sop01:admin:<随机串>
 | POST | `/api/admin/flows/{flow_id}/versions/{version}/cases` | 403 | 201 | 新增回放用例 |
 | DELETE | `.../cases/{case_id}` | 403 | 200 | 删除用例 |
 | POST | `/api/admin/flows/{flow_id}/publish` | 403 | 200/409 | 发布；`apply=false` 为预演 |
-| POST | `/api/admin/flows/{flow_id}/disable` | 403 | 200 | 停用（清空指针） |
-| POST | `/api/admin/flows/{flow_id}/rollback` | 403 | 200 | 回滚到指定历史版本 |
+| POST | `/api/admin/flows/{flow_id}/disable` | 403 | 200 | 停用（指针行打标记，保留署名） |
+| POST | `/api/admin/flows/{flow_id}/rollback` | 403 | 200 | 回滚到指定历史版本（同样记 `published_by`） |
 
 草稿提交体没有 `status` 字段：版本内容里的 status 只是作者态标记，服务端固定写成
 `draft`，只有发布指针能让流程生效。前端因此无法构造出一个"自带 published"的版本。
@@ -114,6 +114,29 @@ pydantic 先挡字段形状（422 带 `loc`），再由 `flow_field_errors()` �
 规则本身仍由装配期代码给出：本轮不做样例自动生成、不从历史任务反推样例，也不做
 「群众说一句话就自动路由到新流程」的规则装配。
 
+### 3.6 发布 / 回滚 / 停用的署名（Issue #61）
+
+一条流程被推上线后，必须能回答"谁在什么时候把 v3 换成了 v4"。本轮不做双人复核，
+署名就是这条链路唯一的责任锚点——没有复核兜底，又没有署名，等于发布无人负责。
+
+- `FlowStore.publish(flow_id, version, *, actor)` / `disable(flow_id, *, actor)`：`actor`
+  是**仅关键字必填**参数，漏传是 `TypeError`，空串被 `require_actor()` 拒绝。不留默认值，
+  因为默认值会把"忘了传"变成一条查不出来的历史。
+- `flow_releases` 增 `published_by` / `disabled_by`；启动时按 `PRAGMA table_info` 幂等
+  补列，旧库旧数据为 `NULL` 且**不回填**——把历史发布硬塞给某个主体，比留空更糟。
+- 管理侧 publish / rollback / disable 的署名取自已鉴权的 `OpsPrincipal.subject`，请求体
+  里同名字段被忽略（可自报的署名等于没有署名）。
+- **停用改为打标记，不删行**：删掉那一行会把发布人一起抹掉，而"谁停用的"恰恰是最需要
+  追责的动作。`published_versions()` 过滤带标记的行，对外"没有指针"的语义不变；重新发布
+  清掉标记。重复停用保持第一次的署名人——状态没有再次改变，就不产生新事实。
+- `updated_at` 只随发布 / 回滚变化，停用不改它；否则 `published_by` 与这个时间会指向
+  两件事。停用时刻没有独立的列，界面也不编一个。
+- 署名不只落在管理侧响应里：运维侧 `GET /api/ops/flows/releases`（`admin` 角色）能读到
+  每一条指针行的 `published_by` / `disabled_by` / `updated_at`，含已停用的行。管理侧看得见、
+  运维侧查不到，等于署名的可用范围只有一半。
+- 装配期播种的署名固定为 `bootstrap`（不是人名）；`scripts/replay_flow.py --publish`
+  必须同时给 `--actor`，命令行同样是匿名发布的入口，不能漏。
+
 ## 4. 验收标准对照
 
 | 验收项 | 落地与回归 |
@@ -129,6 +152,12 @@ pydantic 先挡字段形状（422 带 `loc`），再由 `flow_field_errors()` �
 | #62：只用界面建出的流程能发布成功 | `test_ui_created_flow_can_publish`（界面提交体 → 草稿含样例 → 回放 → 发布） |
 | #62：样例不足时按钮禁用并写明缺什么 | `test_local_sample_gate_disables_save_until_counts_met`、`test_compiled_bundle_wires_the_sample_gate` |
 | #62：前端阈值漂移时服务端仍权威 | `test_server_gate_is_authoritative_when_local_thresholds_drift`（409 + 指针不动） |
+| #61：发布 / 回滚后能读到署名 | `test_publish_records_actor`、`test_rollback_updates_the_publisher`、`test_rollback_records_the_rolling_back_actor` |
+| #61：`actor` 仅关键字必填、空串被拒 | `test_actor_is_keyword_only_and_required`（含空串 / 纯空白） |
+| #61：伪造请求体署名无效 | `test_publish_ignores_self_reported_author`、`test_viewer_cannot_publish_with_a_forged_author` |
+| #61：旧库幂等迁移、旧数据为 NULL | `test_legacy_database_is_migrated_without_backfilling`、`test_migrated_database_accepts_attribution` |
+| #61：停用保留署名且不删行 | `test_disable_records_the_actor_and_keeps_the_publisher`、`test_disable_records_actor_without_deleting_the_row` |
+| #61：运维侧能查到署名台账 | `test_ops_release_ledger_exposes_attribution`、`test_ops_release_ledger_keeps_disabled_rows` |
 | 手工走查 | 运维视角「建草稿 → 回放 → 发布 → 回滚」仍需在试点浏览器里走一遍，见第 6 节 |
 
 ## 5. 部署与运维

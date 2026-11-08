@@ -2,6 +2,7 @@
 
 from collections import defaultdict
 from collections.abc import Sequence
+from dataclasses import replace
 from threading import Lock
 from typing import Any
 from uuid import UUID
@@ -9,8 +10,10 @@ from uuid import UUID
 from workpanda.domain.confirmation import Confirmation, ConfirmationError
 from workpanda.domain.flow import (
     FlowDefinition,
+    FlowRelease,
     FlowReleaseMissing,
     FlowVersionExists,
+    require_actor,
     validate_flow,
 )
 from workpanda.domain.models import EventType, Task, TaskEvent, TaskStatus, utc_now
@@ -204,12 +207,13 @@ class InMemoryFlowStore:
     """进程内流程版本库，语义与 `SqliteFlowStore` 一致（重启即丢）。
 
     只用于 `store_backend=memory` 与测试。两条表在内存里就是两个 dict：
-    版本内容与发布指针，指针为空表示停用。
+    版本内容与发布指针。指针行带署名，停用是打标记而不是删键——与 SQLite 实现
+    同一套语义，否则测试会用另一套真相骗过自己。
     """
 
     def __init__(self) -> None:
         self._versions: dict[tuple[str, str], FlowDefinition] = {}
-        self._pointers: dict[str, str] = {}
+        self._pointers: dict[str, FlowRelease] = {}
         self._lock = Lock()
 
     def close(self) -> None:
@@ -225,22 +229,44 @@ class InMemoryFlowStore:
                 )
             self._versions[key] = flow.model_copy()
 
-    def publish(self, flow_id: str, version: str) -> None:
+    def publish(self, flow_id: str, version: str, *, actor: str) -> None:
+        actor = require_actor(actor)
         with self._lock:
             if (flow_id, version) not in self._versions:
                 raise FlowReleaseMissing(
                     f"flow {flow_id!r} version {version!r} is not registered; "
                     "先写入版本再发布"
                 )
-            self._pointers[flow_id] = version
+            self._pointers[flow_id] = FlowRelease(
+                flow_id=flow_id,
+                version=version,
+                published=True,
+                published_by=actor,
+                updated_at=canonical_stamp(utc_now()),
+                disabled_by=None,
+            )
 
-    def disable(self, flow_id: str) -> None:
+    def disable(self, flow_id: str, *, actor: str) -> None:
+        actor = require_actor(actor)
         with self._lock:
-            self._pointers.pop(flow_id, None)
+            current = self._pointers.get(flow_id)
+            if current is None or current.disabled_by is not None:
+                return
+            self._pointers[flow_id] = replace(
+                current, published=False, disabled_by=actor
+            )
 
     def published_versions(self) -> dict[str, str]:
         with self._lock:
-            return dict(self._pointers)
+            return {
+                flow_id: release.version
+                for flow_id, release in self._pointers.items()
+                if release.published
+            }
+
+    def releases(self) -> list[FlowRelease]:
+        with self._lock:
+            return [self._pointers[flow_id] for flow_id in sorted(self._pointers)]
 
     def list_versions(self, flow_id: str | None = None) -> list[FlowDefinition]:
         with self._lock:

@@ -140,7 +140,7 @@ def test_insufficient_samples_block_publish() -> None:
     service = _release_service(store, _gate(_rule()))
 
     with pytest.raises(IntentEvalBlocked) as caught:
-        service.release(flow.flow_id, flow.version)
+        service.release(flow.flow_id, flow.version, actor="tester")
 
     codes = {finding.code for finding in caught.value.report.blocking}
     assert IntentEvalFindingCode.SAMPLE_COUNT_SHORT in codes
@@ -159,7 +159,7 @@ def test_positives_without_near_miss_are_rejected() -> None:
     service = _release_service(store, _gate(_rule()))
 
     with pytest.raises(IntentEvalBlocked) as caught:
-        service.release(flow.flow_id, flow.version)
+        service.release(flow.flow_id, flow.version, actor="tester")
 
     details = "；".join(finding.detail for finding in caught.value.report.blocking)
     assert "近似误例不足" in details
@@ -176,7 +176,7 @@ def test_full_samples_publish_without_replay_cases() -> None:
     store.add_version(flow)
     service = _release_service(store, _gate(_rule()))
 
-    outcome = service.release(flow.flow_id, flow.version)
+    outcome = service.release(flow.flow_id, flow.version, actor="tester")
 
     assert outcome.published is True
     assert outcome.replay_ran is False
@@ -193,7 +193,9 @@ def test_gate_is_skipped_only_when_explicitly_absent() -> None:
     store = InMemoryFlowStore()
     store.add_version(flow)
 
-    outcome = _release_service(store, None).release(flow.flow_id, flow.version)
+    outcome = _release_service(store, None).release(
+        flow.flow_id, flow.version, actor="tester"
+    )
 
     assert outcome.published is True
     assert outcome.intent_report is None
@@ -217,12 +219,12 @@ def test_misroute_to_another_flow_blocks_release() -> None:
     store = InMemoryFlowStore()
     for flow in (beta, delta):
         store.add_version(flow)
-    store.publish(beta.flow_id, beta.version)
+    store.publish(beta.flow_id, beta.version, actor="tester")
 
     service = _release_service(store, _gate(_rule("eval.beta", keywords=("进度",))))
 
     with pytest.raises(IntentEvalBlocked) as caught:
-        service.release(delta.flow_id, delta.version)
+        service.release(delta.flow_id, delta.version, actor="tester")
 
     report = caught.value.report
     assert report.misroute_count >= 1
@@ -242,7 +244,7 @@ def test_rule_on_old_version_counts_as_misroute() -> None:
     service = _release_service(store, _gate(_rule(version="1")))
 
     with pytest.raises(IntentEvalBlocked) as caught:
-        service.release(flow.flow_id, flow.version)
+        service.release(flow.flow_id, flow.version, actor="tester")
 
     report = caught.value.report
     assert report.misroute_count == len(ALPHA_POS)
@@ -260,7 +262,7 @@ def test_near_miss_routed_is_a_misroute() -> None:
     service = _release_service(store, _gate(_rule()))
 
     with pytest.raises(IntentEvalBlocked) as caught:
-        service.release(flow.flow_id, flow.version)
+        service.release(flow.flow_id, flow.version, actor="tester")
 
     codes = {finding.code for finding in caught.value.report.findings}
     assert IntentEvalFindingCode.SAMPLE_ROUTED in codes
@@ -275,7 +277,7 @@ def test_out_of_scope_routed_is_a_misroute() -> None:
     service = _release_service(store, _gate(_rule()))
 
     with pytest.raises(IntentEvalBlocked) as caught:
-        service.release(flow.flow_id, flow.version)
+        service.release(flow.flow_id, flow.version, actor="tester")
 
     assert IntentEvalFindingCode.SAMPLE_ROUTED in {
         finding.code for finding in caught.value.report.findings
@@ -293,7 +295,7 @@ def test_miss_over_limit_blocks() -> None:
     service = _release_service(store, _gate())
 
     with pytest.raises(IntentEvalBlocked) as caught:
-        service.release(flow.flow_id, flow.version)
+        service.release(flow.flow_id, flow.version, actor="tester")
 
     report = caught.value.report
     assert report.miss_rate == 1.0
@@ -460,7 +462,7 @@ def test_samples_survive_sqlite_round_trip(workdir: Path) -> None:
     store = SqliteFlowStore(workdir / "flows.db")
     try:
         store.add_version(flow)
-        store.publish(flow.flow_id, flow.version)
+        store.publish(flow.flow_id, flow.version, actor="tester")
         reloaded = store.list_versions(flow.flow_id)[0]
     finally:
         store.close()
@@ -482,7 +484,7 @@ def test_new_flow_that_steals_utterances_is_blocked() -> None:
     )
     store = InMemoryFlowStore()
     store.add_version(alpha)
-    store.publish(alpha.flow_id, alpha.version)
+    store.publish(alpha.flow_id, alpha.version, actor="tester")
     store.add_version(gamma)
 
     # gamma 的规则同时命中"改绑"与"手机号"，分值压过 alpha 的单词命中。
@@ -493,7 +495,7 @@ def test_new_flow_that_steals_utterances_is_blocked() -> None:
     service = _release_service(store, gate)
 
     with pytest.raises(IntentEvalBlocked) as caught:
-        service.release(gamma.flow_id, gamma.version)
+        service.release(gamma.flow_id, gamma.version, actor="tester")
 
     report = caught.value.report
     assert report.misroute_count >= 1
@@ -594,6 +596,9 @@ def _publish_via_script(db: Path, flow_id: str, version: str) -> subprocess.Comp
             "--sqlite",
             str(db),
             "--publish",
+            # 发布必须署名（#61）：命令行入口也不接受匿名发布。
+            "--actor",
+            "ops.tester",
         ],
         capture_output=True,
         text=True,

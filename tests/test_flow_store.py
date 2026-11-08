@@ -83,7 +83,7 @@ def test_existing_version_content_is_not_overwritten(store: SqliteFlowStore) -> 
 
 def test_publish_requires_an_existing_version(store: SqliteFlowStore) -> None:
     with pytest.raises(FlowReleaseMissing):
-        store.publish(FLOW_ID, "1")
+        store.publish(FLOW_ID, "1", actor="tester")
 
     # 失败不能留下半个指针，否则下一次启动会指向一个空洞。
     assert store.published_versions() == {}
@@ -93,10 +93,10 @@ def test_rollback_is_moving_the_pointer_back(store: SqliteFlowStore) -> None:
     store.add_version(make_flow("1"))
     store.add_version(make_flow("2"))
 
-    store.publish(FLOW_ID, "2")
+    store.publish(FLOW_ID, "2", actor="tester")
     assert FlowRegistry.from_store(store).resolve(FLOW_ID).version == "2"
 
-    store.publish(FLOW_ID, "1")
+    store.publish(FLOW_ID, "1", actor="tester")
     assert FlowRegistry.from_store(store).resolve(FLOW_ID).version == "1"
     # 回滚不删历史：v2 仍在库里，随时可以再发回去。
     assert [flow.version for flow in store.list_versions(FLOW_ID)] == ["1", "2"]
@@ -107,9 +107,9 @@ def test_disabled_flow_does_not_fall_back_to_the_highest_version(
 ) -> None:
     store.add_version(make_flow("1"))
     store.add_version(make_flow("2"))
-    store.publish(FLOW_ID, "2")
+    store.publish(FLOW_ID, "2", actor="tester")
 
-    store.disable(FLOW_ID)
+    store.disable(FLOW_ID, actor="tester")
 
     registry = FlowRegistry.from_store(store)
     with pytest.raises(FlowNotRunnable):
@@ -142,10 +142,10 @@ def test_require_still_returns_a_version_after_rollback(store: SqliteFlowStore) 
 
     store.add_version(make_flow("1"))
     store.add_version(make_flow("2"))
-    store.publish(FLOW_ID, "2")
+    store.publish(FLOW_ID, "2", actor="tester")
 
     registry = FlowRegistry.from_store(store)
-    store.publish(FLOW_ID, "1")
+    store.publish(FLOW_ID, "1", actor="tester")
     rolled_back = FlowRegistry.from_store(store)
 
     with pytest.raises(FlowNotRunnable):
@@ -159,7 +159,7 @@ def test_resolving_a_missing_version_does_not_fall_back(store: SqliteFlowStore) 
 
     store.add_version(make_flow("1"))
     store.add_version(make_flow("3"))
-    store.publish(FLOW_ID, "3")
+    store.publish(FLOW_ID, "3", actor="tester")
 
     with pytest.raises(FlowNotFound):
         FlowRegistry.from_store(store).resolve(FLOW_ID, "2")
@@ -173,7 +173,7 @@ def test_versions_and_pointer_survive_a_restart(workdir: Path) -> None:
     first = SqliteFlowStore(path)
     first.add_version(make_flow("1"))
     first.add_version(make_flow("2"))
-    first.publish(FLOW_ID, "1")
+    first.publish(FLOW_ID, "1", actor="tester")
     first.close()
 
     second = SqliteFlowStore(path)
@@ -243,9 +243,9 @@ def test_in_memory_store_matches_the_sqlite_contract() -> None:
     with pytest.raises(FlowVersionExists):
         memory.add_version(make_flow("1"))
     with pytest.raises(FlowReleaseMissing):
-        memory.publish(FLOW_ID, "9")
+        memory.publish(FLOW_ID, "9", actor="tester")
 
-    memory.publish(FLOW_ID, "1")
+    memory.publish(FLOW_ID, "1", actor="tester")
     assert memory.published_versions() == {FLOW_ID: "1"}
-    memory.disable(FLOW_ID)
+    memory.disable(FLOW_ID, actor="tester")
     assert memory.published_versions() == {}

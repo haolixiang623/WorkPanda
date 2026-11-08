@@ -321,25 +321,32 @@ def build_replay_case_store(
     return InMemoryReplayCaseStore(), []
 
 
+# 装配期播种的署名。故意不是人名：这一刻没有"某个人"在做，写成人名就是伪造记录。
+SEED_ACTOR = "bootstrap"
+
+
 def seed_demo_flows(store: FlowStore, *, enabled: bool) -> None:
     """把骨架自检流程同步到库里的真实状态。
 
-    开启时确保版本存在、指针指向它；关闭时**清空指针**。只"不写入"是不够的：
+    开启时确保版本存在、指针指向它；关闭时**停用**它。只"不写入"是不够的：
     上一次开着跑过的库里还留着指针，那等于关不掉——而"正式接入业务前必须关闭"
     这条要求必须真的生效。
 
     已存在的同版本内容一律沿用、不覆盖：版本不可变是回滚能成立的前提。
+
+    署名固定为 `SEED_ACTOR`：这一步没有"某个人"在做，写成人名就是伪造记录；
+    写成一个明确表示"装配期同步"的名字，事后能一眼看出它不是一次人工发布。
     """
 
     for flow in demo_flows():
         if not enabled:
-            store.disable(flow.flow_id)
+            store.disable(flow.flow_id, actor=SEED_ACTOR)
             continue
         try:
             store.add_version(flow)
         except FlowVersionExists:
             pass
-        store.publish(flow.flow_id, flow.version)
+        store.publish(flow.flow_id, flow.version, actor=SEED_ACTOR)
 
 
 def build_shared_state(

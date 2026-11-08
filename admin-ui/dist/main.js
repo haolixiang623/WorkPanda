@@ -192,17 +192,25 @@ function renderFlows(flows) {
             row.insertCell().textContent = text;
         }
         const stateCell = row.insertCell();
+        const tag = document.createElement("span");
         if (flow.published) {
-            const tag = document.createElement("span");
             tag.className = "tag on";
-            tag.textContent = "已发布";
-            stateCell.replaceChildren(tag);
+            tag.textContent =
+                flow.published_by === null ? "已发布" : `已发布 · ${flow.published_by}`;
+            if (flow.updated_at !== null) {
+                tag.title = `发布于 ${flow.updated_at}`;
+            }
         }
         else {
-            const tag = document.createElement("span");
             tag.className = "tag off";
             tag.textContent = "草稿";
-            stateCell.replaceChildren(tag);
+        }
+        stateCell.replaceChildren(tag);
+        if (flow.disabled_by !== null) {
+            const note = document.createElement("div");
+            note.className = "muted";
+            note.textContent = `由 ${flow.disabled_by} 停用`;
+            stateCell.append(note);
         }
         row.insertCell().textContent = String(flow.case_count);
         const actions = row.insertCell();
@@ -539,8 +547,11 @@ async function publish(flow, apply) {
     el("action-version").value = flow.version;
     try {
         const outcome = await api(`/api/admin/flows/${encodeURIComponent(flow.flow_id)}/publish`, "POST", { version: flow.version, apply });
+        const attribution = outcome.published_by === null
+            ? ""
+            : `，署名 ${escapeHtml(outcome.published_by)}`;
         showMessage("ok", `<strong>${outcome.published ? "已发布" : "预演通过，未发布"}</strong>：` +
-            `${escapeHtml(outcome.message)}；回放门禁${outcome.replay_ran ? "已执行" : "未执行（该版本没有用例）"}。`);
+            `${escapeHtml(outcome.message)}${attribution}；回放门禁${outcome.replay_ran ? "已执行" : "未执行（该版本没有用例）"}。`);
         await refreshFlows();
     }
     catch (error) {
@@ -551,8 +562,8 @@ async function publish(flow, apply) {
     }
 }
 async function rollback(flow) {
-    await api(`/api/admin/flows/${encodeURIComponent(flow.flow_id)}/rollback`, "POST", { version: flow.version });
-    showMessage("ok", `已回滚 ${escapeHtml(flow.flow_id)} 到 ${escapeHtml(flow.version)}；在途任务仍按各自版本继续。`);
+    const result = await api(`/api/admin/flows/${encodeURIComponent(flow.flow_id)}/rollback`, "POST", { version: flow.version });
+    showMessage("ok", `已回滚 ${escapeHtml(flow.flow_id)} 到 ${escapeHtml(flow.version)}（署名 ${escapeHtml(result.published_by)}）；在途任务仍按各自版本继续。`);
     await refreshFlows();
 }
 async function disable() {
@@ -560,8 +571,8 @@ async function disable() {
     if (flowId === "") {
         throw new Error("请先填写 flow_id。");
     }
-    await api(`/api/admin/flows/${encodeURIComponent(flowId)}/disable`, "POST");
-    showMessage("ok", `${escapeHtml(flowId)} 已停用（历史版本保留，可随时回滚）。`);
+    const result = await api(`/api/admin/flows/${encodeURIComponent(flowId)}/disable`, "POST");
+    showMessage("ok", `${escapeHtml(flowId)} 已由 ${escapeHtml(result.disabled_by)} 停用（历史版本与发布署名保留，可随时回滚）。`);
     await refreshFlows();
 }
 function bind(id, action) {

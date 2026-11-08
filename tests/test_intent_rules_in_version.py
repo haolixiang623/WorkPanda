@@ -140,7 +140,7 @@ def test_publishing_a_version_switches_routing_without_restart() -> None:
         store = container.flow_store
         assert store is not None
         store.add_version(_flow("1", "报修"))
-        store.publish("intent.repair", "1")
+        store.publish("intent.repair", "1", actor="tester")
         container.flows.reload(store)
 
         router = container.router
@@ -343,7 +343,7 @@ def test_eval_script_only_uses_rules_of_published_versions() -> None:
     module = _load_script()
     store = InMemoryFlowStore()
     store.add_version(_flow("1", "报修"))
-    store.publish("intent.repair", "1")
+    store.publish("intent.repair", "1", actor="tester")
     # 草稿版本用同一个关键词，但挂在另一个 flow_id 上：规则若混进路由器，
     # 已发布版本的"我要报修"会被路由到它，报告里出现误路由。
     store.add_version(
