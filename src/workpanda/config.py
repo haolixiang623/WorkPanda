@@ -20,6 +20,12 @@ class Settings(BaseSettings):
     # memory：仅进程内，重启丢失；sqlite：本地持久化。生产应接入 PostgreSQL。
     store_backend: str = "memory"
     sqlite_path: Path = Path("workpanda.db")
+    # 运维对「本次部署会同时运行几个实例」的显式声明，不是运行时探测值：
+    # 服务无法自己数出有几个进程，只能由部署方声明。默认 1 = 当前 launchd 单实例试点。
+    # 声明 >1 时由 capacity.validate_deployment_topology 在启动期强制要求跨进程共享
+    # 状态后端与步骤租约，避免每个实例都以为自己是唯一执行者（Issue #53）。
+    # 阈值、升级顺序与回滚见 docs/CAPACITY-RUNBOOK.md。
+    expected_instances: int = 1
     intent_confidence_threshold: float = 0.6
     confirmation_ttl_seconds: int = 300
     event_keepalive_seconds: float = 15.0

@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, 
 from workpanda.api.dependencies import get_container
 from workpanda.api.ops_auth import OpsDisabled, OpsPrincipal, OpsUnauthenticated
 from workpanda.bootstrap import Container
+from workpanda.capacity import CapacitySnapshot, collect_capacity
 from workpanda.domain.models import (
     EventType,
     TaskEvent,
@@ -402,6 +403,30 @@ async def tool_runtime(container: Container = Depends(get_container)) -> dict:
     if stats is None:
         return {"available": False}
     return {"available": True, **stats()}
+
+
+@router.get(
+    "/metrics",
+    response_model=CapacitySnapshot,
+    dependencies=[Depends(require_ops_admin)],
+)
+async def capacity_metrics(container: Container = Depends(get_container)) -> CapacitySnapshot:
+    """容量基线指标与当前部署形态（Issue #53）。
+
+    只做只读采集：不推进流程、不改状态、不调用外部服务。每个指标自带 `available`
+    与 `unit`；采集不到或尚未埋点的项一律 `available=false` + `value=null` + `reason`，
+    **绝不返回 0**——0 会被值班读成「没有压力」，而事实是「没测到」。有任一不可用
+    项时顶层 `degraded=true`。
+
+    这里不返回阈值、不判断是否该扩容：阈值与升级顺序属待业务/安全责任人确认的
+    事项，写在 `docs/CAPACITY-RUNBOOK.md`。本端点也不含任何凭据、连接串、任务正文
+    或群众原话，只有数值与配置枚举。
+
+    要求 `admin` 而不是 `viewer`：这是新增的运维暴露面（含部署形态配置），按最小
+    可见范围起步；是否下放给 `viewer` 需责任人确认，见 runbook「暴露面」一节。
+    """
+
+    return collect_capacity(container)
 
 
 @router.get(

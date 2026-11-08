@@ -233,7 +233,9 @@ created → running → waiting_for_user → running
 - 尚无真实业务系统工具，外部访问能力默认关闭（`http_fetch` 需显式白名单）；
 - 回放只观测"步骤要求调用哪个工具"，不覆盖"模型实际调用了几次"；回放报告不落库，
   需要留档时自行保存命令行输出；
-- 无审计日志与指标导出。
+- 审计日志已有归档端点，容量指标已有只读快照端点 `GET /api/ops/metrics`，但两者
+  都未接入监控告警平台；指标中 SQLite 写锁等待与任务创建 p95 尚未埋点。容量阈值、
+  扩容顺序与回滚见 [CAPACITY-RUNBOOK.md](CAPACITY-RUNBOOK.md)（阈值待确认）。
 
 ## 7. 下一步建议顺序
 

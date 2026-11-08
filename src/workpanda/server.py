@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import uvicorn
 
+from workpanda.capacity import validate_deployment_topology
 from workpanda.config import Settings, get_settings
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -76,6 +77,9 @@ def build_uvicorn_config(settings: Settings | None = None) -> uvicorn.Config:
 
     resolved = settings or get_settings()
     validate_network_settings(resolved)
+    # 部署形态与网络绑定同属启动期安全前提：声明多实例却仍用进程内状态后端时，
+    # 不能等 lifespan 建好容器才发现（Issue #53）。
+    validate_deployment_topology(resolved)
     options: dict = {
         "host": resolved.bind_host,
         "port": resolved.bind_port,

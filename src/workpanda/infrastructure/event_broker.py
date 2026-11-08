@@ -65,3 +65,15 @@ class EventBroker:
     def subscriber_count(self, task_id: UUID) -> int:
         with self._lock:
             return len(self._subscribers.get(task_id, ()))
+
+    def total_subscriber_count(self) -> int:
+        """所有任务上的活跃订阅总数，即当前进程持有的 SSE 连接数。
+
+        只统计本进程：`EventBroker` 是进程内的，多实例部署时每个实例各报各的，
+        调用方需要按实例求和。`docs/CAPACITY-RUNBOOK.md` 说明了这点——单看一个
+        实例的数字去判断整体容量会低估。取总数与取单任务数用同一把锁，保证快照
+        内部一致，不会把「刚加入的连接」算进总数却没算进某个任务。
+        """
+
+        with self._lock:
+            return sum(len(subscribers) for subscribers in self._subscribers.values())

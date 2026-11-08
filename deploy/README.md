@@ -11,6 +11,9 @@
   FastAPI 服务占用）。
 - 凭据只进钥匙串（service `workpanda-deploy`）；仓库、plist、`api.env`
   里都不会出现明文。`api.env` 只允许白名单内的非敏感键，写敏感键会被拒绝。
+- 本部署是**单实例**（`WORKPANDA_EXPECTED_INSTANCES` 默认 `1`）。要扩到多实例，
+  先按 [docs/CAPACITY-RUNBOOK.md](../docs/CAPACITY-RUNBOOK.md) 开 Redis 共享状态、
+  改实例数声明并走完双实例冒烟；直接起第二个实例不会通过启动门禁。
 
 ## 目录布局
 
