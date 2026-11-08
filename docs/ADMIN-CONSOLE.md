@@ -1,7 +1,7 @@
 # 管理侧 SOP 配置台
 
-> 范围：Issue #51 的落地说明。管理侧能在浏览器里新建流程草稿、配步骤与字段、
-> 维护回放用例、跑回放、发布 / 停用 / 回滚，全程不碰源码。
+> 范围：Issue #51 的落地说明（发布署名见第 3.6 节，Issue #61）。管理侧能在浏览器里
+> 新建流程草稿、配步骤与字段、维护回放用例、跑回放、发布 / 停用 / 回滚，全程不碰源码。
 > 结论先行：**接口默认关闭**。没有配置 `WORKPANDA_ADMIN_TOKENS` 时 `/api/admin/flows/*`
 > 整体返回 404，不存在可匿名访问的管理入口。
 
@@ -42,9 +42,9 @@ export WORKPANDA_ADMIN_TOKENS='duty01:viewer:<随机串>,sop01:admin:<随机串>
 | POST | `/api/admin/flows` | 403 | 201 | 新建草稿版本 |
 | POST | `/api/admin/flows/{flow_id}/versions/{version}/cases` | 403 | 201 | 新增回放用例 |
 | DELETE | `.../cases/{case_id}` | 403 | 200 | 删除用例 |
-| POST | `/api/admin/flows/{flow_id}/publish` | 403 | 200/409 | 发布；`apply=false` 为预演 |
-| POST | `/api/admin/flows/{flow_id}/disable` | 403 | 200 | 停用（清空指针） |
-| POST | `/api/admin/flows/{flow_id}/rollback` | 403 | 200 | 回滚到指定历史版本 |
+| POST | `/api/admin/flows/{flow_id}/publish` | 403 | 200/409 | 发布；`apply=false` 为预演；响应含 `published_by` |
+| POST | `/api/admin/flows/{flow_id}/disable` | 403 | 200 | 停用（标记指针已停用）；响应含 `disabled_by` |
+| POST | `/api/admin/flows/{flow_id}/rollback` | 403 | 200 | 回滚到指定历史版本；响应含 `published_by` |
 
 草稿提交体没有 `status` 字段：版本内容里的 status 只是作者态标记，服务端固定写成
 `draft`，只有发布指针能让流程生效。前端因此无法构造出一个"自带 published"的版本。
@@ -114,6 +114,34 @@ pydantic 先挡字段形状（422 带 `loc`），再由 `flow_field_errors()` �
 规则本身仍由装配期代码给出：本轮不做样例自动生成、不从历史任务反推样例，也不做
 「群众说一句话就自动路由到新流程」的规则装配。
 
+### 3.6 发布署名：谁把这一版推上线（Issue #61）
+
+本轮决定**不做双人复核**，因此署名是发布链路上唯一的责任锚点：没有复核兜底，又没有
+署名，等于发布无人负责。落地方式与运维备注（`POST /api/ops/tasks/{id}/notes`）一致——
+**署名只能来自鉴权主体，不读请求体**：
+
+- `FlowStore.publish(flow_id, version, *, actor)` / `disable(flow_id, *, actor)`：`actor`
+  是仅关键字必填参数，漏传是类型错误；空串或纯空白被 `require_actor()` 拒绝，因为
+  "写下一行空署名"和"没记录"分不开。
+- `flow_releases` 增加 `published_by` / `disabled_by` 两列，旧库启动时由
+  `_ensure_columns()` 幂等补列（`CREATE TABLE IF NOT EXISTS` 不会改已存在的表）。
+  旧数据一律 `NULL`：那时候确实没记是谁做的，**不回填**成"system"之类的默认主体。
+- 回滚走同一条写入路径，因此 `published_by` 一并覆盖"谁回滚的"。
+- 停用不再删除指针行：删掉就没人说得清是谁把这条流程下线的。停用只写 `disabled_by`，
+  `published_version` 保留"停用前指向哪一版"作为审计线索；`published_versions()`
+  跳过 `disabled_by` 非空的行，所以行为与"清空指针"一致。重新发布会清掉 `disabled_by`。
+- 接口层：`publish` / `rollback` / `disable` 从 `require_admin_role` 的
+  `OpsPrincipal.subject` 取 actor；请求体没有 `published_by` 字段，带了也不生效
+  （pydantic 忽略未知字段）。预演（`apply=false`）不写库，返回 `published_by=null`。
+- 界面：版本列表在状态列下显示"主体 · 时间"，停用显示"由 X 停用"；发布 / 回滚 / 停用的
+  结果消息里同样写出署名。旧记录没有主体名时显示"无署名（旧记录）"，不猜一个。
+- 装配期播种（`seed_demo_flows`）用固定主体 `bootstrap`：播种不是人做的动作，但留空会
+  让库里出现"有指针、没人"的行，那种行最容易被当成人工操作。
+
+非目标：不做多级审批，**不预留 `reviewed_by`**（留一个永远为空的字段会让后来的人以为
+"环节存在但没人用"）；也不做独立的发布历史表——指针表的 `updated_at` 已够回答"最近一次
+是谁、什么时候"，需要完整历史时另起 Issue。
+
 ## 4. 验收标准对照
 
 | 验收项 | 落地与回归 |
@@ -129,6 +157,13 @@ pydantic 先挡字段形状（422 带 `loc`），再由 `flow_field_errors()` �
 | #62：只用界面建出的流程能发布成功 | `test_ui_created_flow_can_publish`（界面提交体 → 草稿含样例 → 回放 → 发布） |
 | #62：样例不足时按钮禁用并写明缺什么 | `test_local_sample_gate_disables_save_until_counts_met`、`test_compiled_bundle_wires_the_sample_gate` |
 | #62：前端阈值漂移时服务端仍权威 | `test_server_gate_is_authoritative_when_local_thresholds_drift`（409 + 指针不动） |
+| #61：发布后能读到主体名 | `test_publish_records_actor`（sqlite 与内存两种实现） |
+| #61：伪造请求体 `published_by` 无效 | `test_forged_published_by_in_request_body_is_ignored` |
+| #61：旧库（无该列）自动迁移、旧数据为 `NULL` 且读取不报错 | `test_legacy_database_is_migrated_and_readable`、`test_migration_is_idempotent_across_restarts` |
+| #61：回滚 / 停用同样留名 | `test_rollback_overwrites_the_signature`、`test_disable_records_actor_and_republish_clears_it` |
+| #61：`actor` 漏传是类型错误、空串被拒 | `test_publish_requires_a_keyword_only_actor`、`test_blank_actor_is_rejected` |
+| #61：运维脚本不能匿名发布 | `test_replay_script_refuses_to_publish_without_actor` |
+| #61：界面显示署名 | `test_admin_ui_shows_the_signature`（源码与编译产物都要有） |
 | 手工走查 | 运维视角「建草稿 → 回放 → 发布 → 回滚」仍需在试点浏览器里走一遍，见第 6 节 |
 
 ## 5. 部署与运维
@@ -143,7 +178,10 @@ pydantic 先挡字段形状（422 带 `loc`），再由 `flow_field_errors()` �
 - 轮换与撤销沿用运维侧流程：加新密钥 → 重启 → 调用方切换 → 删旧密钥 → 重启。
 - 操作顺序建议：建草稿（含三类意图样例）→ 加用例 → 回放 → 预演发布 → 发布 →
   需要时回滚。样例文本一律用合成或脱敏话术，不填群众原话。
-  发布结果以响应的 `published` 字段为准，界面不会自行推断成功。
+  发布结果以响应的 `published` 字段为准，界面不会自行推断成功；署名以响应的
+  `published_by` 为准，不要从"我刚输的是谁的凭据"反推。
+- 命令行发布（`scripts/replay_flow.py --publish`）必须带 `--actor <主体>`：脚本无法知道
+  是谁在操作，所以不提供默认值；漏传时退出码 2，且指针不动。
 
 ## 6. 影响面与已知限制（高风险，启用前须确认）
 
@@ -169,14 +207,22 @@ pydantic 先挡字段形状（422 带 `loc`），再由 `flow_field_errors()` �
 6. **人工走查未完成**：自动化覆盖的是接口契约与权限；真实浏览器里完成一次
    「建草稿 → 回放 → 发布 → 回滚」并核对群众侧表现，仍需在试点由人执行。
 7. **多级审批、多人协作与评论**：Issue 明确列为非目标，本轮未实现。
+8. **署名只保存"最后一次操作"**：`flow_releases` 每个流程一行，发布 / 回滚 / 停用都覆盖
+   同一行的 `published_by` / `disabled_by` / `updated_at`。因此能回答"现在是谁发的、
+   什么时候"，**不能**回答"这一版历史上被切换过几次、每次是谁"。后者需要独立的发布
+   历史表，Issue #61 明确列为非目标，需要时另起。
 
 ## 7. 验证证据
 
 - `ruff check .` 全过。
-- 全量 `pytest`（`WORKPANDA_STORE_BACKEND=memory`、`--basetemp` 在 OS 临时目录）通过；
-  `tests/test_admin_flows_api.py` 22 项覆盖第 4 节表格。
+- 全量 `pytest`（`WORKPANDA_STORE_BACKEND=memory`、`--basetemp` 在 OS 临时目录）
+  676 passed；`tests/test_admin_flows_api.py` 22 项覆盖第 4 节表格。
 - Issue #62 新增 `tests/test_admin_ui_intent_samples.py` 5 项：界面提交体端到端发布、
   重复样例的字段级 `loc`、服务端阈值漂移负向回归、前端预检行为、编译产物接线。
+- Issue #61 新增 `tests/test_release_actor.py` 13 个用例（参数化后 18 项）：必填/仅关键字/
+  空串拒绝、两种后端的署名写入、回滚覆盖署名、停用留名与重新发布清标记、旧库迁移与
+  幂等重启、请求体伪造署名无效、预演无署名、接口返回主体、界面与编译产物含署名、
+  运维脚本拒绝匿名发布。
 - 远端两项 CI（Python 检查、文档与敏感信息基础检查）在 PR head 与 main 均为 success。
 - 前端 `tsc --strict --noEmitOnError` 编译通过，产物 `admin-ui/dist/main.js` 与
   `admin-ui/dist/sample_check.js` 已提交。
@@ -200,3 +246,10 @@ pydantic 先挡字段形状（422 带 `loc`），再由 `flow_field_errors()` �
    409。只补表单不补请求体等于没修。最小持久预防是端到端回归
    `test_ui_created_flow_can_publish` 从"界面提交体"出发，断言草稿响应里样例条数，
    而不是只在存储层断言 `FlowDefinition` 支持这个字段。
+7. **#61 的坑是"删行"与"留名"天然冲突**：旧实现在停用时 `DELETE` 指针行——最省事，
+   但把"谁下的线"一起删掉了。改成在行上写 `disabled_by` 之后，所有读路径都必须显式
+   记住"停用的行不算指针"（`published_versions()` 的 `WHERE disabled_by IS NULL`），
+   漏一处就会出现"停用了但还能建任务"。回归用两种后端参数化跑同一组断言，避免内存
+   实现与 SQLite 各自漂移；旧库则用真实老表结构（无这两列）建库、再用新代码打开，
+   钉住"自动加列 + 旧数据为 NULL + 读取不报错"。教训：给一张"会被删掉的行"加审计字段，
+   等于要求先停掉删除语义——这类改动要在设计阶段就把读路径清单列全。

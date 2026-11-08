@@ -45,6 +45,9 @@ from workpanda.infrastructure.replay_cases import (
 )
 from workpanda.infrastructure.sqlite_flow_store import SqliteFlowStore
 
+# 发布署名主体：`FlowReleaseService.release` / `FlowStore.publish` 要求必填。
+TEST_ACTOR = "tester"
+
 READ_TOOL = "replay_read"
 SUBMIT_TOOL = "replay_submit"
 
@@ -322,7 +325,9 @@ def test_replay_never_reaches_production_executor() -> None:
         container.flow_store.add_version(READ_FLOW)
         container.replay_cases.add(_case(READ_FLOW))
 
-        outcome = container.release.release(READ_FLOW.flow_id, READ_FLOW.version)
+        outcome = container.release.release(
+            READ_FLOW.flow_id, READ_FLOW.version, actor=TEST_ACTOR
+        )
 
         assert outcome.published is True
         assert outcome.report is not None
@@ -407,7 +412,9 @@ def test_release_without_cases_does_not_pretend_to_be_checked(workdir: Path) -> 
     cases = InMemoryReplayCaseStore()
     flows.add_version(READ_FLOW)
 
-    outcome = _release_service(flows, cases).release(READ_FLOW.flow_id, READ_FLOW.version)
+    outcome = _release_service(flows, cases).release(
+        READ_FLOW.flow_id, READ_FLOW.version, actor=TEST_ACTOR
+    )
 
     assert outcome.published is True
     assert outcome.replay_ran is False
@@ -421,7 +428,9 @@ def test_release_blocked_when_case_fails(workdir: Path) -> None:
     cases.add(_case(SUBMIT_FLOW, expect=ReplayExpectation(terminal=TaskStatus.COMPLETED)))
 
     with pytest.raises(FlowReleaseBlocked) as excinfo:
-        _release_service(flows, cases).release(SUBMIT_FLOW.flow_id, SUBMIT_FLOW.version)
+        _release_service(flows, cases).release(
+            SUBMIT_FLOW.flow_id, SUBMIT_FLOW.version, actor=TEST_ACTOR
+        )
 
     assert "replay.submit@2" in str(excinfo.value)
     assert excinfo.value.report.verdict is ReplayVerdict.FAIL
@@ -440,7 +449,9 @@ def test_release_publishes_when_cases_pass(workdir: Path) -> None:
         )
     )
 
-    outcome = _release_service(flows, cases).release(READ_FLOW.flow_id, READ_FLOW.version)
+    outcome = _release_service(flows, cases).release(
+        READ_FLOW.flow_id, READ_FLOW.version, actor=TEST_ACTOR
+    )
 
     assert outcome.replay_ran is True
     assert outcome.report is not None
@@ -455,7 +466,7 @@ def test_dry_run_does_not_move_the_pointer(workdir: Path) -> None:
     cases.add(_case(READ_FLOW))
 
     outcome = _release_service(flows, cases).release(
-        READ_FLOW.flow_id, READ_FLOW.version, apply=False
+        READ_FLOW.flow_id, READ_FLOW.version, actor=TEST_ACTOR, apply=False
     )
 
     assert outcome.published is False
@@ -470,7 +481,7 @@ def test_gate_disabled_skips_replay(workdir: Path) -> None:
     cases.add(_case(SUBMIT_FLOW, expect=ReplayExpectation(terminal=TaskStatus.COMPLETED)))
 
     outcome = _release_service(flows, cases, gate=False).release(
-        SUBMIT_FLOW.flow_id, SUBMIT_FLOW.version
+        SUBMIT_FLOW.flow_id, SUBMIT_FLOW.version, actor=TEST_ACTOR
     )
 
     assert outcome.published is True
@@ -480,7 +491,9 @@ def test_gate_disabled_skips_replay(workdir: Path) -> None:
 def test_release_of_unknown_version_raises(workdir: Path) -> None:
     flows = _sqlite_flow_store(workdir)
     with pytest.raises(FlowReleaseMissing):
-        _release_service(flows, InMemoryReplayCaseStore()).release("replay.read", "9")
+        _release_service(flows, InMemoryReplayCaseStore()).release(
+            "replay.read", "9", actor=TEST_ACTOR
+        )
 
 
 # ---------- 用例存储 ----------

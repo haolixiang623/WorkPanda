@@ -9,7 +9,10 @@
   门禁上，运维在事故里反而无法快速退回；因此回滚只校验目标版本确实存在。
 - 每次改动发布指针后调用 `FlowRegistry.reload()`（原地重载）：否则库里的指针
   已经移了，进程内目录还停在旧版本，群众侧"看起来发布成功"却没生效。
-- 不读、不返回任何凭据。主体由 API 层鉴权后只用于审计归属。
+- 不读、不返回任何凭据。主体由 API 层鉴权后只用于审计归属：发布 / 回滚 / 停用
+  三种写操作都把 `actor` 一路带到存储层，落成 `published_by` / `disabled_by`
+  （见 `domain/flow.py` 的 `FlowRelease`）。署名只能来自鉴权主体，不接受请求体自报
+  ——可自报的署名等于没有署名，本系统又不做双人复核，它是唯一的责任锚点。
 
 刻意不做的事：自由文本 DSL / YAML 编辑、多级审批、意图规则的运行时装配
 （意图样例随版本内容提交、发布时由 #52 的门禁裁决，规则本身仍由装配期代码给出）、
@@ -17,6 +20,8 @@
 """
 
 from __future__ import annotations
+
+from datetime import datetime
 
 from pydantic import BaseModel
 
@@ -61,6 +66,12 @@ class FlowSummary(BaseModel):
     title: str
     published: bool
     case_count: int
+    # 发布署名。只出现在"当前发布的那一版"那一行：同一流程的其它版本没有发布过，
+    # 给它们填同一个主体会让界面看起来像"这一版也是谁发的"。
+    published_by: str | None = None
+    published_at: datetime | None = None
+    # 停用署名。只出现在"停用前指针指向的那一版"那一行，语义与上面一致。
+    disabled_by: str | None = None
 
 
 class FlowVersionDetail(BaseModel):
@@ -77,6 +88,8 @@ class PublishOutcome(BaseModel):
     replay_ran: bool
     report: dict | None = None
     message: str = ""
+    # 落库的署名主体。预演不写库，因此为 None——界面不能把预演显示成"由某人发布"。
+    published_by: str | None = None
 
 
 def serialize_report(report: ReplayReport) -> dict:
@@ -110,17 +123,41 @@ class AdminFlowService:
     # ---------- 读 ----------
 
     def overview(self) -> list[FlowSummary]:
-        pointers = self.flows.published_versions()
-        return [
-            FlowSummary(
-                flow_id=flow.flow_id,
-                version=flow.version,
-                title=flow.title,
-                published=pointers.get(flow.flow_id) == flow.version,
-                case_count=len(self.cases.list(flow.flow_id, flow.version)),
+        releases = {item.flow_id: item for item in self.flows.releases()}
+        summaries: list[FlowSummary] = []
+        for flow in self.flows.list_versions():
+            release = releases.get(flow.flow_id)
+            # "这一版正在生效" = 指针指向本版 **且** 流程没被停用。不能用
+            # `published_by is not None` 判：旧库（加署名列之前）的指针是真的，
+            # 只是当时没记主体，那种行仍然是已发布。
+            published = (
+                release is not None
+                and release.enabled
+                and release.published_version == flow.version
             )
-            for flow in self.flows.list_versions()
-        ]
+            # 署名只挂在指针指向的那一版上：同一流程的其它版本没被谁发布过，
+            # 给它们复制同一份署名会让界面看起来像"这几版都是他发的"。
+            on_pointer_row = release is not None and release.published_version == flow.version
+            published_by = release.published_by if published and release is not None else None
+            published_at = release.updated_at if published and release is not None else None
+            disabled_by = (
+                release.disabled_by
+                if on_pointer_row and release is not None and not release.enabled
+                else None
+            )
+            summaries.append(
+                FlowSummary(
+                    flow_id=flow.flow_id,
+                    version=flow.version,
+                    title=flow.title,
+                    published=published,
+                    case_count=len(self.cases.list(flow.flow_id, flow.version)),
+                    published_by=published_by,
+                    published_at=published_at,
+                    disabled_by=disabled_by,
+                )
+            )
+        return summaries
 
     def detail(self, flow_id: str, version: str) -> FlowVersionDetail:
         flow = self._require_version(flow_id, version)
@@ -172,13 +209,17 @@ class AdminFlowService:
 
     # ---------- 发布指针 ----------
 
-    def publish(self, flow_id: str, version: str, *, apply: bool = True) -> PublishOutcome:
+    def publish(
+        self, flow_id: str, version: str, *, actor: str, apply: bool = True
+    ) -> PublishOutcome:
         self._require_version(flow_id, version)
         # `IntentEvalBlocked` 与 `FlowReleaseBlocked` 故意都不在这里吞掉：门禁拦下时
         # 指针没动，报告要原样交给界面，运维才能看到是"样例不够/误路由"还是
         # "某条回放用例以什么判定挡住"。由 API 层分别映射成 409 的两个错误码。
         try:
-            outcome: FlowReleaseOutcome = self.release.release(flow_id, version, apply=apply)
+            outcome: FlowReleaseOutcome = self.release.release(
+                flow_id, version, actor=actor, apply=apply
+            )
         except FlowReleaseMissing as exc:
             raise AdminFlowNotFound(str(exc)) from exc
         if apply:
@@ -192,20 +233,23 @@ class AdminFlowService:
                 serialize_report(outcome.report) if outcome.report is not None else None
             ),
             message=(
-                "已发布，群众侧下一次创建任务即使用该版本"
+                f"已发布（署名 {outcome.published_by}），群众侧下一次创建任务即使用该版本"
                 if apply
-                else "预演通过，尚未发布（发布指针未移动）"
+                else "预演通过，尚未发布（发布指针未移动，不产生署名）"
             ),
+            published_by=outcome.published_by,
         )
 
-    def disable(self, flow_id: str) -> None:
-        self.flows.disable(flow_id)
+    def disable(self, flow_id: str, *, actor: str) -> None:
+        self.flows.disable(flow_id, actor=actor)
         self.registry.reload(self.flows)
 
-    def rollback(self, flow_id: str, version: str) -> None:
+    def rollback(self, flow_id: str, version: str, *, actor: str) -> None:
         self._require_version(flow_id, version)
         try:
-            self.flows.publish(flow_id, version)
+            # 回滚与发布走同一条写入：指针的每次移动都要署名，回滚也不例外——
+            # "谁在事故里退回了 v3"正是事后最需要回答的那一问。
+            self.flows.publish(flow_id, version, actor=actor)
         except FlowReleaseMissing as exc:
             raise AdminFlowNotFound(str(exc)) from exc
         self.registry.reload(self.flows)

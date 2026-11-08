@@ -10,6 +10,9 @@
  *
  * Issue #62：意图样例随草稿一起提交。保存前的本地预检只负责「别把明显不够材料的
  * 草稿发出去」，发布能否通过仍由服务端门禁裁决，本地数字与服务端漂移时以 409 为准。
+ *
+ * Issue #61：发布 / 回滚 / 停用的结果里显示服务端记下的署名主体。界面**不**用当前
+ * 凭据在本地拼一个署名——那会在预演、失败或他人操作时显示成"是我发的"。
  */
 
 import {
@@ -48,6 +51,11 @@ interface FlowSummary {
   title: string;
   published: boolean;
   case_count: number;
+  /** 发布署名：只出现在"当前发布的那一版"那一行，旧记录可能为 null。 */
+  published_by?: string | null;
+  published_at?: string | null;
+  /** 停用署名：只出现在"停用前指针指向的那一版"那一行。 */
+  disabled_by?: string | null;
 }
 
 interface ReplayCaseView {
@@ -87,6 +95,8 @@ interface PublishOutcome {
   published: boolean;
   replay_ran: boolean;
   message: string;
+  /** 落库的署名主体；预演（apply=false）为 null，因为指针没动。 */
+  published_by?: string | null;
 }
 
 interface FieldProblem {
@@ -335,6 +345,36 @@ function actionButton(
   return button;
 }
 
+function formatStamp(raw: string | null | undefined): string {
+  if (!raw) {
+    return "";
+  }
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) {
+    // 解析不了就原样显示：编一个时间比显示出原始文本更容易误导复盘。
+    return raw;
+  }
+  const pad = (value: number): string => String(value).padStart(2, "0");
+  return (
+    `${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ` +
+    `${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`
+  );
+}
+
+/** 列表里的署名备注：谁在什么时候发布了这一版 / 谁把它停用了。 */
+function flowSignature(flow: FlowSummary): string {
+  if (flow.published) {
+    // 旧库（署名功能上线前）的发布记录没有主体名：如实写"无署名"，不猜一个。
+    const who = flow.published_by ?? "无署名（旧记录）";
+    const when = formatStamp(flow.published_at);
+    return when === "" ? who : `${who} · ${when}`;
+  }
+  if (flow.disabled_by) {
+    return `由 ${flow.disabled_by} 停用`;
+  }
+  return "";
+}
+
 function renderFlows(flows: FlowSummary[]): void {
   const tbody = el<HTMLTableSectionElement>("flow-list");
   tbody.replaceChildren();
@@ -352,16 +392,19 @@ function renderFlows(flows: FlowSummary[]): void {
       row.insertCell().textContent = text;
     }
     const stateCell = row.insertCell();
-    if (flow.published) {
-      const tag = document.createElement("span");
-      tag.className = "tag on";
-      tag.textContent = "已发布";
-      stateCell.replaceChildren(tag);
-    } else {
-      const tag = document.createElement("span");
-      tag.className = "tag off";
-      tag.textContent = "草稿";
-      stateCell.replaceChildren(tag);
+    const tag = document.createElement("span");
+    tag.className = flow.published ? "tag on" : "tag off";
+    // 停用与草稿要分开显示：前者是"曾经上线、现在下线了"，后者从未上线。
+    tag.textContent = flow.published ? "已发布" : flow.disabled_by ? "已停用" : "草稿";
+    stateCell.replaceChildren(tag);
+    // 署名是这条链路唯一的责任锚点（不做双人复核），因此必须显示在列表里：
+    // 事后要回答"谁把 v3 换成了 v4"，在这里一眼能看到。
+    const signature = flowSignature(flow);
+    if (signature !== "") {
+      const note = document.createElement("div");
+      note.className = "muted";
+      note.textContent = signature;
+      stateCell.append(note);
     }
     // 第 5 列：用例数。
     row.insertCell().textContent = String(flow.case_count);
@@ -764,10 +807,17 @@ async function publish(
       "POST",
       { version: flow.version, apply },
     );
+    // 署名只以服务端返回的 published_by 为准：预演为 null（指针没动），
+    // 不拿"当前凭据"在本地拼一个出来。
+    const signature =
+      outcome.published_by === null || outcome.published_by === undefined
+        ? "预演不产生署名"
+        : `署名 ${escapeHtml(outcome.published_by)}`;
     showMessage(
       "ok",
       `<strong>${outcome.published ? "已发布" : "预演通过，未发布"}</strong>：` +
-        `${escapeHtml(outcome.message)}；回放门禁${outcome.replay_ran ? "已执行" : "未执行（该版本没有用例）"}。`,
+        `${escapeHtml(outcome.message)}；${signature}；` +
+        `回放门禁${outcome.replay_ran ? "已执行" : "未执行（该版本没有用例）"}。`,
     );
     await refreshFlows();
   } catch (error) {
@@ -781,12 +831,18 @@ async function publish(
 }
 
 async function rollback(flow: { flow_id: string; version: string }): Promise<void> {
-  await api(
+  const result = await api<{ published_by?: string | null }>(
     `/api/admin/flows/${encodeURIComponent(flow.flow_id)}/rollback`,
     "POST",
     { version: flow.version },
   );
-  showMessage("ok", `已回滚 ${escapeHtml(flow.flow_id)} 到 ${escapeHtml(flow.version)}；在途任务仍按各自版本继续。`);
+  // 回滚同样留名：事故里"谁退回了哪一版"和"谁把哪一版推上线"是同一个问题。
+  const who = result.published_by ? `署名 ${escapeHtml(result.published_by)}；` : "";
+  showMessage(
+    "ok",
+    `已回滚 ${escapeHtml(flow.flow_id)} 到 ${escapeHtml(flow.version)}；${who}` +
+      "在途任务仍按各自版本继续。",
+  );
   await refreshFlows();
 }
 
@@ -795,8 +851,12 @@ async function disable(): Promise<void> {
   if (flowId === "") {
     throw new Error("请先填写 flow_id。");
   }
-  await api(`/api/admin/flows/${encodeURIComponent(flowId)}/disable`, "POST");
-  showMessage("ok", `${escapeHtml(flowId)} 已停用（历史版本保留，可随时回滚）。`);
+  const result = await api<{ disabled_by?: string | null }>(
+    `/api/admin/flows/${encodeURIComponent(flowId)}/disable`,
+    "POST",
+  );
+  const who = result.disabled_by ? `，署名 ${escapeHtml(result.disabled_by)}` : "";
+  showMessage("ok", `${escapeHtml(flowId)} 已停用${who}（历史版本保留，可随时回滚）。`);
   await refreshFlows();
 }
 

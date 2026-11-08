@@ -122,6 +122,14 @@ class CaseDraftRequest(BaseModel):
 
 
 class PublishRequest(BaseModel):
+    """发布请求体。
+
+    刻意**没有** `published_by` 字段：署名取自已鉴权的管理侧主体
+    （`OpsPrincipal.subject`），不读请求体。可自报的署名等于没有署名——而本系统
+    不做双人复核，发布记录里那个主体名是这条链路唯一的责任锚点。请求体里带
+    同名字段不会报错（pydantic 忽略未知字段），但也不会生效。
+    """
+
     version: str = Field(min_length=1, max_length=64)
     # False = 只跑门禁、不移动指针。界面据此区分"预演通过"与"已发布"。
     apply: bool = True
@@ -255,17 +263,22 @@ async def replay_version(
 async def publish(
     flow_id: str,
     request: PublishRequest,
-    _principal: OpsPrincipal = Depends(require_admin_role),
+    principal: OpsPrincipal = Depends(require_admin_role),
     container: Container = Depends(get_container),
 ) -> PublishOutcome:
     """发布（或预演）。门禁拦下时返回 409 + 完整报告，指针保持不动。
 
     两道门各有独立错误码：识别样例不够（`admin_intent_gate_blocked`）与回放未通过
     （`admin_release_blocked`）是两种完全不同的补救动作，界面不该把它们混成一句话。
+
+    署名取自已鉴权的管理侧主体，**不读请求体**（见 `PublishRequest`）；预演不写库，
+    因此返回 `published_by=None`。
     """
 
     try:
-        outcome = _service(container).publish(flow_id, request.version, apply=request.apply)
+        outcome = _service(container).publish(
+            flow_id, request.version, actor=principal.subject, apply=request.apply
+        )
     except AdminFlowNotFound as exc:
         raise _not_found(exc) from exc
     except IntentEvalBlocked as exc:
@@ -292,26 +305,35 @@ async def publish(
 @router.post("/{flow_id}/disable")
 async def disable(
     flow_id: str,
-    _principal: OpsPrincipal = Depends(require_admin_role),
+    principal: OpsPrincipal = Depends(require_admin_role),
     container: Container = Depends(get_container),
 ) -> dict:
-    """停用：清空发布指针，历史版本一行不删。"""
+    """停用：指针不再生效并记下主体（`disabled_by`），历史版本一行不删。"""
 
-    _service(container).disable(flow_id)
-    return {"flow_id": flow_id, "disabled": True}
+    _service(container).disable(flow_id, actor=principal.subject)
+    return {"flow_id": flow_id, "disabled": True, "disabled_by": principal.subject}
 
 
 @router.post("/{flow_id}/rollback")
 async def rollback(
     flow_id: str,
     request: VersionRequest,
-    _principal: OpsPrincipal = Depends(require_admin_role),
+    principal: OpsPrincipal = Depends(require_admin_role),
     container: Container = Depends(get_container),
 ) -> dict:
-    """回滚：把指针移回一个已存在的历史版本，在途任务仍用各自的版本继续跑。"""
+    """回滚：把指针移回一个已存在的历史版本，在途任务仍用各自的版本继续跑。
+
+    回滚走 `publish`，因此同样留下 `published_by`——"谁在事故里退回了哪一版"
+    和"谁把哪一版推上线"是同一个问题。
+    """
 
     try:
-        _service(container).rollback(flow_id, request.version)
+        _service(container).rollback(flow_id, request.version, actor=principal.subject)
     except AdminFlowNotFound as exc:
         raise _not_found(exc) from exc
-    return {"flow_id": flow_id, "version": request.version, "rolled_back": True}
+    return {
+        "flow_id": flow_id,
+        "version": request.version,
+        "rolled_back": True,
+        "published_by": principal.subject,
+    }

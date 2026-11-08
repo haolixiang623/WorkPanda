@@ -5,11 +5,14 @@
 
 版本与发布：版本内容不可变，发布状态由**指针**表达（见 `FlowStore`）。同一条
 记录既当"已发布"又当"草稿"必然漂移，所以库里只存版本，指针只有一个。
+指针的每一次移动（发布 / 回滚 / 停用）都带主体署名，见 `FlowRelease`：本系统不做
+双人复核，署名是这条链路上唯一的责任锚点。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from typing import Protocol
 
@@ -87,24 +90,70 @@ class FlowReleaseMissing(LookupError):
     """发布指针指向的版本不存在。"""
 
 
+@dataclass(frozen=True, slots=True)
+class FlowRelease:
+    """发布记录的一行：**谁**、在什么时候、把指针移到了哪一版。
+
+    这是"事后能回答'谁把 v3 换成了 v4'"的唯一依据，因此主体名与时间必须来自
+    写入时的真实调用方，不接受请求体自报。
+
+    停用也留在这条记录里：`disabled_by` 非空表示该流程已下线，此时
+    `published_version` 是"停用前指针指向哪一版"，只作审计线索，**不再算发布指针**
+    （`published_versions()` 不返回它）。重新发布就是往同一行写回指针并清掉
+    `disabled_by`——不新增行，所以一行永远是"该流程最后一次操作"。
+    """
+
+    flow_id: str
+    published_version: str
+    updated_at: datetime
+    # 旧库（本字段加入之前发布的记录）里为 `None`：不知道就如实留空，不回填默认主体。
+    published_by: str | None = None
+    disabled_by: str | None = None
+
+    @property
+    def enabled(self) -> bool:
+        """当前是否仍在生效（未被停用）。"""
+
+        return self.disabled_by is None
+
+
+def require_actor(actor: str) -> str:
+    """校验署名主体：空串或纯空白一律拒绝。
+
+    `actor` 是仅关键字必填参数，漏传会在调用处报 `TypeError`；但显式传 `""` 仍会
+    "成功"写下一行没有署名的记录——那和没署名一样，等于把责任锚点又弄丢了。
+    """
+
+    subject = actor.strip()
+    if not subject:
+        raise ValueError("actor 不能为空：发布 / 回滚 / 停用必须留下署名主体")
+    return subject
+
+
 class FlowStore(Protocol):
     """流程定义的持久化端口。
 
-    只表达两件事：**有哪些版本**、**哪个版本是当前发布指针**。发布状态不写进
-    版本内容——否则"发布"要改两条记录，改一半就是两种真相。
+    只表达三件事：**有哪些版本**、**哪个版本是当前发布指针**、**谁移动了指针**。
+    发布状态不写进版本内容——否则"发布"要改两条记录，改一半就是两种真相。
     """
 
     def add_version(self, flow: FlowDefinition) -> None:
         """新增一个版本。已存在则抛 `FlowVersionExists`，绝不覆盖。"""
 
-    def publish(self, flow_id: str, version: str) -> None:
-        """把发布指针移向指定版本。版本不存在则抛 `FlowReleaseMissing`。"""
+    def publish(self, flow_id: str, version: str, *, actor: str) -> None:
+        """把发布指针移向指定版本并记下主体。版本不存在则抛 `FlowReleaseMissing`。
 
-    def disable(self, flow_id: str) -> None:
-        """清空发布指针。历史版本保留，回滚就是再把指针移回去。"""
+        `actor` 是仅关键字必填参数：漏传是类型错误，不会静默默认成空串。
+        """
+
+    def disable(self, flow_id: str, *, actor: str) -> None:
+        """停用：指针不再生效并记下主体。历史版本保留，回滚就是再把指针移回去。"""
+
+    def releases(self) -> list[FlowRelease]:
+        """全部发布记录（含已停用的），按 `flow_id` 排序。审计展示用。"""
 
     def published_versions(self) -> dict[str, str]:
-        """`flow_id -> 已发布版本`。没有指针的流程不出现在结果里。"""
+        """`flow_id -> 已发布版本`。没有指针或已停用的流程不出现在结果里。"""
 
     def list_versions(self, flow_id: str | None = None) -> list[FlowDefinition]:
         """按 `(flow_id, version)` 排序返回版本，不做发布状态过滤。"""

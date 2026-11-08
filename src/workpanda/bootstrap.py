@@ -176,6 +176,11 @@ def build_replay_case_store(
     return InMemoryReplayCaseStore(), []
 
 
+# 装配期播种的署名主体。播种不是人做的动作，但也不能留空：空署名与"没记录"分不开，
+# 而事后看到 `published_by="bootstrap"` 至少能立刻判断"这一版是自检流程被装配写进去的"。
+SEED_ACTOR = "bootstrap"
+
+
 def seed_demo_flows(store: FlowStore, *, enabled: bool) -> None:
     """把骨架自检流程同步到库里的真实状态。
 
@@ -184,17 +189,20 @@ def seed_demo_flows(store: FlowStore, *, enabled: bool) -> None:
     这条要求必须真的生效。
 
     已存在的同版本内容一律沿用、不覆盖：版本不可变是回滚能成立的前提。
+
+    这里的写入同样要署名（`SEED_ACTOR`）：署名是发布记录的一部分，装配路径若绕过
+    它，库里就会出现"有指针、没人"的行，那种行最容易在事故复盘时被当成人工操作。
     """
 
     for flow in demo_flows():
         if not enabled:
-            store.disable(flow.flow_id)
+            store.disable(flow.flow_id, actor=SEED_ACTOR)
             continue
         try:
             store.add_version(flow)
         except FlowVersionExists:
             pass
-        store.publish(flow.flow_id, flow.version)
+        store.publish(flow.flow_id, flow.version, actor=SEED_ACTOR)
 
 
 def build_shared_state(

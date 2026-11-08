@@ -8,8 +8,8 @@
     # 只出回放报告（规则/样例还没就位时先写用例；不能当作发布依据）
     python3 scripts/replay_flow.py --flow demo.generic --version 2 --replay-only
 
-    # 走门禁并真的移动发布指针
-    python3 scripts/replay_flow.py --flow demo.generic --version 2 --publish
+    # 走门禁并真的移动发布指针（发布必须署名：库里记下 `published_by`）
+    python3 scripts/replay_flow.py --flow demo.generic --version 2 --publish --actor ops-zhang
 
     # 给某个版本加一条回放用例（用例是数据，写在库里）
     python3 scripts/replay_flow.py --flow demo.generic --version 2 --add-case case.json
@@ -103,6 +103,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--publish", action="store_true", help="通过门禁后移动发布指针")
     parser.add_argument(
+        "--actor",
+        default=None,
+        metavar="SUBJECT",
+        help=(
+            "发布署名主体，`--publish` 时必填（如 ops-zhang）。"
+            "不给默认值：脚本无法知道是谁在操作，编一个主体名等于把责任锚点做成假的"
+        ),
+    )
+    parser.add_argument(
         "--replay-only",
         action="store_true",
         help="只出回放报告，不跑识别样例门禁（用于规则/样例就位前编写用例，不能当作发布依据）",
@@ -115,6 +124,11 @@ def main(argv: list[str] | None = None) -> int:
     path = args.sqlite or _default_db()
     if not path.exists():
         print(f"库文件不存在：{path}（先运行一次服务，或指定 --sqlite）", file=sys.stderr)
+        return 2
+    actor = (args.actor or "").strip()
+    if args.publish and not actor:
+        # 只在真的发布时要求署名：查报告、加用例都不产生责任归属。
+        print("发布必须署名：加 --actor <主体>（库里的 published_by 取这个值）", file=sys.stderr)
         return 2
 
     flows = SqliteFlowStore(path)
@@ -151,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.publish:
             try:
-                outcome = service.release(args.flow, args.version)
+                outcome = service.release(args.flow, args.version, actor=actor)
             except IntentEvalBlocked as exc:
                 _emit_intents(exc.report, args.json)
                 print(f"发布被拦（识别样例）：{exc}", file=sys.stderr)
@@ -165,7 +179,10 @@ def main(argv: list[str] | None = None) -> int:
             if outcome.report is not None:
                 _emit(outcome.report, args.json)
             else:
-                print(f"该版本没有回放用例，回放门禁不适用；已发布 {args.flow}@{args.version}")
+                print(
+                    f"该版本没有回放用例，回放门禁不适用；"
+                    f"已发布 {args.flow}@{args.version}（署名 {outcome.published_by}）"
+                )
             return 0
 
         # 预演：两道门都要过。只跑回放会给人一种"能发"的错觉，所以在给出回放报告的

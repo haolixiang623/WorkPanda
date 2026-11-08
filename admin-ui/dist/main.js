@@ -175,6 +175,29 @@ function actionButton(label, onClick, extra) {
     button.addEventListener("click", () => void guarded(onClick));
     return button;
 }
+function formatStamp(raw) {
+    if (!raw) {
+        return "";
+    }
+    const parsed = new Date(raw);
+    if (Number.isNaN(parsed.getTime())) {
+        return raw;
+    }
+    const pad = (value) => String(value).padStart(2, "0");
+    return (`${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ` +
+        `${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`);
+}
+function flowSignature(flow) {
+    if (flow.published) {
+        const who = flow.published_by ?? "无署名（旧记录）";
+        const when = formatStamp(flow.published_at);
+        return when === "" ? who : `${who} · ${when}`;
+    }
+    if (flow.disabled_by) {
+        return `由 ${flow.disabled_by} 停用`;
+    }
+    return "";
+}
 function renderFlows(flows) {
     const tbody = el("flow-list");
     tbody.replaceChildren();
@@ -192,17 +215,16 @@ function renderFlows(flows) {
             row.insertCell().textContent = text;
         }
         const stateCell = row.insertCell();
-        if (flow.published) {
-            const tag = document.createElement("span");
-            tag.className = "tag on";
-            tag.textContent = "已发布";
-            stateCell.replaceChildren(tag);
-        }
-        else {
-            const tag = document.createElement("span");
-            tag.className = "tag off";
-            tag.textContent = "草稿";
-            stateCell.replaceChildren(tag);
+        const tag = document.createElement("span");
+        tag.className = flow.published ? "tag on" : "tag off";
+        tag.textContent = flow.published ? "已发布" : flow.disabled_by ? "已停用" : "草稿";
+        stateCell.replaceChildren(tag);
+        const signature = flowSignature(flow);
+        if (signature !== "") {
+            const note = document.createElement("div");
+            note.className = "muted";
+            note.textContent = signature;
+            stateCell.append(note);
         }
         row.insertCell().textContent = String(flow.case_count);
         const actions = row.insertCell();
@@ -539,8 +561,12 @@ async function publish(flow, apply) {
     el("action-version").value = flow.version;
     try {
         const outcome = await api(`/api/admin/flows/${encodeURIComponent(flow.flow_id)}/publish`, "POST", { version: flow.version, apply });
+        const signature = outcome.published_by === null || outcome.published_by === undefined
+            ? "预演不产生署名"
+            : `署名 ${escapeHtml(outcome.published_by)}`;
         showMessage("ok", `<strong>${outcome.published ? "已发布" : "预演通过，未发布"}</strong>：` +
-            `${escapeHtml(outcome.message)}；回放门禁${outcome.replay_ran ? "已执行" : "未执行（该版本没有用例）"}。`);
+            `${escapeHtml(outcome.message)}；${signature}；` +
+            `回放门禁${outcome.replay_ran ? "已执行" : "未执行（该版本没有用例）"}。`);
         await refreshFlows();
     }
     catch (error) {
@@ -551,8 +577,10 @@ async function publish(flow, apply) {
     }
 }
 async function rollback(flow) {
-    await api(`/api/admin/flows/${encodeURIComponent(flow.flow_id)}/rollback`, "POST", { version: flow.version });
-    showMessage("ok", `已回滚 ${escapeHtml(flow.flow_id)} 到 ${escapeHtml(flow.version)}；在途任务仍按各自版本继续。`);
+    const result = await api(`/api/admin/flows/${encodeURIComponent(flow.flow_id)}/rollback`, "POST", { version: flow.version });
+    const who = result.published_by ? `署名 ${escapeHtml(result.published_by)}；` : "";
+    showMessage("ok", `已回滚 ${escapeHtml(flow.flow_id)} 到 ${escapeHtml(flow.version)}；${who}` +
+        "在途任务仍按各自版本继续。");
     await refreshFlows();
 }
 async function disable() {
@@ -560,8 +588,9 @@ async function disable() {
     if (flowId === "") {
         throw new Error("请先填写 flow_id。");
     }
-    await api(`/api/admin/flows/${encodeURIComponent(flowId)}/disable`, "POST");
-    showMessage("ok", `${escapeHtml(flowId)} 已停用（历史版本保留，可随时回滚）。`);
+    const result = await api(`/api/admin/flows/${encodeURIComponent(flowId)}/disable`, "POST");
+    const who = result.disabled_by ? `，署名 ${escapeHtml(result.disabled_by)}` : "";
+    showMessage("ok", `${escapeHtml(flowId)} 已停用${who}（历史版本保留，可随时回滚）。`);
     await refreshFlows();
 }
 function bind(id, action) {
