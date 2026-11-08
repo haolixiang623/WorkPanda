@@ -14,6 +14,10 @@ from workpanda.domain.intent_eval import (
 )
 from workpanda.domain.intent_sample import MIN_NEAR_MISS_SAMPLES, MIN_POSITIVE_SAMPLES
 
+# 回环主机名单。与 `server.py` 的绑定校验共用一份：两处各写一份，
+# 迟早出现"启动检查认为不对外、静态托管却认为对外"的分叉。
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="WORKPANDA_", env_file=".env", extra="ignore")
@@ -69,6 +73,19 @@ class Settings(BaseSettings):
     # 允许跨域访问的来源，逗号分隔。不接受任何通配符：预检一旦放行，
     # 浏览器会替任意站点把请求发过来并带上凭据，等于把会话交给全网。
     cors_origins: str = ""
+    # 群众侧页面（仓库里的 `web/`）的静态托管。
+    #
+    # 默认开启，但**只在绑定回环地址时真正挂载**：这个页面会给任何打开它的人
+    # 签发会话，而本部署还没有面向公网的认证与 TLS。把它挂到 0.0.0.0 上，等于
+    # 让局域网里任何一台机器都能新建任务、占用执行预算。
+    #
+    # 对外提供服务前先补网关与认证，再显式打开 `web_ui_expose_public`
+    # （同时会触发 server.py 的对外绑定三道门）。
+    web_ui_enabled: bool = True
+    # 静态目录。留空时按仓库布局取 `web/`；安装成 wheel 后那里没有这个目录，
+    # 就不挂载（静态资源本就该由网关/独立域名下发，参见 `admin-ui/README.md`）。
+    web_ui_dir: Path | None = None
+    web_ui_expose_public: bool = False
     # 通用 harness：直连 OpenAI 兼容接口，自带工具循环与预算控制。
     # 优先级高于 Octop 运行时：harness 用我们的受控循环，Octop 只当模型后端。
     harness_enabled: bool = False
@@ -182,6 +199,22 @@ class Settings(BaseSettings):
 
         chosen = (self.harness_shared_backend or self.harness_cancel_backend or "memory").strip()
         return chosen.lower() or "memory"
+
+    @property
+    def bind_is_loopback(self) -> bool:
+        return self.bind_host.strip().lower() in LOOPBACK_HOSTS
+
+    @property
+    def web_ui_served(self) -> bool:
+        """群众侧页面是否真的挂载。
+
+        把一个"功能开关"和一条安全前提写在一起，是因为它们只在这条前提下
+        才有意义：页面自己会签发会话，对外可达就等于把会话发给所有人。
+        """
+
+        if not self.web_ui_enabled:
+            return False
+        return self.bind_is_loopback or self.web_ui_expose_public
 
     @property
     def allowed_hosts(self) -> tuple[str, ...]:

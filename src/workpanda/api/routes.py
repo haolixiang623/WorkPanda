@@ -54,7 +54,7 @@ async def create_task(
     container: Container = Depends(get_container),
 ) -> TaskView:
     task = await asyncio.to_thread(container.tasks.create_task, request, principal.subject)
-    return TaskView.from_task(task)
+    return TaskView.from_task(task, container.flows)
 
 
 @router.get("/tasks/{task_id}", response_model=TaskView)
@@ -63,7 +63,9 @@ async def get_task(
     principal: Principal = Depends(get_principal),
     container: Container = Depends(get_container),
 ) -> TaskView:
-    return TaskView.from_task(container.tasks.get_task(task_id, principal.subject))
+    return TaskView.from_task(
+        container.tasks.get_task(task_id, principal.subject), container.flows
+    )
 
 
 @router.post("/tasks/{task_id}/answers", response_model=TaskView)
@@ -74,7 +76,7 @@ async def answer_task(
     container: Container = Depends(get_container),
 ) -> TaskView:
     task = await asyncio.to_thread(container.tasks.answer, task_id, request, principal.subject)
-    return TaskView.from_task(task)
+    return TaskView.from_task(task, container.flows)
 
 
 @router.post("/tasks/{task_id}/confirm", response_model=TaskView)
@@ -85,7 +87,7 @@ async def confirm_task(
     container: Container = Depends(get_container),
 ) -> TaskView:
     task = await asyncio.to_thread(container.tasks.confirm, task_id, request, principal.subject)
-    return TaskView.from_task(task)
+    return TaskView.from_task(task, container.flows)
 
 
 @router.post("/tasks/{task_id}/cancel", response_model=TaskView)
@@ -96,7 +98,9 @@ async def cancel_task(
 ) -> TaskView:
     # 刻意不放到工作线程：取消必须是执行进行中也能立刻被处理的短请求。
     # 它只翻转任务状态并下发执行侧信号，不做任何模型或工具调用。
-    return TaskView.from_task(container.tasks.cancel(task_id, principal.subject))
+    return TaskView.from_task(
+        container.tasks.cancel(task_id, principal.subject), container.flows
+    )
 
 
 class ConfirmationLinkRedeemRequest(BaseModel):

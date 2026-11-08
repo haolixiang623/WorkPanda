@@ -13,6 +13,10 @@ WorkPanda 是面向群众的自然语言公共服务入口。当前仓库处于*
 - 确定性意图识别与槽位抽取：同分跨流程判歧义→澄清、抽不到不编造、
   未声明字段在创建入口即拒绝（版本化评测集见 [docs/INTENT-EVAL.md](docs/INTENT-EVAL.md)）；
 - 群众可见状态（`ui_state`）由服务端唯一给出，只有"已完成"使用成功语义；
+- **群众侧最小对话页**（Issue #77）：`web/` 独立 TS/ESM（`tsc` 构建、产物提交），
+  服务端在 `/web/` 静态托管且**默认只挂回环**；状态只从服务端 `ui_state` 派生，
+  事件流仅作"去问一次"的提醒，刷新/重连按 `task_id` 恢复
+  （见 [web/README.md](web/README.md)）；
 - 关键动作的服务端一次性确认凭证（绑定任务、流程版本、步骤和参数摘要）；
 - **流程定义持久化**：版本不可变、发布状态由指针表达；发布/停用/回滚 = 移动指针，
   历史版本保留，回滚后在途任务仍按创建时的版本继续（Issue #49）；
@@ -43,6 +47,9 @@ WorkPanda 是面向群众的自然语言公共服务入口。当前仓库处于*
 - 真实业务系统工具（尚无外部 API 接入）；
 - Octop 控制台插件、Octop Browser；
 - 登录、实名核验、权限分级与审计后台；
+- 「需要用户操作」（验证码 / 扫码 / 本人操作）的服务端语义：事件层尚未产出该信号，
+  页面只按"在等用户、但没让用户填表"派生这一屏，三要素里的有效期以办理页面为准
+  （Issue #79 接入）；群众侧页面尚未在真实浏览器里完成人工走查；
 - 多级审批流、意图样例的运行时路由（Issue #52）与多实例发布同步（Issue #53）；
   管理侧配置台已可用（Issue #51），但启用前仍需业务与安全责任人确认权限边界，
   且真实浏览器里的一次完整操作走查仍待人工完成；
@@ -68,6 +75,7 @@ uvicorn workpanda.main:app --app-dir src --reload
 
 启动后：
 
+- 群众侧页面：`http://127.0.0.1:8000/`（跳到 `/web/`；只在回环绑定时挂载）
 - 健康检查：`GET http://127.0.0.1:8000/healthz`
 - 接口文档：`http://127.0.0.1:8000/docs`
 
@@ -164,6 +172,9 @@ uvicorn workpanda.main:app --app-dir src --reload
 | `WORKPANDA_ENABLE_DEMO_FLOW` | `true` | 启用骨架自检流程 `demo.generic` |
 | `WORKPANDA_REPLAY_RELEASE_GATE` | `true` | 该版本有回放用例时，回放未通过不得发布 |
 | `WORKPANDA_REPLAY_TIMEOUT_SECONDS` | `10` | 单条回放用例的时限；超时判"无结论" |
+| `WORKPANDA_WEB_UI_ENABLED` | `true` | 是否托管群众侧页面（仍受回环绑定约束） |
+| `WORKPANDA_WEB_UI_DIR` | 空 | 静态目录；留空按仓库布局取 `web/`，指不到 `index.html` 则启动失败 |
+| `WORKPANDA_WEB_UI_EXPOSE_PUBLIC` | `false` | 非回环绑定时是否也托管页面（要对外就必须显式打开） |
 
 运维访问控制（角色、凭据轮换、TLS、回退）见
 [docs/OPS-ACCESS-CONTROL.md](docs/OPS-ACCESS-CONTROL.md)。
@@ -193,6 +204,8 @@ src/workpanda/
 ├── config.py        配置
 └── main.py          应用入口
 
+admin-ui/            管理侧配置台前端（独立构建，产物提交）
+web/                 群众侧对话页前端（独立构建，产物提交）
 tests/               单元与接口测试
 scripts/             端到端冒烟、压测与回放脚本
 docs/                架构、受控执行层与开发运营机制

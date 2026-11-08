@@ -5,10 +5,14 @@
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
+import workpanda
 from workpanda.api.admin import router as admin_router
 from workpanda.api.admin_identities import router as admin_identities_router
 from workpanda.api.errors import register_error_handlers
@@ -17,6 +21,28 @@ from workpanda.api.routes import router
 from workpanda.api.staff import router as staff_router
 from workpanda.bootstrap import Container, build_container
 from workpanda.config import Settings, get_settings
+
+# 群众侧页面的挂载点。刻意不挂在 `/`：一个吞掉全部未匹配路径的 Mount 会把
+# `/api/` 下的拼写错误也变成静态文件的 404（纯文本），调用方拿到的就不再是
+# 统一的 JSON 错误体。`/` 只做一次跳转。
+WEB_UI_MOUNT = "/web"
+
+
+def _web_ui_directory(settings: Settings) -> Path | None:
+    """解析群众侧静态目录。
+
+    显式配置了却指不到 `index.html` 时直接失败：那说明部署写错了路径，而"安静地
+    不挂载"会表现为页面打不开、日志里什么都没有。自动推断的路径（wheel 安装）
+    找不到就不挂——静态资源本就该由网关下发。
+    """
+
+    if settings.web_ui_dir is not None:
+        explicit = settings.web_ui_dir
+        if not (explicit / "index.html").is_file():
+            raise ValueError(f"web_ui_dir 指向的目录里没有 index.html：{explicit}")
+        return explicit
+    discovered = Path(workpanda.__file__).resolve().parents[2] / "web"
+    return discovered if (discovered / "index.html").is_file() else None
 
 
 def create_app(settings: Settings | None = None, container: Container | None = None) -> FastAPI:
@@ -66,6 +92,19 @@ def create_app(settings: Settings | None = None, container: Container | None = N
     app.include_router(admin_router)
     app.include_router(admin_identities_router)
     app.include_router(staff_router)
+
+    # 群众侧页面：只在绑定回环时挂载（见 `Settings.web_ui_served`）。
+    if resolved_settings.web_ui_served:
+        directory = _web_ui_directory(resolved_settings)
+        if directory is not None:
+            app.mount(WEB_UI_MOUNT, StaticFiles(directory=directory, html=True), name="web-ui")
+
+            @app.get("/", include_in_schema=False)
+            async def web_ui_root() -> RedirectResponse:
+                """打开服务根就是群众页。相对跳转，避免部署在子路径下时跳错主机。"""
+
+                return RedirectResponse(f"{WEB_UI_MOUNT}/", status_code=307)
+
     return app
 
 
