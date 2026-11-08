@@ -31,6 +31,7 @@ from workpanda.application.intent_eval import IntentEvalBlocked
 from workpanda.application.release import FlowReleaseBlocked
 from workpanda.bootstrap import Container
 from workpanda.domain.flow import FlowDefinition, FlowStatus, StepDefinition
+from workpanda.domain.intent_sample import IntentSample
 from workpanda.domain.replay import ReplayCase, ReplayExpectation
 
 router = APIRouter(prefix="/api/admin/flows", tags=["admin"])
@@ -97,12 +98,20 @@ def _conflict(exc: AdminFlowConflict) -> HTTPException:
 
 
 class FlowDraftRequest(BaseModel):
-    """草稿提交体。没有 `status` 字段：发布与否只能由发布指针表达。"""
+    """草稿提交体。没有 `status` 字段：发布与否只能由发布指针表达。
+
+    `intent_samples` 随版本内容一起提交（#62）：管理页录入的样例必须真正落到版本里，
+    否则界面建出的流程一定过不了发布门禁。条数下限**不在这里**裁决——草稿允许先
+    建流程、后补样例，发布时由 `IntentReleaseGate` 用服务端阈值判定，避免前后端各写
+    一份阈值而漂移。形状（id / text / category）与重复由 pydantic 和
+    `flow_field_errors` 兜底，重复项会带 `intent_samples.<i>.<field>` 的 loc。
+    """
 
     flow_id: str = Field(min_length=1, max_length=128)
     version: str = Field(min_length=1, max_length=64)
     title: str = Field(min_length=1, max_length=200)
     steps: tuple[StepDefinition, ...] = Field(min_length=1)
+    intent_samples: tuple[IntentSample, ...] = ()
 
 
 class CaseDraftRequest(BaseModel):
@@ -154,8 +163,8 @@ async def create_draft(
     """新建草稿版本。版本不可变：同 (flow_id, version) 已存在一律 409，不覆盖。
 
     pydantic 先挡字段形状（422 带 loc），再由 `flow_field_errors` 挡语义
-    （execute 必须有 tool、非执行步骤不得带 tool / 要求确认、step_id 不重复），
-    错误同样带 `loc`，界面可标到具体输入框。
+    （execute 必须有 tool、非执行步骤不得带 tool / 要求确认、step_id 不重复、
+    intent sample 的 id / 文本不重复），错误同样带 `loc`，界面可标到具体输入框。
     """
 
     flow = FlowDefinition(
@@ -164,6 +173,7 @@ async def create_draft(
         title=draft.title,
         status=FlowStatus.DRAFT,
         steps=draft.steps,
+        intent_samples=draft.intent_samples,
     )
     service = _service(container)
     try:
