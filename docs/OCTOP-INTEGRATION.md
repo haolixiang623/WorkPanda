@@ -1,7 +1,12 @@
 # Octop 集成说明
 
-> 范围：说明 WorkPanda 如何接入 Octop-Harness 运行时，以及 Octop 控制台与 WorkPanda 的职责划分。
-> 现状：运行时适配已实现，真实模型端到端已跑通（含结构化结果契约）；只读控制台插件已实现（`plugins/workpanda-ops/`），并在本机 Octop 实例上完成安装、加载、模型接入、真实聊天工具调用与 Dashboard 浏览器内渲染的全链路走查（见第 4 节）。
+> 范围：说明 WorkPanda 如何接入 Octop 控制台（只读运维界面），以及双方的职责划分。
+> 现状：**运行时接入已移除**。WorkPanda 只保留内置 harness 一条执行路径（理由见
+> [HARNESS.md](HARNESS.md) 第 2 节与 [ARCHITECTURE.md](ARCHITECTURE.md) 3.9 节）；
+> 本文档第 3 节保留为历史记录，说明当时的适配方式与踩过的坑。
+>
+> 只读控制台插件已实现（`plugins/workpanda-ops/`），并在本机 Octop 实例上完成安装、
+> 加载、模型接入、真实聊天工具调用与 Dashboard 浏览器内渲染的全链路走查（见第 4 节）。
 
 ## 1. 相关上游项目
 
@@ -24,7 +29,12 @@ WorkPanda 只依赖 **Octop-Harness SDK**，不整体部署 Octop 产品。控�
 
 关键约束：**控制台不写业务状态**。流程推进、群众确认和副作用只能通过群众侧接口完成，避免出现"控制台显示成功、业务侧仍待确认"的双写冲突。
 
-## 3. 运行时接入
+## 3. 运行时接入（已废弃）
+
+> **本节描述的实现已于 2026-11-08 移除。** `OctopHarnessGateway` / `OctopHarnessExecutor`、
+> `WORKPANDA_OCTOP_*` 配置、`scripts/smoke_octop.py` 与 `.[octop]` 可选依赖均已删除，
+> 对应测试一并移除。保留下文是为了记住两类判断依据：结构化结果契约为什么必须存在
+> （3.2 节），以及"把整步委托给外部运行时"到底丢掉了什么。
 
 ### 3.1 组件
 
@@ -82,24 +92,17 @@ WorkPanda 只依赖 **Octop-Harness SDK**，不整体部署 Octop 产品。控�
 1. 可完成的步骤 → 必须 `completed` 且带 `evidence`；
 2. 模型无法真正完成的步骤 → 必须落到 `outcome_unconfirmed` / `handoff_required`，**绝不能是 `completed`**，且事件里必须留下模型原文。
 
-```bash
-python -m pip install -e '.[octop]'
-python scripts/smoke_octop.py    # 依赖 .env 中的 Octop 配置
-```
+> 已废弃：`scripts/smoke_octop.py` 与 `.[octop]` 可选依赖随适配器一起删除。
+> 现行冒烟请用 `python scripts/smoke_harness.py`（无需可选依赖）。
 
-### 3.6 启用方式
+### 3.6 启用方式（已废弃）
 
-```bash
-python -m pip install -e '.[octop]'
-export WORKPANDA_OCTOP_ENABLED=true
-export WORKPANDA_OCTOP_API_KEY=...            # 必须
-export WORKPANDA_OCTOP_MODEL=gpt-4o-mini
-export WORKPANDA_OCTOP_PROVIDER=openai        # openai / anthropic
-export WORKPANDA_OCTOP_BASE_URL=...           # 兼容接口时必填
-export WORKPANDA_OCTOP_WORKSPACE=...          # 必须是绝对路径或可解析路径
-```
+历史上通过 `WORKPANDA_OCTOP_*` 一组环境变量在装配期选中这个执行器。这组配置已从
+`Settings` 中删除；残留的旧环境变量会被忽略（`extra="ignore"`），不会再换掉执行器——
+`tests/test_cancel_executor.py::test_stale_octop_env_does_not_resurrect_a_second_executor`
+把这一点钉住。
 
-未启用时执行器仍是 `ScriptedExecutor`，仅用于骨架自检。
+现在装配只有两条：`harness`（真实执行）或 `ScriptedExecutor`（骨架自检，不跑模型循环）。
 
 ## 4. 控制台接入
 
@@ -196,7 +199,7 @@ launchd 托管的常驻进程，全部状态落在 `~/Library/Application Suppor
   `RunAtLoad` + `KeepAlive`：机器重启后自动拉起，进程异常退出也会被拉起；
 - 凭据在登录钥匙串，service `workpanda-deploy`，账户名为环境变量名：
   `WORKPANDA_OPS_TOKEN`、`WORKPANDA_SESSION_SECRET`、`WORKPANDA_MODEL_API_KEY`、
-  `WORKPANDA_OCTOP_API_KEY`、`OCTOP_ADMIN_PASSWORD`。包装脚本启动时读取并注入，
+  `OCTOP_ADMIN_PASSWORD`。包装脚本启动时读取并注入，
   plist 与 `api.env` 里没有明文（`api.env` 只接受白名单内的非敏感键）；
 - 安装：`octop plugin install <插件目录> --force`（1.0.2 的 `plugin install`
   只接受目录或 URL，**不接受本地 zip 路径**），随后 `octop plugin reload` 并重启
@@ -254,12 +257,13 @@ TLS、对外绑定与多客户端隔离都没有在试点里演练过。
 
 ## 5. 已验证与未验证
 
-已验证：
+已验证（历史，对应代码已移除）：
 
-- `octop-harness 1.0.8` 可安装；
-- 适配器能按其真实签名构造 `HarnessAgent`（`tests/test_octop_runtime.py::test_real_sdk_builds_harness_agent`）；
-- 三态映射、缺少凭据、未安装 SDK 的降级行为有单元测试覆盖；
-- **真实模型端到端已跑通**：内网 OpenAI 兼容接口（`deepseek-v4-1-flash`）下，可完成步骤得到 `completed` + `evidence`；模型无法执行的步骤得到 `handoff_required` + `failed`，且事件中保留了模型原文，不再出现虚假成功（`scripts/smoke_octop.py`）。
+- `octop-harness 1.0.8` 曾可安装，适配器能按其真实签名构造 `HarnessAgent`；
+- 三态映射、缺少凭据、未安装 SDK 的降级行为当时有单元测试覆盖；
+- **真实模型端到端曾跑通**：内网 OpenAI 兼容接口（`deepseek-v4-1-flash`）下，可完成步骤得到 `completed` + `evidence`；模型无法执行的步骤得到 `handoff_required` + `failed`，且事件中保留了模型原文，不再出现虚假成功（`scripts/smoke_octop.py`，已随适配器一起删除）。
+
+现行执行路径的同类验证见 `scripts/smoke_harness.py`。
 
 未验证：
 

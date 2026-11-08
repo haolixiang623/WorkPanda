@@ -16,7 +16,6 @@
 - 签名会话令牌、任务归属隔离与按会话限流；
 - 通用 harness 受控执行层：工具白名单、参数校验、三重预算、逐次留痕（见 `docs/HARNESS.md`）；
 - 结构化结果契约（防虚假成功）：无依据不得报成功，有工具却零调用降级为待确认；
-- Octop-Harness 运行时适配器（备选后端）；
 - 统一错误码映射与基础测试。
 
 明确未实现：
@@ -39,7 +38,7 @@ domain/          任务状态、流程定义、确认凭证、存储协议
   ↑
 harness/         通用受控执行层：工具循环、预算、留痕（只依赖 application.ports）
   ↑
-infrastructure/  存储、事件总线、Octop 适配器
+infrastructure/  存储、事件总线
 ```
 
 依赖方向单向：`api → application → domain`，`infrastructure` 与 `harness` 只实现 `domain` 和
@@ -132,12 +131,14 @@ created → running → waiting_for_user → running
 
 限流状态在进程内存中，多实例部署需替换为共享存储（如 Redis）。
 
-### 3.9 Octop 集成
+### 3.9 运维控制台集成
 
-运行时由 Octop-Harness 承担，控制台由 Octop 提供，详见 [OCTOP-INTEGRATION.md](OCTOP-INTEGRATION.md)。
+执行只走内置 harness 一条路径（见 `docs/HARNESS.md`）；控制台由 Octop 提供，只读地读取
+`/api/ops/*`，详见 [OCTOP-INTEGRATION.md](OCTOP-INTEGRATION.md)。
 
-- `OctopHarnessExecutor` 实现 `Executor` 协议，只执行单个受控步骤；
-- 超时与运行时异常映射为 `unconfirmed`，不重试、不报成功；
+- 早先存在的「Octop 运行时作为备选执行器」已移除：把整步委托出去后，工具循环不在本服务内，
+  取消、预算、留痕、确认都只能落到整步粒度，无法证明某次副作用是否发生。这属于能力边界，
+  不是配置项；
 - 运维读接口 `/api/ops/*` 由按主体发放的凭据保护（`WORKPANDA_OPS_TOKENS`），
   未配置时整体 404；`viewer` 只见列表与聚合，明细要求 `admin`，见
   [OPS-ACCESS-CONTROL.md](OPS-ACCESS-CONTROL.md)；

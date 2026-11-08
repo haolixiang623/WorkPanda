@@ -119,15 +119,6 @@ class Settings(BaseSettings):
     harness_audit_max_bytes: int = 5_000_000
     # 滚动保留的备份份数；0 表示只留当前文件。
     harness_audit_backups: int = 3
-    # Octop-Harness 运行时。默认关闭，未配置模型凭据时不启用。
-    octop_enabled: bool = False
-    octop_agent_name: str = "workpanda"
-    octop_model: str = "gpt-4o-mini"
-    octop_provider: str = "openai"
-    octop_api_key: str | None = None
-    octop_base_url: str | None = None
-    octop_workspace: str | None = None
-    octop_timeout_seconds: float = 30.0
     # 骨架自检流程，只用于验证任务链路；正式接入业务前必须关闭。
     enable_demo_flow: bool = True
 

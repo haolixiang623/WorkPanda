@@ -1,7 +1,7 @@
 """取消对所有执行器生效：至少"开始前"这一道不能漏。
 
-背景：取消信号原本只有 `HarnessExecutor` 自己的循环在读。Octop 运行时与脚手架
-执行器不读它，于是用户点了取消，正在排队的那一步照样从头跑完——包括那笔提交。
+背景：取消信号原本只有 `HarnessExecutor` 自己的循环在读。脚手架执行器不读它，
+于是用户点了取消，正在排队的那一步照样从头跑完——包括那笔提交。
 `CancellableExecutor` 统一了"执行开始前"这道边界，本组用例把它钉住。
 """
 
@@ -22,7 +22,6 @@ from workpanda.config import Settings
 from workpanda.harness.cancel import CancelRegistry
 from workpanda.harness.cancel_executor import CancellableExecutor
 from workpanda.infrastructure.adapters import ScriptedExecutor
-from workpanda.infrastructure.octop_runtime import OctopHarnessExecutor
 
 
 def make_request(task_id: uuid.UUID | None = None) -> ExecutionRequest:
@@ -173,7 +172,20 @@ def test_default_container_wraps_the_scripted_executor() -> None:
         container.close()
 
 
-def test_octop_executor_is_wrapped_when_enabled() -> None:
+def test_stale_octop_env_does_not_resurrect_a_second_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Octop 运行时已移除：老环境变量不得再换掉执行器。
+
+    部署脚本或历史 `.env` 里可能仍留着 `WORKPANDA_OCTOP_*`。配置类忽略未知键，
+    本用例把这一点钉住——否则那些残留配置会变成一条看不见的第二执行路径。
+    """
+
+    monkeypatch.setenv("WORKPANDA_OCTOP_ENABLED", "true")
+    monkeypatch.setenv("WORKPANDA_OCTOP_API_KEY", "sk-test-not-a-real-key")
+
+    assert not [name for name in Settings.model_fields if name.startswith("octop")]
+
     container = build_container(
         Settings(
             store_backend="memory",
@@ -181,14 +193,10 @@ def test_octop_executor_is_wrapped_when_enabled() -> None:
             harness_enabled=False,
             model_base_url=None,
             model_api_key=None,
-            octop_enabled=True,
-            octop_api_key="sk-test-not-a-real-key",
-            octop_workspace=".pytest-tmp/octop-cancel",
         )
     )
     try:
         assert isinstance(container.executor, CancellableExecutor)
-        assert isinstance(container.executor.inner, OctopHarnessExecutor)
+        assert isinstance(container.executor.inner, ScriptedExecutor)
     finally:
-        # 关闭容器应能关掉网关里的后台事件循环线程。
         container.close()
