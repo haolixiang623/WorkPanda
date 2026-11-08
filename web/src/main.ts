@@ -555,7 +555,7 @@ function summaryList(screen: Screen, editable: boolean): HTMLElement {
     list.appendChild(el("dt", "", row.label));
     const cell = el("dd", "", row.value);
     if (editable) {
-      const change = actionButton({ kind: "edit", label: "改", primary: false }, () => {
+      const change = actionButton({ kind: "edit", label: "修改", primary: false }, () => {
         editing = row.name;
         render();
       });

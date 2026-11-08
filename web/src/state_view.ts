@@ -249,6 +249,9 @@ export function screenOf(view: TaskView | null): Screen {
       const summary = collected(view);
       return {
         ...base,
+        // 步骤作者写的「这一步要什么」比状态级的通用句具体得多：服务端给了就用它，
+        // 群众看到的是「请补充需要办理的主题。」而不是「请补充提示的内容」。
+        hint: view.current_step_prompt ?? base.hint,
         field,
         summary,
         actions: field === null ? [CANCEL] : [SUBMIT, CANCEL],
