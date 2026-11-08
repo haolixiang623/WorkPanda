@@ -37,6 +37,15 @@
             gap: 8px; align-items: end; padding: 8px 0; border-bottom: 1px dashed #e5e6eb; }
     .step .field { min-width: 0; }
     .step label { font-size: 11px; }
+    .sample { display: grid; grid-template-columns: 1fr 1.1fr 2.2fr auto;
+              gap: 8px; align-items: end; padding: 8px 0; border-bottom: 1px dashed #e5e6eb; }
+    .sample .field { min-width: 0; }
+    .sample label { font-size: 11px; }
+    #sample-status { margin-top: 10px; padding: 10px 12px; border-radius: 6px;
+                     font-size: 12px; white-space: pre-wrap; }
+    #sample-status.ok { background: #e8f7ee; color: #1a7f43; }
+    #sample-status.warn { background: #fff0f1; color: #b0273f; }
+    #sample-status ul { margin: 6px 0 0; padding-left: 20px; }
     .invalid { border-color: #d03050 !important; background: #fff5f6 !important; }
     #message { padding: 10px 12px; border-radius: 6px; margin-bottom: 16px; display: none;
                white-space: pre-wrap; word-break: break-word; }
@@ -90,6 +99,21 @@
     <div id="steps"></div>
     <div class="row" style="margin-top: 12px">
       <button id="add-step">添加步骤</button>
+    </div>
+
+    <h2 style="margin-top: 20px">意图样例（发布门禁材料）</h2>
+    <p class="muted">样例随版本一起保存，发布时由服务端门禁裁决。正例必须能被识别到本流程这一版；
+      近似误例与超范围例必须一条都不被路由。样例一律用合成或脱敏话术，不要填入真实用户原话。</p>
+    <div id="samples"></div>
+    <div class="row" style="margin-top: 10px">
+      <button id="add-sample-positive">添加正例</button>
+      <button id="add-sample-near-miss">添加近似误例</button>
+      <button id="add-sample-out-of-scope">添加超范围例</button>
+    </div>
+    <div id="sample-status" role="status" aria-live="polite"></div>
+    <p class="muted" id="sample-authority">上面的条数只是本地提示；缺哪一类、缺几条最终以服务端发布门禁的 409 报告为准。</p>
+
+    <div class="row" style="margin-top: 12px">
       <button id="save-draft" class="primary">保存草稿</button>
       <button id="clear-draft">清空表单</button>
     </div>

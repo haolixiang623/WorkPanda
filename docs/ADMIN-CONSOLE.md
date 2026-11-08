@@ -49,6 +49,10 @@ export WORKPANDA_ADMIN_TOKENS='duty01:viewer:<随机串>,sop01:admin:<随机串>
 草稿提交体没有 `status` 字段：版本内容里的 status 只是作者态标记，服务端固定写成
 `draft`，只有发布指针能让流程生效。前端因此无法构造出一个"自带 published"的版本。
 
+草稿提交体带 `intent_samples`（Issue #62）：表单录入的样例随版本一起落库，与
+`FlowDefinition` 的字段一一对应。条数下限**不在建草稿时裁决**——版本不可变，允许先把
+草稿建出来再补材料；发布时由 `IntentReleaseGate` 按服务端配置判定，见第 3.5 节。
+
 ## 3. 关键设计决策
 
 ### 3.1 发布后群众侧必须立即命中（本轮最重要的一处）
@@ -88,6 +92,28 @@ pydantic 先挡字段形状（422 带 `loc`），再由 `flow_field_errors()` �
 `serialize_report()` 在服务端补齐这两个字段：否则前端只能从逐条结果自行重算门禁口径，
 迟早和后端对不上。
 
+### 3.5 意图样例：界面录入、本地提示、服务端裁决（Issue #62）
+
+管理页表单提供三类样例的动态列表（正例 / 近似误例 / 超范围例），可增删、可改类别，
+`sample_id`、类别、话术都有形状校验，重复 id / 重复话术会定位到具体行。这些样例随
+草稿提交体一起发送到 `POST /api/admin/flows`，由 pydantic 与 `flow_field_errors()`
+分别挡形状和语义，错误带 `intent_samples.<i>.<field>` 的 `loc`，界面按 `data-loc` 标红。
+
+保存前的**本地预检**只做一件事：把「缺哪一类、还缺几条」直接显示出来，样例不足或形状
+不合法时禁用「保存草稿」，避免先存一份注定发不出去的版本、再跑到发布时吃 409。
+它用的是 `admin-ui/src/sample_check.ts` 里的纯函数，编译产物可被 Node 直接 import 做
+行为回归（`tests/test_admin_ui_intent_samples.py`）。
+
+本地条数**不是发布规则**。服务端 `IntentReleaseGate` 用
+`Settings.intent_eval_min_positive` / `intent_eval_min_near_miss` 独立裁决；两边数字一旦
+漂移，或调用方绕过界面直接打 API，最终结论都是服务端的 `409 admin_intent_gate_blocked`
+报告，`report.coverage` 里逐类写出 `have/need`，指针保持不动。回归
+`test_server_gate_is_authoritative_when_local_thresholds_drift` 刻意把服务端阈值调高，
+钉住「前端说够了不算数」。超范围例建议写，但服务端不设条数下限，本地也只作提示。
+
+规则本身仍由装配期代码给出：本轮不做样例自动生成、不从历史任务反推样例，也不做
+「群众说一句话就自动路由到新流程」的规则装配。
+
 ## 4. 验收标准对照
 
 | 验收项 | 落地与回归 |
@@ -100,24 +126,30 @@ pydantic 先挡字段形状（422 带 `loc`），再由 `flow_field_errors()` �
 | 不应发生：viewer 发布或回滚 | `test_viewer_can_read_but_cannot_change_anything` |
 | 不应发生：管理侧凭据泄漏 | `test_admin_credential_never_appears_in_responses`、`test_admin_ui_assets_do_not_embed_credentials`、三套凭据互不认账用例 |
 | 契约测试：合法/非法各若干 | 4 组形状 + 4 组语义 + 版本不可变 + 用例增删 |
+| #62：只用界面建出的流程能发布成功 | `test_ui_created_flow_can_publish`（界面提交体 → 草稿含样例 → 回放 → 发布） |
+| #62：样例不足时按钮禁用并写明缺什么 | `test_local_sample_gate_disables_save_until_counts_met`、`test_compiled_bundle_wires_the_sample_gate` |
+| #62：前端阈值漂移时服务端仍权威 | `test_server_gate_is_authoritative_when_local_thresholds_drift`（409 + 指针不动） |
 | 手工走查 | 运维视角「建草稿 → 回放 → 发布 → 回滚」仍需在试点浏览器里走一遍，见第 6 节 |
 
 ## 5. 部署与运维
 
-- 前端在 `admin-ui/`，与群众侧分开构建、分开部署；静态托管 `index.html` 与
-  `dist/main.js` 即可，`tsc --project admin-ui/tsconfig.json` 可重新生成产物。
+- 前端在 `admin-ui/`，与群众侧分开构建、分开部署；静态托管 `index.html` 与整个
+  `dist/`（`main.js` 与 `sample_check.js` 两个 ESM 模块，缺一不可）即可，
+  `tsc --project admin-ui/tsconfig.json` 可重新生成产物。
 - 若管理页与服务端不同源，把管理页来源加入 `WORKPANDA_CORS_ORIGINS` 白名单
   （不接受通配符）。服务端默认仍只监听回环且不开 TLS；对外暴露需同时满足
   `bind_host` 非回环、`tls_enabled=true` + 证书存在、`allow_network_bind=true`，
   见 [OPS-ACCESS-CONTROL.md](OPS-ACCESS-CONTROL.md) 第 4 节。
 - 轮换与撤销沿用运维侧流程：加新密钥 → 重启 → 调用方切换 → 删旧密钥 → 重启。
-- 操作顺序建议：建草稿 → 加用例 → 回放 → 预演发布 → 发布 → 需要时回滚。
+- 操作顺序建议：建草稿（含三类意图样例）→ 加用例 → 回放 → 预演发布 → 发布 →
+  需要时回滚。样例文本一律用合成或脱敏话术，不填群众原话。
   发布结果以响应的 `published` 字段为准，界面不会自行推断成功。
 
 ## 6. 影响面与已知限制（高风险，启用前须确认）
 
 本 Issue 风险等级为高：管理侧能改"哪一步需要确认、哪一步能调哪个工具"，等于能改
-副作用语义与权限边界。以下事项**没有在本轮解决**，启用前需业务 / 安全责任人确认：
+副作用语义与权限边界。以下事项除第 4 条的**样例录入界面**已由 Issue #62 补上外，
+其余**没有在本轮解决**，启用前需业务 / 安全责任人确认：
 
 1. **默认关闭**：未配置管理凭据时接口整体 404；是否启用、由哪些主体持有 admin
    凭据属于部署决策，不在代码里代做决定。
@@ -126,12 +158,13 @@ pydantic 先挡字段形状（422 带 `loc`），再由 `flow_field_errors()` �
    依赖"发布立即全局生效"。
 3. **回滚绕过门禁**：3.2 的取舍需责任人确认；若要求回滚也过门禁，应另做设计评审，
    并给出用例被误删时的应急通道。
-4. **意图样例由版本内容携带，#52 的发布门禁会拦**：`intent_samples` 是
-   `FlowDefinition` 的字段，API 建草稿时随请求体一起提交；但本轮表单没有样例录入项，
-   所以**只用界面建出来的流程没有样例，发布会返回 409**（`admin_intent_gate_blocked`，
-   报告里点名缺哪一类、缺几条）。补齐样例需要走 API/脚本，规则本身仍由装配期代码给出，
-   群众说一句话自动路由到新流程属于后续事项。当前无样例的新流程可由客户端显式
-   指定 `flow_id` 命中，或由部署侧补规则。
+4. **意图样例录入已支持，规则自动装配仍未做（#62 / #52）**：`intent_samples` 随
+   `FlowDefinition` 落库，API 建草稿时随请求体一起提交。表单提供三类样例的动态列表、
+   形状校验与提交前本地预检；样例不足会禁用保存并写明「缺哪一类、还缺几条」，
+   服务端 `IntentReleaseGate` 仍按自己的阈值裁决，本地数字漂移时以 409 报告为准
+   （见 3.5）。**仍未解决的是规则装配**：样例只用于发布前评测，不会让群众说一句话
+   就自动命中新建流程；规则仍由装配期代码给出，当前需部署侧补规则或由客户端显式
+   指定 `flow_id`。这属于启用前需确认的影响面，本轮不代业务做决定。
 5. **独立域名 / 端口 / 证书**：待部署形态确定（见 #53），本轮不决定。
 6. **人工走查未完成**：自动化覆盖的是接口契约与权限；真实浏览器里完成一次
    「建草稿 → 回放 → 发布 → 回滚」并核对群众侧表现，仍需在试点由人执行。
@@ -141,9 +174,12 @@ pydantic 先挡字段形状（422 带 `loc`），再由 `flow_field_errors()` �
 
 - `ruff check .` 全过。
 - 全量 `pytest`（`WORKPANDA_STORE_BACKEND=memory`、`--basetemp` 在 OS 临时目录）通过；
-  新增 `tests/test_admin_flows_api.py` 22 项覆盖第 4 节表格。
+  `tests/test_admin_flows_api.py` 22 项覆盖第 4 节表格。
+- Issue #62 新增 `tests/test_admin_ui_intent_samples.py` 5 项：界面提交体端到端发布、
+  重复样例的字段级 `loc`、服务端阈值漂移负向回归、前端预检行为、编译产物接线。
 - 远端两项 CI（Python 检查、文档与敏感信息基础检查）在 PR head 与 main 均为 success。
-- 前端 `tsc --strict --noEmitOnError` 编译通过，产物 `admin-ui/dist/main.js` 已提交。
+- 前端 `tsc --strict --noEmitOnError` 编译通过，产物 `admin-ui/dist/main.js` 与
+  `admin-ui/dist/sample_check.js` 已提交。
 
 ## 8. 复盘
 
@@ -157,5 +193,10 @@ pydantic 先挡字段形状（422 带 `loc`），再由 `flow_field_errors()` �
    `test_publish_makes_flow_hittable_by_citizen_side` 与回滚用例；凡是"改了配置就该
    立即生效"的功能，都要求一条从真实入口发起的回归，而不只是存储层断言。
 5. **后续**：多实例发布同步由 #53 承接，可观察完成标准 = 多实例下发布后所有实例
-   在约定时限内一致且可监测；意图样例的录入界面与规则装配仍待补（#52 已交付
-   "样例随版本 + 发布门禁"，表单尚未覆盖样例录入，见第 6 节第 4 条）。
+   在约定时限内一致且可监测；#52 已交付"样例随版本 + 发布门禁"，#62 补上了表单录入
+   界面，剩下的规则自动装配仍待补（见第 6 节第 4 条）。
+6. **#62 的根因是静默丢字段，不只是少一个输入框**：`FlowDraftRequest` 未声明
+   `intent_samples`，pydantic 默认忽略额外键，界面填了样例也存不进版本，发布必吃
+   409。只补表单不补请求体等于没修。最小持久预防是端到端回归
+   `test_ui_created_flow_can_publish` 从"界面提交体"出发，断言草稿响应里样例条数，
+   而不是只在存储层断言 `FlowDefinition` 支持这个字段。
