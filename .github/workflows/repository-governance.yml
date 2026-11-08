@@ -71,3 +71,8 @@ jobs:
         run: ruff check .
       - name: 运行测试
         run: pytest
+      # 识别评测是发布门禁的一部分：跑全部已发布流程的意图样例，输出混淆矩阵、
+      # 误路由率与漏路由率。误路由必须为 0；漏路由超上限、样例条数不足、评测
+      # 超时或崩溃都判失败——"没有结论"不许当通过。
+      - name: 识别评测门禁
+        run: python scripts/evaluate_intents.py

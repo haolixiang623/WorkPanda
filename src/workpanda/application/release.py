@@ -1,9 +1,15 @@
-"""发布门禁：把"回放通过"变成发布的前置条件。
+"""发布门禁：把"回放通过"与"样例能过"变成发布的前置条件。
 
-规则只有一条：**该版本有回放用例时，未通过不得发布**。没有用例的版本照旧可以发布
-——这条门禁不假装覆盖没有基线的流程；它只是让"写了用例就真的会被拦"成立。反过来说，
-"用一条永远不会失败的用例换放行"也是不可能的：用例无效（`invalid`）与回放无结论
-（`unconfirmed`）同样会挡住发布。
+两道门，顺序固定，都是先裁决再移动指针：
+
+1. **识别样例**（`application/intent_eval.py`）：该版本必须带够正例与近似误例，且
+   评测里不得出现误路由、漏路由不得超过上限。样例不足是作者态问题，报在回放之前，
+   省得"回放过了但发不出去"还要再跑一遍才看懂；
+2. **回放**：该版本有回放用例时，未通过不得发布。
+
+关于"没有基线就放行"：回放这条是**有意的**——不假装覆盖没写用例的流程，但报告里
+会明确标出 `replay_ran=false`。识别样例不同：`intent_sample_gate` 开启时样例是硬性
+材料，没有样例不能发布，因为"缺样例"本身就是要拦的那件事。
 
 发布指针的移动仍然由 `FlowStore` 负责，这里只做裁决：先判定，再移动。两件事分成
 两个存储操作是刻意的——门禁失败时不该出现"指针移了、回放没过"的中间态。
@@ -13,8 +19,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from workpanda.application.intent_eval import IntentReleaseGate
 from workpanda.application.replay import FlowReplay
 from workpanda.domain.flow import FlowDefinition, FlowReleaseMissing, FlowStore
+from workpanda.domain.intent_eval import IntentEvalReport
 from workpanda.domain.replay import ReplayCaseStore, ReplayReport
 
 
@@ -34,6 +42,8 @@ class FlowReleaseOutcome:
     # 是否存在可用的回放依据。False 有两种原因：没写用例，或门禁被关掉。
     replay_ran: bool
     report: ReplayReport | None = None
+    # 识别样例的评测报告。`intent_gate` 未启用时为 None。
+    intent_report: IntentEvalReport | None = None
 
 
 class FlowReleaseService:
@@ -44,11 +54,15 @@ class FlowReleaseService:
         cases: ReplayCaseStore,
         replay: FlowReplay,
         gate_enabled: bool = True,
+        intent_gate: IntentReleaseGate | None = None,
     ) -> None:
         self.flows = flows
         self.cases = cases
         self.replay = replay
         self.gate_enabled = gate_enabled
+        # None 表示该部署没有启用识别样例门禁（`intent_sample_gate=false`，或测试中
+        # 直接注入流程定义、根本不存在"发布"这件事）。装配层默认一定给。
+        self.intent_gate = intent_gate
 
     def release(
         self, flow_id: str, version: str, *, apply: bool = True
@@ -62,6 +76,11 @@ class FlowReleaseService:
         # 版本必须真的存在：`FlowStore.publish` 只保证指针不指向空洞，不会告诉我们
         # 这个版本的步骤长什么样，而回放必须要它。
         flow = self._version(flow_id, version)
+        intent_report = (
+            self.intent_gate.require(flow, self._published_definitions())
+            if self.intent_gate is not None
+            else None
+        )
         cases = self.cases.list(flow_id, version)
 
         if not self.gate_enabled or not cases:
@@ -72,6 +91,7 @@ class FlowReleaseService:
                 flow_version=version,
                 published=apply,
                 replay_ran=False,
+                intent_report=intent_report,
             )
 
         report = self.replay.run_cases(flow, cases)
@@ -86,6 +106,7 @@ class FlowReleaseService:
             published=apply,
             replay_ran=True,
             report=report,
+            intent_report=intent_report,
         )
 
     def check(self, flow_id: str, version: str) -> ReplayReport:
@@ -94,11 +115,29 @@ class FlowReleaseService:
         flow = self._version(flow_id, version)
         return self.replay.run_cases(flow, self.cases.list(flow_id, version))
 
+    def check_intents(self, flow_id: str, version: str) -> IntentEvalReport | None:
+        """只跑识别评测、不改状态。门禁未启用时返回 None。"""
+
+        if self.intent_gate is None:
+            return None
+        flow = self._version(flow_id, version)
+        return self.intent_gate.evaluate(flow, self._published_definitions())
+
     def _version(self, flow_id: str, version: str) -> FlowDefinition:
         for flow in self.flows.list_versions(flow_id):
             if flow.version == version:
                 return flow
         raise FlowReleaseMissing(f"flow {flow_id!r} version {version!r} is not registered")
+
+    def _published_definitions(self) -> list[FlowDefinition]:
+        """当前发布指针指向的版本。评测用它当"其余流程"的口径。"""
+
+        pointers = self.flows.published_versions()
+        return [
+            flow
+            for flow in self.flows.list_versions()
+            if pointers.get(flow.flow_id) == flow.version
+        ]
 
 
 def _blocked_message(flow_id: str, version: str, report: ReplayReport) -> str:

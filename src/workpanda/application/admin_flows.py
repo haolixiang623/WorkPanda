@@ -12,7 +12,8 @@
 - 不读、不返回任何凭据。主体由 API 层鉴权后只用于审计归属。
 
 刻意不做的事：自由文本 DSL / YAML 编辑、多级审批、意图规则的运行时装配
-（意图样例与 CI 评测门禁属 #52）、多实例间的发布同步（属 #53，见部署文档）。
+（意图样例随版本内容提交、发布时由 #52 的门禁裁决，规则本身仍由装配期代码给出）、
+多实例间的发布同步（属 #53，见部署文档）。
 """
 
 from __future__ import annotations
@@ -173,8 +174,9 @@ class AdminFlowService:
 
     def publish(self, flow_id: str, version: str, *, apply: bool = True) -> PublishOutcome:
         self._require_version(flow_id, version)
-        # `FlowReleaseBlocked` 故意不在这里吞掉：门禁拦下时指针没动，报告要原样
-        # 交给界面，运维才能看到是哪条用例以什么判定挡住的。由 API 层映射成 409。
+        # `IntentEvalBlocked` 与 `FlowReleaseBlocked` 故意都不在这里吞掉：门禁拦下时
+        # 指针没动，报告要原样交给界面，运维才能看到是"样例不够/误路由"还是
+        # "某条回放用例以什么判定挡住"。由 API 层分别映射成 409 的两个错误码。
         try:
             outcome: FlowReleaseOutcome = self.release.release(flow_id, version, apply=apply)
         except FlowReleaseMissing as exc:
