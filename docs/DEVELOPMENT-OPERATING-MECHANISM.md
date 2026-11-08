@@ -194,17 +194,20 @@ python scripts/issue_claim.py guard 27 --sha <sha>   # 合并前复核
   Issue 会被自动认领；`question`（需决策）与 `documentation`（总览/合规前置）
   不自动领取，对应第 3 节「高风险任务不能由 AI 自行领取」；
 - claim 默认 TTL 7200 秒，过期视为失效，避免 worker 崩溃后永久占位；
-  该 Issue 已有 open PR 时放宽 4 倍，但保留上界；TTL 必须长于一次修复的
-  最坏耗时，否则会出现租约中途过期、两人同时在跑；
+  **只有该 claim 自己的 worker 已在这个 Issue 上开出 PR** 时才放宽 4 倍
+  （按 claim 归属算，不因「该 Issue 上有别人的 PR」而延长），且保留上界，
+  悬空 PR 不能永久锁死 Issue；TTL 必须长于一次修复的最坏耗时，否则会出现
+  租约中途过期、两人同时在跑；
 - 这套机制只对**走同一脚本**的 worker 成立；绕过协议时只能靠 L3 兜底。
 
 ### 10.5 验证证据
 
 `tests/test_issue_claim.py` 用带锁的 fake GitHub（服务端自增 comment id）跑
 20 轮双线程真并发，断言每轮**有且仅有一个** worker 获准；另覆盖过期、
-TTL 放宽、精确释放、旧格式释放被忽略、输者撤回、guard 的 CI/竞争分支/
-已合并拒绝。真实 GitHub API 上也做过一次双进程并发认领 + 撤回 + 释放 +
-guard 复核的端到端验证。
+TTL 按 worker 放宽、精确释放、旧格式释放被忽略、输者撤回、guard 的 CI/
+竞争分支/已合并拒绝，以及「过期无产出 claim 不能复活」在 claim / guard /
+list 三条路径上结论一致。真实 GitHub API 上也做过一次双进程并发认领 +
+撤回 + 释放 + guard 复核的端到端验证。
 
 ### 10.6 跨环境部署清单
 

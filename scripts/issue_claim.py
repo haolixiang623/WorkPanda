@@ -4,6 +4,12 @@
 而在 claim comment 的服务端单调 id：一个 Issue 的有效 claim 中 id 最小者获准。
 comment id 由 GitHub 分配且唯一，所以最小者唯一 —— 这与并发时序无关。
 
+「有效」= 未被 release 且未过期。过期按基准 TTL 算；只有当**该 claim 自己的
+worker** 已经在这个 Issue 上开了 PR 时，才把有效期放宽 PR_TTL_MULTIPLIER 倍。
+放宽必须按 worker 归属计，不能因为「这个 Issue 上有人开了 PR」就延长所有
+claim —— 那会复活一条从没产出、早已过期的旧 claim，让它凭更小的 id 判赢，
+把真正在干活的 worker 挤掉（#71）。
+
 本机的进程互斥锁只保证「挑选 Issue → 发 claim」这一段不撞车；跨主机时该锁失效，
 但 comment id 仲裁仍然成立，结果只是一次无效认领，不会有两个 worker 同时开工。
 
@@ -37,6 +43,7 @@ try:
     import msvcrt  # Windows：msvcrt.locking 做本机进程互斥
 except ImportError:  # 非 Windows
     msvcrt = None  # type: ignore[assignment]
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -144,31 +151,43 @@ def parse_events(comments: list[dict]) -> tuple[list[Claim], set[int]]:
     return claims, released_ids
 
 
+def _is_active(
+    claim: Claim, now: datetime, released_ids: set[int], open_pr_workers: Collection[str]
+) -> bool:
+    """单条 claim 是否仍占着这个 Issue。仲裁与列可领都必须走这一份判定。
+
+    放宽有效期的条件是「**这条 claim 的 worker 自己**已经开了 PR」，不是
+    「这个 Issue 上有人开了 PR」：后者会让一条从未产出、早已过期的 claim
+    因为别人开了 PR 而复活，进而凭更小的 comment id 判赢，把真正在干活
+    的 worker 挤掉（#71）。没有 PR 支撑的 claim 一律按基准 TTL 过期。
+    """
+
+    if claim.comment_id in released_ids:
+        return False
+    multiplier = PR_TTL_MULTIPLIER if claim.worker_id in open_pr_workers else 1
+    return _as_utc(now) - _as_utc(claim.created_at) <= timedelta(
+        seconds=claim.ttl_seconds * multiplier
+    )
+
+
 def arbitrate(
     claims: list[Claim],
     worker_id: str,
     now: datetime,
     *,
     released_ids: set[int] | None = None,
-    has_open_pr: bool = False,
+    open_pr_workers: Collection[str] = frozenset(),
 ) -> tuple[bool, Claim | None, str]:
     """有效 claim 中 id 最小者获准。返回 (是否获准, 胜者, 原因)。
 
-    过期的 claim 视为失效（worker 崩溃后不会永久占位）；但该 Issue 已有
-    open PR 时把有效期放宽 PR_TTL_MULTIPLIER 倍，避免抢占正在开发的分支，
-    同时保留上界，防止一条悬空 PR 把 Issue 永久锁死。
+    过期规则见 _is_active：没产出 PR 的 claim 到点即失效（worker 崩溃后
+    不会永久占位），有自己 PR 的 claim 放宽 PR_TTL_MULTIPLIER 倍，避免
+    抢正在开发的分支，同时保留上界，防止悬空 PR 把 Issue 永久锁死。
     """
 
     released_ids = released_ids or set()
     now = _as_utc(now)
-    active = []
-    for claim in claims:
-        if claim.comment_id in released_ids:
-            continue
-        multiplier = PR_TTL_MULTIPLIER if has_open_pr else 1
-        if now - _as_utc(claim.created_at) > timedelta(seconds=claim.ttl_seconds * multiplier):
-            continue
-        active.append(claim)
+    active = [claim for claim in claims if _is_active(claim, now, released_ids, open_pr_workers)]
     if not active:
         return False, None, "no_active_claim"
     winner = min(active, key=lambda item: item.comment_id)
@@ -178,21 +197,16 @@ def arbitrate(
 
 
 def active_claims(
-    claims: list[Claim], now: datetime, *, released_ids: set[int], has_open_pr: bool
+    claims: list[Claim],
+    now: datetime,
+    *,
+    released_ids: set[int],
+    open_pr_workers: Collection[str],
 ) -> list[Claim]:
     """给 list / next 用：还有哪些 claim 仍在占着这个 Issue。"""
 
-    result = []
-    multiplier = PR_TTL_MULTIPLIER if has_open_pr else 1
-    for claim in claims:
-        if claim.comment_id in released_ids:
-            continue
-        if _as_utc(now) - _as_utc(claim.created_at) > timedelta(
-            seconds=claim.ttl_seconds * multiplier
-        ):
-            continue
-        result.append(claim)
-    return result
+    now = _as_utc(now)
+    return [c for c in claims if _is_active(c, now, released_ids, open_pr_workers)]
 
 
 # ---------------------------------------------------------------------------
@@ -347,9 +361,20 @@ def branch_prefix(number: int) -> str:
     return f"issue/{number}-"
 
 
-def _has_open_pr(pulls: list[dict], number: int) -> bool:
+def open_pr_workers(pulls: list[dict], number: int) -> set[str]:
+    """哪些 worker 在该 Issue 上已经有 open PR。
+
+    PR 的分支名是 issue/<n>-<worker>，前缀之后那段就是 worker id ——
+    只有这些人自己的 claim 才配延长有效期（理由见 _is_active）。
+    """
+
     prefix = branch_prefix(number)
-    return any((pr.get("head", {}).get("ref") or "").startswith(prefix) for pr in pulls)
+    workers: set[str] = set()
+    for pr in pulls:
+        ref = pr.get("head", {}).get("ref") or ""
+        if ref.startswith(prefix) and len(ref) > len(prefix):
+            workers.add(ref[len(prefix) :])
+    return workers
 
 
 def _withdraw(
@@ -377,9 +402,9 @@ def claim_once(client, number: int, worker_id: str, now: datetime, ttl: int) -> 
     claim_id = int(created["id"])
     comments = client.list_comments(number)
     claims, released_ids = parse_events(comments)
-    has_pr = _has_open_pr(client.list_open_pulls(), number)
+    pr_workers = open_pr_workers(client.list_open_pulls(), number)
     granted, winner, reason = arbitrate(
-        claims, worker_id, now, released_ids=released_ids, has_open_pr=has_pr
+        claims, worker_id, now, released_ids=released_ids, open_pr_workers=pr_workers
     )
 
     result = {
@@ -397,7 +422,7 @@ def claim_once(client, number: int, worker_id: str, now: datetime, ttl: int) -> 
     # 写后读回：判定必须基于服务端最终状态，不能拿刚发出去的那条当结论。
     again, released_again = parse_events(client.list_comments(number))
     still, _, _ = arbitrate(
-        again, worker_id, now, released_ids=released_again, has_open_pr=has_pr
+        again, worker_id, now, released_ids=released_again, open_pr_workers=pr_workers
     )
     if not still:
         result["granted"] = False
@@ -415,9 +440,9 @@ def release_claim(client, number: int, worker_id: str, now: datetime) -> dict:
 
     comments = client.list_comments(number)
     claims, released_ids = parse_events(comments)
-    has_pr = _has_open_pr(client.list_open_pulls(), number)
+    pr_workers = open_pr_workers(client.list_open_pulls(), number)
     granted, winner, reason = arbitrate(
-        claims, worker_id, now, released_ids=released_ids, has_open_pr=has_pr
+        claims, worker_id, now, released_ids=released_ids, open_pr_workers=pr_workers
     )
     if not granted or winner is None:
         return {
@@ -459,7 +484,10 @@ def eligible_issues(client, now: datetime, ttl: int) -> list[int]:
             continue
         claims, released_ids = parse_events(client.list_comments(number))
         if active_claims(
-            claims, now, released_ids=released_ids, has_open_pr=_has_open_pr(pulls, number)
+            claims,
+            now,
+            released_ids=released_ids,
+            open_pr_workers=open_pr_workers(pulls, number),
         ):
             continue
         result.append(number)
@@ -479,9 +507,9 @@ def guard(client, number: int, worker_id: str, sha: str, now: datetime) -> dict:
     comments = client.list_comments(number)
     claims, released_ids = parse_events(comments)
     pulls = client.list_open_pulls()
-    has_pr = _has_open_pr(pulls, number)
+    pr_workers = open_pr_workers(pulls, number)
     granted, _, reason = arbitrate(
-        claims, worker_id, now, released_ids=released_ids, has_open_pr=has_pr
+        claims, worker_id, now, released_ids=released_ids, open_pr_workers=pr_workers
     )
     if not granted:
         return reject("claim_lost_or_expired: " + reason)

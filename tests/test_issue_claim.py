@@ -134,13 +134,29 @@ def test_arbitrate_expired_claim_is_ignored():
     assert claim.arbitrate([stale], "worker1", now)[2] == "no_active_claim"
 
 
-def test_open_pr_extends_ttl_but_keeps_an_upper_bound():
+def test_open_pr_extends_ttl_only_for_the_worker_that_opened_it():
+    """放宽有效期按 claim 归属算，不按 Issue 全局算。
+
+    这条用例的前身（test_open_pr_extends_ttl_but_keeps_an_upper_bound）断言
+    「该 Issue 上有 open PR → 任何过期的 claim 都复活」，正是这条写错的语义
+    让一条从未产出、早已过期的旧 claim 凭更小的 comment id 判赢，把真正在
+    干活、PR 都已经开出来的 worker 挤掉（#71）。这里纠正的是一条错误断言，
+    不是为了让测试变绿而改期望。
+    """
+
     now = claim.utcnow()
     stale = claim.Claim(101, "worker1", now - timedelta(seconds=7201), 7200)
-    assert claim.arbitrate([stale], "worker1", now, has_open_pr=False)[0] is False
-    assert claim.arbitrate([stale], "worker1", now, has_open_pr=True)[0] is True
+
+    # 没产出过 PR：到点即失效，别人开 PR 也延长不了我的租约。
+    assert claim.arbitrate([stale], "worker1", now)[0] is False
+    assert claim.arbitrate([stale], "worker1", now, open_pr_workers={"worker2"})[0] is False
+
+    # 自己的 claim + 自己的 PR：放宽。
+    assert claim.arbitrate([stale], "worker1", now, open_pr_workers={"worker1"})[0] is True
+
+    # 放宽仍有上界：一条悬空 PR 不能把 Issue 永久锁死。
     ancient = claim.Claim(101, "worker1", now - timedelta(seconds=7200 * 5), 7200)
-    assert claim.arbitrate([ancient], "worker1", now, has_open_pr=True)[0] is False
+    assert claim.arbitrate([ancient], "worker1", now, open_pr_workers={"worker1"})[0] is False
 
 
 def test_released_claim_no_longer_wins():
@@ -324,6 +340,95 @@ def test_guard_rejects_competing_branch_and_already_merged():
     fake.pulls = []
     fake.commits = [{"commit": {"message": "feat: 修完 (#28)\n\nCloses #27"}}]
     assert claim.guard(fake, 27, "worker1", "abc123", now)["reason"] == "already_merged"
+
+
+def test_open_pr_workers_parses_worker_from_branch_name():
+    """PR 归属从分支名 issue/<n>-<worker> 里取，越界的一律不算进来。"""
+
+    pulls = [
+        {"head": {"ref": "issue/71-worker1"}},
+        {"head": {"ref": "issue/71-interactive"}},
+        {"head": {"ref": "issue/711-worker9"}},  # 不同 Issue
+        {"head": {"ref": "issue/71-"}},  # 空 worker
+        {"head": {"ref": "feature/issue/71-x"}},
+        {"head": {}},
+    ]
+    assert claim.open_pr_workers(pulls, 71) == {"worker1", "interactive"}
+
+
+def test_stale_claim_without_output_cannot_be_revived_by_another_pr():
+    """#71 真实事故的回归。
+
+    #68 / #69 两份已完成、CI 全绿的实现双双 lost_arbitration，因为一条
+    06:18:06Z 创建、从未产出、08:18:06Z 已过期的 claim（comment
+    6718147034）被「该 Issue 上有 open PR」的全局倍率复活，凭更小的
+    comment id 判赢。
+    """
+
+    now = claim.utcnow()
+    fake = FakeGitHub()
+    fake.seed_claim("worker3", 71, now - timedelta(seconds=7201))  # id 更小，但没产出
+    fake.pulls = [{"head": {"ref": "issue/71-worker1"}}]  # PR 是 worker1 的
+
+    result = claim.claim_once(fake, 71, "worker1", now, 7200)
+    assert result["granted"] is True
+    assert result["reason"] == "granted"
+    assert result["winner_comment_id"] == result["claim_comment_id"]
+    assert result["branch"] == "issue/71-worker1"
+
+
+def test_active_claims_ignores_stale_claim_even_when_others_have_open_pr():
+    """list / next 走的是 active_claims，必须与 arbitrate 同一套过期规则。"""
+
+    now = claim.utcnow()
+    stale = claim.Claim(101, "worker3", now - timedelta(seconds=7201), 7200)
+    fresh = claim.Claim(102, "worker1", now, 7200)
+
+    alive = claim.active_claims(
+        [stale, fresh], now, released_ids=set(), open_pr_workers={"worker1"}
+    )
+    assert [item.comment_id for item in alive] == [102]
+
+    # 只有当 worker3 自己也有了 PR，它这条才配留下
+    alive = claim.active_claims(
+        [stale, fresh], now, released_ids=set(), open_pr_workers={"worker1", "worker3"}
+    )
+    assert [item.comment_id for item in alive] == [101, 102]
+
+
+def test_guard_does_not_revive_another_workers_stale_claim():
+    """合并前闸门同样不许让别人的过期 claim 复活。"""
+
+    now = claim.utcnow()
+    fake = FakeGitHub()
+    fake.seed_claim("worker3", 71, now - timedelta(seconds=7201))
+    fake.seed_claim("worker1", 71, now)
+    fake.pulls = [{"head": {"ref": "issue/71-worker1"}}]
+    fake.check_runs_result = green_checks()
+
+    result = claim.guard(fake, 71, "worker1", "abc123", now)
+    assert result["ok"] is True, result
+
+
+def test_claim_guard_and_list_agree_on_the_same_server_state():
+    """#71 一致性验收：claim / guard / list 对同一份服务端状态结论相同。"""
+
+    now = claim.utcnow()
+    issues = [
+        {"number": 71, "state": "open", "labels": [{"name": "enhancement"}], "assignees": []},
+    ]
+    fake = FakeGitHub(issues)
+    fake.seed_claim("worker3", 71, now - timedelta(seconds=7201))
+    fake.pulls = [{"head": {"ref": "issue/71-worker1"}}]
+    fake.check_runs_result = green_checks()
+
+    assert claim.claim_once(fake, 71, "worker1", now, 7200)["granted"] is True
+    assert claim.guard(fake, 71, "worker1", "abc123", now)["ok"] is True
+    assert claim.eligible_issues(fake, now, 7200) == []
+    # 过期无产出的 worker3 手上没有任何可释放的 claim
+    released = claim.release_claim(fake, 71, "worker3", now)
+    assert released["ok"] is False
+    assert released["reason"].startswith("no_active_claim_to_release")
 
 
 def test_default_lock_path_is_outside_repo(monkeypatch):
