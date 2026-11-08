@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex" />
+  <title>办事助手</title>
+  <style>
+    :root { color-scheme: light; --ink: #1f2329; --muted: #646a73; --line: #e5e6eb;
+            --brand: #1a6ee0; --ok: #1a7f43; --warn: #b0273f; --bg: #f7f8fa; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--ink);
+           font: 15px/1.65 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+           -webkit-text-size-adjust: 100%; }
+    .shell { max-width: 560px; margin: 0 auto; padding: 20px 16px 48px; }
+    header h1 { font-size: 19px; margin: 0 0 4px; }
+    header p { margin: 0 0 18px; color: var(--muted); font-size: 13px; }
+    .card { background: #fff; border: 1px solid var(--line); border-radius: 10px;
+            padding: 16px; margin-bottom: 14px; }
+    .status-title { font-size: 17px; margin: 0 0 6px; }
+    .status .hint { margin: 0; color: var(--muted); }
+    .status.completed { border-color: #b9e3c6; background: #f4fbf6; }
+    .status.completed .status-title { color: var(--ok); }
+    .status.failed, .status.outcome_unconfirmed, .status.cancelled,
+    .status.handoff { border-color: #f0d6da; background: #fdf6f7; }
+    .status.failed .status-title, .status.outcome_unconfirmed .status-title,
+    .status.handoff .status-title { color: var(--warn); }
+    .status.awaiting_confirmation { border-color: #cfdcf5; background: #f5f8fe; }
+    .status.user_action_required { border-color: #f2e2c4; background: #fffaf1; }
+    .muted { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+    .composer { display: flex; flex-direction: column; gap: 6px; }
+    .composer label { font-size: 13px; color: var(--muted); }
+    textarea, input[type="text"] { width: 100%; padding: 9px 10px; font: inherit;
+                                   color: var(--ink); border: 1px solid #c9cdd4;
+                                   border-radius: 6px; background: #fff; }
+    textarea:focus, input[type="text"]:focus, button:focus-visible {
+      outline: 2px solid var(--brand); outline-offset: 1px; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+    .actions .muted { flex-basis: 100%; margin: 4px 0 0; }
+    button { padding: 9px 16px; border: 1px solid #c9cdd4; border-radius: 6px;
+             background: #fff; color: var(--ink); cursor: pointer; font: inherit; }
+    button.primary { background: var(--brand); border-color: var(--brand); color: #fff; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    button.link { border: none; background: none; color: var(--brand); padding: 0 2px;
+                  text-decoration: underline; }
+    dl { margin: 0; }
+    dt { font-size: 12px; color: var(--muted); margin-top: 10px; }
+    dd { margin: 2px 0 0; }
+    dl.summary dd { display: flex; gap: 8px; align-items: baseline; justify-content: space-between; }
+    dl.summary dd button { padding: 1px 8px; font-size: 12px; }
+    .action-target { margin: 0 0 6px; font-size: 13px; color: var(--muted); }
+    .impact { margin-top: 14px; padding: 10px 12px; border-radius: 6px;
+              background: #fff7e8; color: #7a4b00; font-size: 13px; }
+    .connection { display: none; }
+    .connection.reconnecting, .connection.offline {
+      display: flex; gap: 8px; align-items: center; margin-bottom: 12px;
+      padding: 9px 12px; border-radius: 6px; font-size: 13px; }
+    .connection.reconnecting { background: #fff7e8; color: #7a4b00; }
+    .connection.offline { background: #fff0f1; color: var(--warn); }
+    #notice { display: none; }
+    #notice.notice { display: block; margin-bottom: 12px; padding: 9px 12px;
+                     border-radius: 6px; background: #fff0f1; color: var(--warn);
+                     font-size: 13px; }
+    footer { margin-top: 20px; color: var(--muted); font-size: 12px; }
+    footer p { margin: 4px 0; }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <h1>办事助手</h1>
+      <p>用您自己的话说要办什么就行，系统会一步步问清楚。</p>
+    </header>
+
+    <div id="connection" class="connection" role="status" aria-live="polite"></div>
+    <div id="notice" role="alert"></div>
+    <main id="app"></main>
+
+    <footer>
+      <p>本次页面不会保存您填写的内容；关闭页面后需重新开始。</p>
+      <p>办理进度以本页显示的状态为准，请勿重复提交。</p>
+    </footer>
+  </div>
+  <script type="module" src="./dist/main.js"></script>
+</body>
+</html>

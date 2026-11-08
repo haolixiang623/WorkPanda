@@ -2,10 +2,15 @@
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, computed_field
+
+if TYPE_CHECKING:
+    # 只为标注：`flow` 在运行时依赖 `models`（`StepKind` 之外还有状态枚举），
+    # 顶层互相 import 会成环。
+    from workpanda.domain.flow import FlowRegistry
 
 
 def utc_now() -> datetime:
@@ -117,7 +122,13 @@ class TaskNoteRequest(BaseModel):
 
 
 class TaskView(BaseModel):
-    """面向客户端的任务视图，不暴露内部存储细节。"""
+    """面向客户端的任务视图，不暴露内部存储细节。
+
+    群众侧页面要用到的东西在这里**一次给全**，不让页面去猜：状态、待填字段、
+    已填内容、当前步骤的说明与确认文案。页面拿不到就会自己编（把 `subject` 印成
+    "subject"，或者按旧槽位拼一句确认摘要），而那是界面在替服务端说话——正是
+    `domain/presentation.py` 要避免的那类分叉（#77）。
+    """
 
     task_id: UUID
     conversation_id: str
@@ -125,8 +136,21 @@ class TaskView(BaseModel):
     flow_version: str
     status: TaskStatus
     current_step: str | None
+    # 当前步骤的作者文案（来自流程版本，不是模型生成的）。页面直接展示，不改写。
+    current_step_title: str | None = None
+    current_step_prompt: str | None = None
+    confirm_message: str | None = None
     completed_steps: list[str]
     pending_fields: list[str]
+    # 字段的群众可读名字，覆盖**这一版流程声明过的全部字段**，不只是待填的那几个：
+    # 确认页要把已收集的值逐条列出来核对，返回修改时要能指回具体字段。只给待填
+    # 字段的话，确认页只能把 `subject` 原样印出来。缺标签时回退成字段名本身——
+    # 页面不需要第二套规则。同一字段在多个步骤里给了不同标签时，先出现的明确
+    # 标签优先，不让后一个步骤把前一个的说法改掉。
+    field_labels: dict[str, str] = Field(default_factory=dict)
+    # 已收集的字段值。确认摘要要能核对"到底提交什么"，所以必须给到客户端；
+    # 但也只给当前任务自己的值，不跨任务、不跨会话。
+    slots: dict[str, str] = Field(default_factory=dict)
     result: dict[str, Any] | None
     failure_code: str | None
     failure_message: str | None
@@ -150,8 +174,44 @@ class TaskView(BaseModel):
 
         return ui_state_for(self.status).value
 
+    # 群众可见文案也由服务端下发，而不是让页面自己维护一张 11 项的表：
+    # 页面一旦有第二份措辞，"结果待确认"就可能被写成"已办结"，而这正是
+    # `domain/presentation.py` 存在的理由。页面只负责原样显示。
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ui_title(self) -> str:
+        from workpanda.domain.presentation import copy_for_status
+
+        return copy_for_status(self.status).title
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def ui_hint(self) -> str:
+        from workpanda.domain.presentation import copy_for_status
+
+        return copy_for_status(self.status).hint
+
     @classmethod
-    def from_task(cls, task: Task) -> "TaskView":
+    def from_task(cls, task: Task, flows: "FlowRegistry | None" = None) -> "TaskView":
+        """从任务投影出视图。`flows` 给了才补当前步骤的作者文案与字段标签。
+
+        刻意做成可选：运维/工作人员的视图不需要群众文案，而展示层不该因为
+        "库里查不到这个版本"就整条接口 500——那种任务照样要能看、能取消。
+        """
+
+        flow = None
+        if flows is not None:
+            flow = flows.find(task.flow_id, task.flow_version)
+        step = None if flow is None or task.current_step is None else flow.step(task.current_step)
+        labels: dict[str, str] = {}
+        if flow is not None:
+            for candidate in flow.steps:
+                for name in candidate.required_fields:
+                    label = candidate.field_labels.get(name)
+                    if label is not None:
+                        labels[name] = label
+                    else:
+                        labels.setdefault(name, name)
         return cls(
             task_id=task.task_id,
             conversation_id=task.conversation_id,
@@ -159,8 +219,13 @@ class TaskView(BaseModel):
             flow_version=task.flow_version,
             status=task.status,
             current_step=task.current_step,
+            current_step_title=None if step is None else step.title,
+            current_step_prompt=None if step is None else step.prompt,
+            confirm_message=None if step is None else step.confirm_message,
             completed_steps=list(task.completed_steps),
             pending_fields=task.pending_fields,
+            field_labels=labels,
+            slots=dict(task.slots),
             result=task.result,
             failure_code=task.failure_code,
             failure_message=task.failure_message,

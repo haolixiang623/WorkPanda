@@ -44,6 +44,11 @@ class StepDefinition(BaseModel):
     requires_confirmation: bool = False
     confirm_message: str | None = Field(default=None, max_length=1000)
     fail_to_handoff: bool = True
+    # 群众侧展示用的字段中文名（可选）。字段名是内部标识（`subject`、`contact`），
+    # 直接印在页面上等于让群众读代码；但页面也不能自己编一个说法（"主题"还是
+    # "办理事项"只有流程作者知道）。所以标签归作者，页面只负责取。
+    # 留空时页面退回显示字段名本身——诚实但不好看，好过猜错。
+    field_labels: dict[str, str] = Field(default_factory=dict)
 
 
 class FlowDefinition(BaseModel):
@@ -243,6 +248,16 @@ class FlowRegistry:
                 f"flow {flow_id!r} version {version!r} is not registered"
             ) from exc
 
+    def find(self, flow_id: str, version: str) -> FlowDefinition | None:
+        """按 `(flow_id, version)` 取版本，不存在返回 None。
+
+        给展示层用：任务可能指向库里已经没有的版本（历史数据、迁移、或运维删过），
+        这时页面该少显示几句作者文案，而不是整条任务接口 500——那种任务照样要
+        能查看、能取消。
+        """
+
+        return self._flows.get((flow_id, version))
+
     @staticmethod
     def _published(flow: FlowDefinition) -> FlowDefinition:
         if flow.status is not FlowStatus.PUBLISHED:
@@ -309,6 +324,7 @@ def flow_field_errors(flow: FlowDefinition) -> list[FlowFieldError]:
                         ),
                     )
                 )
+        errors.extend(_field_label_errors(flow, index, step))
 
     errors.extend(_intent_sample_errors(flow))
     errors.extend(_intent_rule_errors(flow))
@@ -328,6 +344,37 @@ def validate_flow(flow: FlowDefinition) -> None:
     errors = flow_field_errors(flow)
     if errors:
         raise ValueError(errors[0].message)
+
+
+def _field_label_errors(
+    flow: FlowDefinition, index: int, step: StepDefinition
+) -> list[FlowFieldError]:
+    """字段标签只能标注这一步骤声明过的字段，且不能是空串。
+
+    标错字段的后果很隐蔽：页面照样渲染，只是那条标签永远不会出现（字段名本身被
+    显示给群众），或者出现一个「有名字但没有输入框」的幽灵标签。两种都不会报错。
+    """
+
+    errors: list[FlowFieldError] = []
+    for name, label in sorted(step.field_labels.items()):
+        if name not in step.required_fields:
+            errors.append(
+                FlowFieldError(
+                    loc=("steps", index, "field_labels", name),
+                    message=(
+                        f"step {step.step_id!r} labels {name!r}, "
+                        "which is not one of its required_fields"
+                    ),
+                )
+            )
+        if not label.strip():
+            errors.append(
+                FlowFieldError(
+                    loc=("steps", index, "field_labels", name),
+                    message=f"step {step.step_id!r} has a blank label for {name!r}",
+                )
+            )
+    return errors
 
 
 def _intent_rule_errors(flow: FlowDefinition) -> list[FlowFieldError]:

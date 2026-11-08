@@ -22,9 +22,7 @@ from __future__ import annotations
 import uvicorn
 
 from workpanda.capacity import validate_deployment_topology
-from workpanda.config import Settings, get_settings
-
-LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+from workpanda.config import LOOPBACK_HOSTS, Settings, get_settings
 
 
 class NetworkConfigError(ValueError):

@@ -47,3 +47,8 @@ out/
 # 安装时不跑 tsc；同样要排除 dist/ 规则的误伤。
 !admin-ui/dist/
 !admin-ui/dist/*
+
+# 群众侧对话页的编译产物同样随仓库交付：服务端直接托管 `web/`，
+# 没有构建步骤可用；`tests/test_web_ui.py` 还会比对源码与产物是否同步。
+!web/dist/
+!web/dist/*
