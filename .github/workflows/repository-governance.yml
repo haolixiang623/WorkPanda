@@ -78,3 +78,28 @@ jobs:
       # 超时或崩溃都判失败——"没有结论"不许当通过。
       - name: 识别评测门禁
         run: python scripts/evaluate_intents.py
+
+  # 浏览器用例单独一个 job：它们的依赖（Playwright + chromium）不该装进每个
+  # Python job，但**也不能因此消失**。`WORKPANDA_REQUIRE_BROWSER=1` 让"缺浏览器"
+  # 在这里是失败而不是跳过——跳过当通过是这类门禁最典型的失效方式（job 配错了
+  # 也只是绿）。靶子用仓库自带的 mock-site，本机进程内起两个端口，不访问外网。
+  browser:
+    name: 浏览器执行器检查
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 安装项目、浏览器组件与开发依赖
+        run: |
+          python -m pip install -e ".[browser]"
+          python -m pip install -r requirements-dev.txt
+      - name: 安装 chromium
+        run: python -m playwright install --with-deps chromium
+      - name: 运行浏览器用例
+        env:
+          WORKPANDA_REQUIRE_BROWSER: '1'
+        run: pytest tests/test_browser_harness.py -q

@@ -22,6 +22,13 @@ dev = [
   "pytest-asyncio>=0.24,<1.0",
   "ruff>=0.7,<1.0",
 ]
+# 浏览器执行器（P2）。**必须钉死版本**：Playwright 每次大版本都会改定位与等待
+# 语义，浮动版本会让"同一份代码在 CI 与本机行为不同"，而这类差异恰好表现为
+# "元素找不到"——最容易被当成页面改版放过去的一种失败。
+# 浏览器二进制不进仓库，装完再跑 `playwright install chromium`。
+browser = [
+  "playwright==1.64.1",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/workpanda"]
@@ -32,6 +39,11 @@ packages = ["src/workpanda"]
 # 与产品包不重叠。
 pythonpath = ["src", "mock-site"]
 asyncio_mode = "auto"
+# `browser` 标记的用例需要真实 chromium。CI 里另有一个 job 装浏览器并设
+# `WORKPANDA_REQUIRE_BROWSER=1`：那个 job 里缺浏览器是**失败**，不是跳过。
+markers = [
+  "browser: 需要真实浏览器（chromium）的用例，CI 单独 job 运行",
+]
 
 [tool.ruff]
 line-length = 100

@@ -1,9 +1,11 @@
 """内置受控工具。
 
-只放"与业务无关、但任何事项都可能用到"的能力。两个样本分别代表两类风险：
+只放"与业务无关、但任何事项都可能用到"的能力。三个样本分别代表三类风险：
 
 - `sys_clock`：纯本地、无副作用，低风险；
-- `http_fetch`：触达外部网络，中风险——必须域名白名单、禁私网地址、禁跳转。
+- `http_fetch`：触达外部网络，中风险——必须域名白名单、禁私网地址、禁跳转；
+- `browser_*`：用真实浏览器操作三方站，中高风险——白名单（含跳转后的站点）、
+  一任务一 context、写操作默认全拒。
 
 新增工具时必须先确认：默认不可用、显式授权才可用、失败不产生副作用。
 """
@@ -19,6 +21,9 @@ from urllib.parse import urlparse
 
 import httpx
 
+from workpanda.harness.browser.policy import BrowserPolicy
+from workpanda.harness.browser.session import BrowserSessions
+from workpanda.harness.browser.tools import browser_tools
 from workpanda.harness.models import RiskLevel, ToolSpec
 from workpanda.harness.tools import (
     DEFAULT_MAX_STUCK_THREADS,
@@ -172,6 +177,7 @@ def default_registry(
     *,
     allowed_hosts: Sequence[str] = (),
     http_client: httpx.Client | None = None,
+    browser_policy: BrowserPolicy | None = None,
     max_stuck_threads: int = DEFAULT_MAX_STUCK_THREADS,
 ) -> tuple[ToolRegistry, list[Callable[[], None]]]:
     """构造默认工具注册表。
@@ -188,4 +194,11 @@ def default_registry(
         fetch = HttpFetchTool(allowed_hosts=allowed_hosts, client=http_client)
         registry.register(fetch)
         closers.append(fetch.close)
+    # 浏览器工具同理：没给白名单就一个都不注册，模型连工具名都看不到。
+    # 注册了也只是"具备能力"，某一步能不能调仍由步骤授权决定。
+    if browser_policy is not None and browser_policy.enabled:
+        sessions = BrowserSessions(browser_policy)
+        for tool in browser_tools(sessions, browser_policy):
+            registry.register(tool)
+        closers.append(sessions.close_all)
     return registry, closers

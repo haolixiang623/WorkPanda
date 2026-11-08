@@ -208,10 +208,66 @@ class LookupOrderTool:
 |---|---|---|
 | `sys_clock` | 低 | 返回 UTC/本地时间与 unix 时间戳 |
 | `http_fetch` | 中 | 按域名白名单抓取公开网页文本；**未配置白名单时不注册** |
+| `browser_*` | 中 | 七个浏览器工具，只开到「进入填写页」（见下） |
 
 `http_fetch` 的安全约束（缺一不可）：仅 https、主机白名单（精确或 `.` 前缀后缀匹配）、
 解析结果必须是公网地址、不跟随重定向、限制响应体大小与超时。空白名单意味着外部访问能力
 默认关闭，比默认全开安全。
+
+### 浏览器执行器（API 优先、浏览器补位）
+
+有些三方站只能点页面。`browser_*` 七个工具用 Playwright 驱动无头 Chromium，
+**只开到「进入填写页」**，把最容易出事的那一半（点提交）明确挡在门外。
+
+| 工具 | 说明 |
+|---|---|
+| `browser_open` | 打开白名单内页面，返回标题、地址与可见正文 |
+| `browser_read` | 读整页或某个元素的文本；表单控件读当前值（密码字段不回读） |
+| `browser_click` | 点链接/普通按钮；提交类控件默认拒绝 |
+| `browser_fill` | 写文本输入框（`value` 声明为敏感参数，不落明文） |
+| `browser_select` | 选下拉项（按 value 或显示文本） |
+| `browser_check` | 勾选/取消复选框；单选框只能改选 |
+| `browser_wait` | 等元素出现/隐藏，等不到就是明确失败 |
+
+五条硬约束，每条都有回归（策略层是纯函数，不依赖浏览器，所以"本机没装浏览器"
+不会成为红线无人验证的理由）：
+
+1. **域名白名单，含跳转后的站点**。条目可带端口（`127.0.0.1:8101`）：同一主机的两个
+   端口是两个 origin，cookie 作用域与隔离边界都不一样，按主机粒度放行等于放大一圈。
+   跳转落地后**每次操作都复查**——跨 origin 交接就发生在一击里，只校验入口等于没校验。
+2. **一任务一 browser + 一 context**，cookie / localStorage 不共享，任务之间没有任何
+   复用路径。Playwright 的同步 API 绑定创建它的线程，而工具调用是"每次调用起一个
+   线程"，所以每个任务配一个单线程执行器，由它排队执行。
+3. **写操作默认全拒**。判据是元素自身的属性（`data-testid`、`type`、可访问名、有无
+   form 宿主），不是模型说的话。提交类控件（`type=submit|image`、form 内没写 type 的
+   `<button>`）**必须在 `HARNESS_BROWSER_PERMITTED_CLICK_TESTIDS` 里登记过**才点得动；
+   登录按钮就属于这一类，登记即代表"人确认过它只建立会话、不提交业务数据"。
+   拒绝发生在派发点击之前——被拒时页面状态一点都不会变。
+4. **超时=结果未知，不重试**。工具不设内部超时，唯一时限是 `ToolSpec.timeout_seconds`；
+   超时由 harness 记 `TIMEOUT`（上层落 `OUTCOME_UNCONFIRMED`），不会自动重来。
+   `browser_click` 非幂等：一次执行里同一个目标只允许成功点一次。
+5. **失败现场默认不留**。配了 `HARNESS_BROWSER_ARTIFACT_DIR` 才写，写前先脱敏：DOM 走
+   文本脱敏 + 把本次填过的值回抹；截图前注入 CSS 把输入框内容渲染成圆点。
+   **截图只能盖住表单值**——页面别处回显的个人信息不在遮罩范围内，所以留档目录按
+   0600/0700 建，且不应外发。
+
+失败码（都能被上层的"转人工"接住，没有一条会退化成"看起来成功了"）：
+
+| 失败码 | 含义 |
+|---|---|
+| `scheme_not_allowed` / `credentials_in_url` | 地址不合法（只认 http/https，不许带凭据） |
+| `host_not_allowed` | 入口不在白名单 |
+| `redirect_host_not_allowed` | 跳转落到白名单外，会话立即销毁 |
+| `element_not_found` | 定位不到；或定位到多个却没给 `index`（`ambiguous_target`） |
+| `element_timeout` | 元素在限期内没出现 |
+| `submit_click_blocked` / `download_blocked` | 写操作 / 下载被拒 |
+| `option_not_found` / `not_a_select` / `not_a_checkbox` | 页面结构与预期不符（改版信号） |
+| `browser_unavailable` | 部署没装可选依赖 |
+
+依赖与 CI：Playwright 钉死 `1.64.1`（`pip install '.[browser]'`），浏览器二进制不进
+仓库（`playwright install chromium`）。CI 单开一个 job 装浏览器并设
+`WORKPANDA_REQUIRE_BROWSER=1`——在那个 job 里缺浏览器是**失败**；其余 job 里这些用例
+会 skip，并在报告里写明原因（跳过不当通过）。
 
 ### 一轮多调用的并发执行
 
