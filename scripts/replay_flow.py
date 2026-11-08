@@ -8,8 +8,8 @@
     # 只出回放报告（规则/样例还没就位时先写用例；不能当作发布依据）
     python3 scripts/replay_flow.py --flow demo.generic --version 2 --replay-only
 
-    # 走门禁并真的移动发布指针
-    python3 scripts/replay_flow.py --flow demo.generic --version 2 --publish
+    # 走门禁并真的移动发布指针（必须同时给署名）
+    python3 scripts/replay_flow.py --flow demo.generic --version 2 --publish --actor ops.zhang
 
     # 给某个版本加一条回放用例（用例是数据，写在库里）
     python3 scripts/replay_flow.py --flow demo.generic --version 2 --add-case case.json
@@ -102,6 +102,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--publish", action="store_true", help="通过门禁后移动发布指针")
     parser.add_argument(
+        "--actor",
+        default=None,
+        metavar="SUBJECT",
+        help="发布署名（谁把这一版推上线）；与 --publish 一起必填，不接受匿名发布",
+    )
+    parser.add_argument(
         "--replay-only",
         action="store_true",
         help="只出回放报告，不跑识别样例门禁（用于规则/样例就位前编写用例，不能当作发布依据）",
@@ -110,6 +116,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--delete-case", default=None, metavar="CASE_ID", help="删除一条用例")
     parser.add_argument("--json", action="store_true", help="以 JSON 输出报告")
     args = parser.parse_args(argv)
+
+    # 发布署名是必填的：命令行是最容易被跳过的那个入口，允许这里匿名，署名链就断了。
+    # 在打开库文件之前就拒绝，避免"读了一半才报用法错误"。
+    if args.publish and not (args.actor or "").strip():
+        print("--publish 必须同时给出 --actor（谁发布的）；不接受匿名发布。", file=sys.stderr)
+        return 2
 
     path = args.sqlite or _default_db()
     if not path.exists():
@@ -151,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.publish:
             try:
-                outcome = service.release(args.flow, args.version)
+                outcome = service.release(args.flow, args.version, actor=args.actor)
             except IntentEvalBlocked as exc:
                 _emit_intents(exc.report, args.json)
                 print(f"发布被拦（识别样例）：{exc}", file=sys.stderr)

@@ -48,6 +48,12 @@ interface FlowSummary {
   title: string;
   published: boolean;
   case_count: number;
+  /** 指针行上的署名人；只有 `published=true` 的那一行有值。 */
+  published_by: string | null;
+  /** 停用人；挂在停用前最后指向的那一版上。 */
+  disabled_by: string | null;
+  /** 最后一次发布 / 回滚的时间；停用不改它，所以停用时间不在这里。 */
+  updated_at: string | null;
 }
 
 interface ReplayCaseView {
@@ -87,6 +93,21 @@ interface PublishOutcome {
   published: boolean;
   replay_ran: boolean;
   message: string;
+  /** 预演（apply=false）没有移动指针，因此为 null。 */
+  published_by: string | null;
+}
+
+interface RollbackOutcome {
+  flow_id: string;
+  version: string;
+  rolled_back: boolean;
+  published_by: string;
+}
+
+interface DisableOutcome {
+  flow_id: string;
+  disabled: boolean;
+  disabled_by: string;
 }
 
 interface FieldProblem {
@@ -352,16 +373,25 @@ function renderFlows(flows: FlowSummary[]): void {
       row.insertCell().textContent = text;
     }
     const stateCell = row.insertCell();
+    const tag = document.createElement("span");
     if (flow.published) {
-      const tag = document.createElement("span");
       tag.className = "tag on";
-      tag.textContent = "已发布";
-      stateCell.replaceChildren(tag);
+      // 署名直接印在状态上：这一列回答的第一问题不是"发布了没有"，而是"谁推上去的"。
+      tag.textContent =
+        flow.published_by === null ? "已发布" : `已发布 · ${flow.published_by}`;
+      if (flow.updated_at !== null) {
+        tag.title = `发布于 ${flow.updated_at}`;
+      }
     } else {
-      const tag = document.createElement("span");
       tag.className = "tag off";
       tag.textContent = "草稿";
-      stateCell.replaceChildren(tag);
+    }
+    stateCell.replaceChildren(tag);
+    if (flow.disabled_by !== null) {
+      const note = document.createElement("div");
+      note.className = "muted";
+      note.textContent = `由 ${flow.disabled_by} 停用`;
+      stateCell.append(note);
     }
     // 第 5 列：用例数。
     row.insertCell().textContent = String(flow.case_count);
@@ -764,10 +794,16 @@ async function publish(
       "POST",
       { version: flow.version, apply },
     );
+    // 署名以服务端返回为准：界面不自己拼"当前登录人"，否则展示出来的名字可能
+    // 与库里记下的主体不是同一个（预演更是根本没有署名）。
+    const attribution =
+      outcome.published_by === null
+        ? ""
+        : `，署名 ${escapeHtml(outcome.published_by)}`;
     showMessage(
       "ok",
       `<strong>${outcome.published ? "已发布" : "预演通过，未发布"}</strong>：` +
-        `${escapeHtml(outcome.message)}；回放门禁${outcome.replay_ran ? "已执行" : "未执行（该版本没有用例）"}。`,
+        `${escapeHtml(outcome.message)}${attribution}；回放门禁${outcome.replay_ran ? "已执行" : "未执行（该版本没有用例）"}。`,
     );
     await refreshFlows();
   } catch (error) {
@@ -781,12 +817,15 @@ async function publish(
 }
 
 async function rollback(flow: { flow_id: string; version: string }): Promise<void> {
-  await api(
+  const result = await api<RollbackOutcome>(
     `/api/admin/flows/${encodeURIComponent(flow.flow_id)}/rollback`,
     "POST",
     { version: flow.version },
   );
-  showMessage("ok", `已回滚 ${escapeHtml(flow.flow_id)} 到 ${escapeHtml(flow.version)}；在途任务仍按各自版本继续。`);
+  showMessage(
+    "ok",
+    `已回滚 ${escapeHtml(flow.flow_id)} 到 ${escapeHtml(flow.version)}（署名 ${escapeHtml(result.published_by)}）；在途任务仍按各自版本继续。`,
+  );
   await refreshFlows();
 }
 
@@ -795,8 +834,14 @@ async function disable(): Promise<void> {
   if (flowId === "") {
     throw new Error("请先填写 flow_id。");
   }
-  await api(`/api/admin/flows/${encodeURIComponent(flowId)}/disable`, "POST");
-  showMessage("ok", `${escapeHtml(flowId)} 已停用（历史版本保留，可随时回滚）。`);
+  const result = await api<DisableOutcome>(
+    `/api/admin/flows/${encodeURIComponent(flowId)}/disable`,
+    "POST",
+  );
+  showMessage(
+    "ok",
+    `${escapeHtml(flowId)} 已由 ${escapeHtml(result.disabled_by)} 停用（历史版本与发布署名保留，可随时回滚）。`,
+  );
   await refreshFlows();
 }
 

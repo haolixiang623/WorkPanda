@@ -118,8 +118,9 @@ python3 scripts/replay_flow.py --flow demo.generic --version 2
 # 加一条用例（JSON 只写用例本身，flow_id/version 取自命令行）
 python3 scripts/replay_flow.py --flow demo.generic --version 2 --add-case case.json
 
-# 通过门禁后真的移动发布指针
-python3 scripts/replay_flow.py --flow demo.generic --version 2 --publish --side-effect-free sys_clock
+# 通过门禁后真的移动发布指针（必须署名，--actor 与 --publish 一起必填）
+python3 scripts/replay_flow.py --flow demo.generic --version 2 --publish \
+    --actor ops.zhang --side-effect-free sys_clock
 ```
 
 `case.json`：

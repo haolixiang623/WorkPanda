@@ -44,6 +44,8 @@ class FlowReleaseOutcome:
     report: ReplayReport | None = None
     # 识别样例的评测报告。`intent_gate` 未启用时为 None。
     intent_report: IntentEvalReport | None = None
+    # 实际落在库里的署名人。预演（未移动指针）为 None——没有发生的事不署名。
+    published_by: str | None = None
 
 
 class FlowReleaseService:
@@ -65,12 +67,16 @@ class FlowReleaseService:
         self.intent_gate = intent_gate
 
     def release(
-        self, flow_id: str, version: str, *, apply: bool = True
+        self, flow_id: str, version: str, *, actor: str, apply: bool = True
     ) -> FlowReleaseOutcome:
         """裁决（并在 `apply` 时执行）一次发布。
 
         `apply=False` 是"只看能不能发"的预演：运维可以先跑一遍看报告，确认无误再
-        真的移动指针。预演不写任何状态——否则"预演一次"就成了发布会。
+        真的移动指针。预演不写任何状态——否则"预演一次"就成了发布会，也就等于
+        凭空记了一条"某人发过"。
+
+        署名是必填的：这里是所有发布路径（管理侧接口、命令行脚本）的唯一收口，
+        允许某一处省略，署名链就断了。
         """
 
         # 版本必须真的存在：`FlowStore.publish` 只保证指针不指向空洞，不会告诉我们
@@ -85,13 +91,14 @@ class FlowReleaseService:
 
         if not self.gate_enabled or not cases:
             if apply:
-                self.flows.publish(flow_id, version)
+                self.flows.publish(flow_id, version, actor=actor)
             return FlowReleaseOutcome(
                 flow_id=flow_id,
                 flow_version=version,
                 published=apply,
                 replay_ran=False,
                 intent_report=intent_report,
+                published_by=actor if apply else None,
             )
 
         report = self.replay.run_cases(flow, cases)
@@ -99,7 +106,7 @@ class FlowReleaseService:
             raise FlowReleaseBlocked(_blocked_message(flow_id, version, report), report)
 
         if apply:
-            self.flows.publish(flow_id, version)
+            self.flows.publish(flow_id, version, actor=actor)
         return FlowReleaseOutcome(
             flow_id=flow_id,
             flow_version=version,
@@ -107,6 +114,7 @@ class FlowReleaseService:
             replay_ran=True,
             report=report,
             intent_report=intent_report,
+            published_by=actor if apply else None,
         )
 
     def check(self, flow_id: str, version: str) -> ReplayReport:
