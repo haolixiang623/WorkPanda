@@ -79,6 +79,19 @@ uvicorn workpanda.main:app --app-dir src --reload
 - 健康检查：`GET http://127.0.0.1:8000/healthz`
 - 接口文档：`http://127.0.0.1:8000/docs`
 
+## 本地模拟三方站
+
+`mock-site/` 是首期试点的模拟第三方站点：独立应用、两个端口、两个 origin、三个 tab、
+多附件，并保留五个可配置的失败/未知开关。它是 P2 浏览器执行器与 P3 人机协同的靶子。
+**这是模拟站，任何行为都不代表真实政务系统**，也不接真实身份核验与实名通道。
+
+```bash
+cd mock-site && python -m mock_site
+```
+
+演示账号 `demo / demo1234`，账号站 `127.0.0.1:8101`、办理站 `127.0.0.1:8102`。
+细节与全部开关见 [mock-site/README.md](mock-site/README.md)。
+
 ## 接口
 
 所有 `/api` 请求都需要携带 `X-WorkPanda-Session`。首次请求可以不带，服务端会在响应头下发新会话，客户端后续请求需原样带回。
@@ -208,6 +221,7 @@ admin-ui/            管理侧配置台前端（独立构建，产物提交）
 web/                 群众侧对话页前端（独立构建，产物提交）
 tests/               单元与接口测试
 scripts/             端到端冒烟、压测与回放脚本
+mock-site/           本地模拟三方站（两个 origin、多 tab、多附件、可复现失败）
 docs/                架构、受控执行层与开发运营机制
 design/              UI/UX 设计契约
 ```
