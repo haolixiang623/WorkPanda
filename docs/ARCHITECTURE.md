@@ -84,8 +84,21 @@ infrastructure/  存储、事件总线
 - 断言四件事：步骤序列、工具集合、终态、以及"工具调用不得越过所在步骤的声明"（未授权工具）；
 - 判定分 `pass`/`fail`/`invalid`/`unconfirmed`/`aborted`：用例写错与流程回归分开报，
   超时与崩溃一律"无结论"，谁也不降级成通过；
-- 门禁（`FlowReleaseService`）先裁决再移动指针：该版本有回放用例时，未通过即拦下，
-  指针不动。没有用例的版本照旧可发，但报告里明确标出"没有回放依据"。
+- 门禁（`FlowReleaseService`）先裁决再移动指针：**先识别样例、再回放**。该版本有回放
+  用例时，未通过即拦下，指针不动；没有用例的版本照旧可发（回放这条），但报告里明确
+  标出"没有回放依据"。
+
+**发布前的识别样例**（`domain/intent_sample.py`、`domain/intent_eval.py`、
+`application/intent_eval.py`）：
+
+- 样例跟版本内容绑定（`FlowDefinition.intent_samples`），分正例 / 近似误例 / 超范围例；
+  改样例等于改版本，避免"发布时校验的样例"与"生效的样例"两处漂移；
+- 发布强制 ≥3 条正例 + ≥2 条近似误例；评测产出混淆矩阵、误路由率、漏路由率；
+- **误路由必须为 0**（群众的话被塞进另一个事项的执行参数），漏路由默认上限 0；
+- 超时与崩溃判 `unconfirmed`，与"通过"严格分开；报告只含 `sample_id`，不含样例原文；
+- CI 入口 `scripts/evaluate_intents.py`，与启动路径共用同一套路由器装配。
+
+细节见 [INTENT-EVAL.md](INTENT-EVAL.md) 第 3.4 节。
 
 细节见 [SOP-REPLAY.md](SOP-REPLAY.md)。
 

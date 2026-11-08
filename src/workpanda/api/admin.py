@@ -27,6 +27,7 @@ from workpanda.application.admin_flows import (
     PublishOutcome,
     serialize_report,
 )
+from workpanda.application.intent_eval import IntentEvalBlocked
 from workpanda.application.release import FlowReleaseBlocked
 from workpanda.bootstrap import Container
 from workpanda.domain.flow import FlowDefinition, FlowStatus, StepDefinition
@@ -247,12 +248,25 @@ async def publish(
     _principal: OpsPrincipal = Depends(require_admin_role),
     container: Container = Depends(get_container),
 ) -> PublishOutcome:
-    """发布（或预演）。门禁拦下时返回 409 + 完整回放报告，指针保持不动。"""
+    """发布（或预演）。门禁拦下时返回 409 + 完整报告，指针保持不动。
+
+    两道门各有独立错误码：识别样例不够（`admin_intent_gate_blocked`）与回放未通过
+    （`admin_release_blocked`）是两种完全不同的补救动作，界面不该把它们混成一句话。
+    """
 
     try:
         outcome = _service(container).publish(flow_id, request.version, apply=request.apply)
     except AdminFlowNotFound as exc:
         raise _not_found(exc) from exc
+    except IntentEvalBlocked as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "admin_intent_gate_blocked",
+                "detail": str(exc),
+                "report": exc.report.model_dump(mode="json"),
+            },
+        ) from exc
     except FlowReleaseBlocked as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 from workpanda.api.ops_auth import OpsAccessPolicy, build_ops_policy
 from workpanda.application.admin_flows import AdminFlowService
+from workpanda.application.intent_eval import IntentEvalRunner, IntentReleaseGate
 from workpanda.application.ports import Executor, IntentRouter
 from workpanda.application.release import FlowReleaseService
 from workpanda.application.replay import FlowReplay
@@ -298,6 +299,16 @@ def default_intent_rules(flow_definitions: list[FlowDefinition]) -> tuple[Intent
     )
 
 
+def build_intent_router(flow_definitions: list[FlowDefinition]) -> RuleIntentRouter:
+    """装配识别路由器。服务端与运维脚本共用这一个函数，避免两处规则口径不同。
+
+    评测必须评"线上真的会用的那个路由器"：如果 CI 自己拼一台路由器，评测通过
+    只能证明评测代码对，证明不了服务能听懂群众说话。
+    """
+
+    return RuleIntentRouter(rules=default_intent_rules(flow_definitions))
+
+
 def build_container(
     settings: Settings | None = None,
     *,
@@ -337,6 +348,23 @@ def build_container(
         registry = FlowRegistry.from_store(flow_store)
     replay_cases, replay_closers = build_replay_case_store(settings)
     closers.extend(replay_closers)
+    registered = registry.versions()
+    # 未显式注入路由器时用确定性规则路由器：没有规则就等于"识别不了"，
+    # 让创建任务走澄清而不是猜一个流程。它在发布门禁之前装配，因为门禁要评的
+    # 正是"线上会用的这个路由器"。
+    router_instance = router or build_intent_router(registered)
+    # 识别样例门禁只在有版本库时成立：注入定义的场景没有"发布"这回事。
+    intent_gate = (
+        IntentReleaseGate(
+            router=router_instance,
+            runner=IntentEvalRunner(timeout_seconds=settings.intent_eval_timeout_seconds),
+            min_positive=settings.intent_eval_min_positive,
+            min_near_miss=settings.intent_eval_min_near_miss,
+            max_miss_rate=settings.intent_eval_max_miss_rate,
+        )
+        if flow_store is not None and settings.intent_sample_gate
+        else None
+    )
     # 发布门禁只在有版本库时成立：注入定义的那些定义不在库里，"发布"无从谈起。
     release = (
         FlowReleaseService(
@@ -344,6 +372,7 @@ def build_container(
             cases=replay_cases,
             replay=FlowReplay(timeout_seconds=settings.replay_timeout_seconds),
             gate_enabled=settings.replay_release_gate,
+            intent_gate=intent_gate,
         )
         if flow_store is not None
         else None
@@ -360,7 +389,6 @@ def build_container(
         if flow_store is not None and release is not None
         else None
     )
-    registered = registry.versions()
     broker = EventBroker()
     # 共享状态后端先建：取消信号、步骤租约、预算账本三处共用同一个连接与键前缀。
     shared_state, shared_closers = build_shared_state(settings)
@@ -434,10 +462,6 @@ def build_container(
             executor_instance = CancellableExecutor(ScriptedExecutor(), cancellations)
     else:
         executor_instance = executor
-
-    # 未显式注入路由器时用确定性规则路由器：没有规则就等于"识别不了"，
-    # 让创建任务走澄清而不是猜一个流程。
-    router_instance = router or RuleIntentRouter(rules=default_intent_rules(registered))
 
     runner = FlowRunner(
         store=store,

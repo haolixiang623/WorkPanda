@@ -6,6 +6,12 @@ from urllib.parse import urlsplit
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from workpanda.domain.intent_eval import (
+    DEFAULT_EVAL_TIMEOUT_SECONDS,
+    DEFAULT_MAX_MISS_RATE,
+)
+from workpanda.domain.intent_sample import MIN_NEAR_MISS_SAMPLES, MIN_POSITIVE_SAMPLES
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="WORKPANDA_", env_file=".env", extra="ignore")
@@ -132,6 +138,19 @@ class Settings(BaseSettings):
     # 单条用例的回放时限。回放不碰网络，正常在毫秒级完成；超时说明流程不收敛或
     # 代码有问题，此时判"无结论"而不是继续等。
     replay_timeout_seconds: float = 10.0
+    # 识别样例门禁：发布前必须带够正例与近似误例，且评测里不得出现误路由。
+    # 默认开启——关掉它意味着"样例只是摆设"，而这恰好是最难被发现的失效方式：
+    # 路由覆盖度下降不会报错，只会表现为"澄清率上升"。
+    intent_sample_gate: bool = True
+    # 发布所需的最少样例条数（正例 / 近似误例）。下限取自骨架自检流程的基线，
+    # 与 `domain/intent_sample.py` 的常量同源：门禁与 CI 用同一套数字。
+    intent_eval_min_positive: int = MIN_POSITIVE_SAMPLES
+    intent_eval_min_near_miss: int = MIN_NEAR_MISS_SAMPLES
+    # 漏路由率上限（0 表示一条都不许漏）。误路由没有开关：必须为 0。
+    intent_eval_max_miss_rate: float = DEFAULT_MAX_MISS_RATE
+    # 一次评测的时限。评测是纯函数、正常在毫秒级完成；超时说明规则实现卡死，
+    # 此时判"无结论"而不是继续等（等下去 CI 会挂住、门禁会静默放行）。
+    intent_eval_timeout_seconds: float = DEFAULT_EVAL_TIMEOUT_SECONDS
 
     @property
     def shared_backend(self) -> str:

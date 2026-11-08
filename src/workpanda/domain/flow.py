@@ -15,6 +15,8 @@ from typing import Protocol
 
 from pydantic import BaseModel, Field
 
+from workpanda.domain.intent_sample import IntentSample
+
 
 class FlowStatus(StrEnum):
     DRAFT = "draft"
@@ -49,6 +51,10 @@ class FlowDefinition(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     status: FlowStatus = FlowStatus.PUBLISHED
     steps: tuple[StepDefinition, ...] = Field(min_length=1)
+    # 意图样例：发布前的必备材料（见 `domain/intent_sample.py`）。刻意放在版本内容里，
+    # 而不是单独一张可改的表——"发布时校验的样例"必须就是"这一版生效的样例"。
+    # 草稿允许为空，条数要求由发布门禁（`application/intent_eval.py`）裁决。
+    intent_samples: tuple[IntentSample, ...] = ()
 
     def step(self, step_id: str) -> StepDefinition | None:
         for step in self.steps:
@@ -264,6 +270,8 @@ def flow_field_errors(flow: FlowDefinition) -> list[FlowFieldError]:
                         ),
                     )
                 )
+
+    errors.extend(_intent_sample_errors(flow))
     return errors
 
 
@@ -280,3 +288,51 @@ def validate_flow(flow: FlowDefinition) -> None:
     errors = flow_field_errors(flow)
     if errors:
         raise ValueError(errors[0].message)
+
+
+def _intent_sample_errors(flow: FlowDefinition) -> list[FlowFieldError]:
+    """意图样例自身的结构校验。条数要求不在这里：草稿允许先写流程、后补样例。
+
+    报错只给 `sample_id` 对，不给原文——校验信息会进日志、管理侧界面与 CI 输出，
+    样例文本按"群众可能这样说"的证据对待，不该顺手复制到第二处。
+    """
+
+    samples = flow.intent_samples
+    if not samples:
+        return []
+
+    errors: list[FlowFieldError] = []
+    seen_ids: set[str] = set()
+    for index, sample in enumerate(samples):
+        if sample.sample_id in seen_ids:
+            errors.append(
+                FlowFieldError(
+                    loc=("intent_samples", index, "sample_id"),
+                    message=(
+                        f"duplicate intent sample_id {sample.sample_id!r} in flow "
+                        f"{flow.flow_id!r}@{flow.version}"
+                    ),
+                )
+            )
+        seen_ids.add(sample.sample_id)
+
+    # 局部导入：`domain/intent.py` 依赖应用层端口，而本模块是几乎所有模块的基础，
+    # 不在模块级把这条依赖带进整条导入链。
+    from workpanda.domain.intent import normalize_text
+
+    first_seen: dict[str, str] = {}
+    for index, sample in enumerate(samples):
+        key = normalize_text(sample.text)
+        if key in first_seen:
+            errors.append(
+                FlowFieldError(
+                    loc=("intent_samples", index, "text"),
+                    message=(
+                        f"duplicate intent sample text {first_seen[key]}/{sample.sample_id} "
+                        f"in flow {flow.flow_id!r}@{flow.version}"
+                    ),
+                )
+            )
+            continue
+        first_seen[key] = sample.sample_id
+    return errors

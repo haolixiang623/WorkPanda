@@ -65,6 +65,10 @@ def admin_client() -> Iterator[tuple[TestClient, Container]]:
         enable_demo_flow=False,
         admin_tokens=f"boss:admin:{ADMIN_TOKEN},duty:viewer:{VIEWER_TOKEN}",
         ops_token=OPS_TOKEN,
+        # 本文件验的是管理侧"指针语义"（发布 / 预演 / 回滚 / 停用），与识别样例门禁
+        # 无关；这里建的流程没有样例、代码里也没有对应规则，门禁会挡在发布之前。
+        # 门禁与它的管理侧 409 映射由 `tests/test_intent_eval.py` 单独覆盖。
+        intent_sample_gate=False,
     )
     container = build_container(settings)
     client = TestClient(create_app(container=container))

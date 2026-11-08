@@ -309,7 +309,9 @@ def test_flow_declaring_ungranted_tool_fails_before_running_anything() -> None:
 def test_replay_never_reaches_production_executor() -> None:
     """给回放配一个真实的、会记录调用的执行器，它必须一次都没被调用。"""
 
-    settings = Settings(store_backend="memory", enable_demo_flow=True)
+    # 本例只关心"回放有没有借道生产执行器"，与识别样例门禁无关：`READ_FLOW` 在代码里
+    # 没有意图规则，样例过不了门禁，会挡在回放之前。这里显式关掉那道门，被测行为不变。
+    settings = Settings(store_backend="memory", enable_demo_flow=True, intent_sample_gate=False)
     from workpanda.bootstrap import build_container
 
     spy = _SpyExecutor()
@@ -597,8 +599,10 @@ def test_replay_script_adds_case_from_json(workdir: Path) -> None:
     )
     assert added.returncode == 0, added.stderr
 
+    # `READ_FLOW` 在代码里没有意图规则，识别样例门禁必然拦下发布；本例验的是
+    # "用例进库后回放能跑通"，所以只看回放结论（`--replay-only`，不作发布依据）。
     replayed = subprocess.run(
-        [*args, "--side-effect-free", READ_TOOL],
+        [*args, "--side-effect-free", READ_TOOL, "--replay-only"],
         capture_output=True,
         text=True,
         timeout=120,
