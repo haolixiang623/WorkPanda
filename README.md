@@ -21,7 +21,6 @@ WorkPanda 是面向群众的自然语言公共服务入口。当前仓库处于*
 - 落盘脱敏：敏感入参、手机号/身份证/银行卡/令牌在留痕与运维接口中统一掩码；
 - 执行留痕独立存储（内存或 SQLite，可跨重启检索）与聚合指标（未确认占比、被拦/超时调用数）；
 - 断点续跑（可选）：工具调用后落 checkpoint，中断可继续；出现结果未知时拒绝续跑并转人工；
-- Octop-Harness 运行时适配器（备选后端，可选启用）；
 - 运维只读接口 `/api/ops/*`，供 Octop 控制台读取；
 - 执行器、意图路由、事件发布的可替换端口；
 - SSE 事件流，支持断线后按序号补发；
@@ -115,7 +114,7 @@ uvicorn workpanda.main:app --app-dir src --reload
 | `WORKPANDA_TLS_CERTFILE` | 空 | 证书链路径 |
 | `WORKPANDA_TLS_KEYFILE` | 空 | 私钥路径 |
 | `WORKPANDA_CORS_ORIGINS` | 空 | 跨域来源白名单，逗号分隔；不接受通配符 |
-| `WORKPANDA_HARNESS_ENABLED` | `false` | 启用通用 harness 执行器（优先于 Octop） |
+| `WORKPANDA_HARNESS_ENABLED` | `false` | 启用通用 harness 执行器（唯一的真实执行路径） |
 | `WORKPANDA_MODEL_BASE_URL` | 空 | OpenAI 兼容接口地址 |
 | `WORKPANDA_MODEL_API_KEY` | 空 | 模型凭据；启用 harness 时必填 |
 | `WORKPANDA_MODEL_NAME` | `gpt-4o-mini` | 模型标识 |
@@ -132,23 +131,10 @@ uvicorn workpanda.main:app --app-dir src --reload
 | `WORKPANDA_HARNESS_RESUME_ENABLED` | `false` | 断点续跑；开启后每个工具调用落 checkpoint |
 | `WORKPANDA_HARNESS_RESUME_TTL_SECONDS` | `900` | 断点保留时限，超时拒绝续跑 |
 | `WORKPANDA_HARNESS_ALLOWED_HOSTS` | 空 | 逗号分隔的 http 工具域名白名单；为空则不注册 |
-| `WORKPANDA_OCTOP_ENABLED` | `false` | 启用 Octop-Harness 运行时执行器 |
-| `WORKPANDA_OCTOP_API_KEY` | 空 | 模型凭据；启用时必填 |
-| `WORKPANDA_OCTOP_MODEL` | `gpt-4o-mini` | 模型标识 |
-| `WORKPANDA_OCTOP_PROVIDER` | `openai` | `openai` 或 `anthropic` |
-| `WORKPANDA_OCTOP_BASE_URL` | 空 | 兼容接口地址 |
-| `WORKPANDA_OCTOP_WORKSPACE` | `.octop/workpanda` | Agent 工作区，必须可解析为绝对路径 |
-| `WORKPANDA_OCTOP_TIMEOUT_SECONDS` | `30` | 单步骤执行超时 |
 | `WORKPANDA_ENABLE_DEMO_FLOW` | `true` | 启用骨架自检流程 `demo.generic` |
 
-Octop 集成细节见 [docs/OCTOP-INTEGRATION.md](docs/OCTOP-INTEGRATION.md)；运维访问控制
-（角色、凭据轮换、TLS、回退）见 [docs/OPS-ACCESS-CONTROL.md](docs/OPS-ACCESS-CONTROL.md)。
-
-启用运行时时需安装可选依赖：
-
-```bash
-python -m pip install -e '.[octop]'
-```
+运维访问控制（角色、凭据轮换、TLS、回退）见
+[docs/OPS-ACCESS-CONTROL.md](docs/OPS-ACCESS-CONTROL.md)。
 
 `demo.generic` 只用于验证"收集 → 确认 → 执行 → 完成"链路，不代表任何业务规则。正式接入业务前必须设为 `false`。
 
@@ -170,7 +156,7 @@ src/workpanda/
 ├── application/     任务服务、流程推进器、端口协议
 ├── domain/          状态机、流程定义、确认凭证、存储协议
 ├── harness/         通用受控执行层（工具循环、预算、脱敏、留痕、契约）
-├── infrastructure/  内存/SQLite 存储、事件总线、Octop 适配器
+├── infrastructure/  内存/SQLite 存储、事件总线
 ├── bootstrap.py     依赖装配
 ├── config.py        配置
 └── main.py          应用入口

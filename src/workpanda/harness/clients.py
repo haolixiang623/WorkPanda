@@ -1,7 +1,7 @@
 """模型端口与脚本化客户端。
 
-harness 只依赖这个端口，因此换模型、换网关、换 Agent SDK 都不影响受控逻辑：
-Octop 运行时、内网 OpenAI 兼容接口、测试用假模型都只是不同实现。
+harness 只依赖这个端口，因此换模型、换网关都不影响受控逻辑：
+内网 OpenAI 兼容接口、测试用假模型都只是不同实现。
 """
 
 from __future__ import annotations

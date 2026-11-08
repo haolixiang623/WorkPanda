@@ -39,17 +39,21 @@ harness 只依赖协议，不反向依赖具体存储。
 依赖方向：`executor → loop → tools/models`，全部单向；本层只依赖 `application.ports`
 与自身，不反向依赖 API、存储或业务代码。
 
-### 与 Octop 运行时的关系
+### 为什么只有一个执行后端
 
-Octop **不是** harness 的上层，而是它可选的一种后端：
+本层曾经并存过一个「Octop 运行时作为备选执行器」的分支，现已移除。理由不是偏好，
+而是能力边界：
 
-| | 通用 harness | Octop 运行时 |
+| | 内置 harness | 已移除的 Octop 运行时 |
 |---|---|---|
 | 工具循环由谁控制 | 我们（白名单、预算、留痕） | SDK 内部，我们只能当黑盒 |
 | 能否看到每次工具调用 | 能，逐次留痕 | 不能 |
-| 适用场景 | 默认执行路径 | 需要 SDK 内置能力时的备选 |
+| 取消、预算、确认的粒度 | 每次工具调用 | 整步 |
 
-装配优先级：`harness > Octop 运行时 > 脚手架执行器`（见 `bootstrap.py`）。
+一旦循环不在本服务里，第二节那些不变式（最小可见、四道闸、有界、无证据不算成功）
+就只能降级成"整步尽力"。所以保留两套装配不是"多一个选项"，而是"多一条无法承诺的路径"。
+
+现在装配只有两条：`harness`（真实执行）与脚手架执行器（不跑模型循环，只验证任务链路）。
 
 ## 3. 十五条不变式
 
@@ -401,7 +405,7 @@ sqlite3 workpanda.db "DELETE FROM harness_checkpoints WHERE task_id='...' AND st
 | `WORKPANDA_HARNESS_AUDIT_MAX_BYTES` | `5000000` | 单个归档文件大小上限，超过即滚动 |
 | `WORKPANDA_HARNESS_AUDIT_BACKUPS` | `3` | 滚动保留的备份份数；`0` 表示只留当前文件 |
 
-`HARNESS_ENABLED` 为 true 且模型三项配置齐全时才启用；否则回落到 Octop 运行时或脚手架执行器。
+`HARNESS_ENABLED` 为 true 且模型三项配置齐全时才启用；否则回落到脚手架执行器（它不跑模型循环，只验证任务链路）。
 
 ## 10. 验证
 
@@ -656,8 +660,8 @@ registry.cancel_task(task_id, "user_cancelled")   # 从 HTTP 线程调用
 
 ### 未验证 / 已知限制
 
-- Octop 运行时与脚手架执行器不读这个信号：它们的"开始前"这一道由第 18 节的包装器
-  统一兜住，但执行进行中仍只能跑完（取消对它们不是全无效，只是只覆盖四道边界里的第一道）；
+- 脚手架执行器不读这个信号：它的"开始前"这一道由第 18 节的包装器
+  统一兜住，但执行进行中仍只能跑完（取消对它不是全无效，只是只覆盖四道边界里的第一道）；
 - 跨主机多实例仍需把共享信号后端换成 Redis / advisory lock，SQLite 只覆盖同机多进程；
 - 执行结束到结果持久化之间极窄的窗口内收到取消，仍可能先落一条结果事件（第 16 节）。
 
@@ -747,7 +751,7 @@ sqlite3 workpanda.db "DELETE FROM harness_cancel_signals WHERE task_id='...'"
 - `asyncio.to_thread` 用的是默认线程池，并发步骤数受池大小约束，这是有意的背压；
 - 结果守卫读状态之后、结果持久化之前那段极窄窗口，已由第 17 节的条件写消除：
   取消与结果落地共用一次状态 CAS，状态与结果事件同生共死，谁先写谁生效；
-- Octop 运行时与脚手架执行器仍不读这个信号。
+- 脚手架执行器仍不读这个信号。
 
 ## 17. 条件写：让取消与迟到结果真正互斥
 
@@ -864,7 +868,7 @@ SQLite 实现的顺序是关键：先执行带 `AND status = ?` 的 `UPDATE`，�
 ## 18. 取消对任意执行器生效（开始前那一道）
 
 第 14 节把取消写成"执行侧看得见的信号"，但那个信号只有 `HarnessExecutor` 自己的
-循环在读。装配切到 Octop 运行时或脚手架执行器时，`POST /api/tasks/{id}/cancel`
+循环在读。装配切到脚手架执行器时，`POST /api/tasks/{id}/cancel`
 又退回纯状态翻转：任务显示已取消，正在排队或刚开始的那一步照样把模型调用与
 工具调用跑完，包括用户刚说"不要了"的那一次提交。
 
@@ -875,18 +879,18 @@ SQLite 实现的顺序是关键：先执行带 `AND status = ?` 的 `UPDATE`，�
 
 ```python
 from workpanda.harness.cancel_executor import CancellableExecutor
+from workpanda.infrastructure.adapters import ScriptedExecutor
 
-executor = CancellableExecutor(OctopHarnessExecutor(gateway), cancellations)
+executor = CancellableExecutor(ScriptedExecutor(), cancellations)
 ```
 
 它做的只有三件事：把请求交给内层之前取一次令牌、已取消就直接给出
 `unconfirmed` + `cancelled`（一步都不跑）、无论结论如何都在 `finally` 里释放登记项。
-默认装配已把 Octop 分支与脚手架分支包进这层（harness 分支自带取消，不再重复包）。
+默认装配已把脚手架分支包进这层（harness 分支自带取消，不再重复包）。
 
 | 执行器 | 开始前 | 执行中 |
 |---|---|---|
 | `HarnessExecutor` | 生效（自带） | 生效（下一轮模型 / 下一条工具 / 退避等待） |
-| Octop 运行时 | 生效（包装器） | 不生效——工具循环不在本服务手里 |
 | 脚手架执行器 | 生效（包装器） | 不生效（占位实现，单次同步返回） |
 | 自定义执行器 | 生效（包装器） | 只在它自己读令牌时生效 |
 
@@ -915,7 +919,7 @@ executor = CancellableExecutor(OctopHarnessExecutor(gateway), cancellations)
   结论 `unconfirmed` + `cancelled`，`stop_reason`/`verification` 与 harness 拒绝一致；
 - 同一条暂存取消只拦住那一次：随后同一任务的又一次执行正常下发到内层；
 - 执行期间被取消且内层自己读到了令牌：包装器原样报告内层结论，不改写；
-- 默认装配（脚手架）与 `octop_enabled` 装配都被包进这一层，内层执行器类型不变。
+- 默认装配（脚手架）被包进这一层，内层执行器类型不变。
 ## 19. 工具线程台账与容量闸门
 
 第 12 节第一条限制一直没被真正面对过：工具超时的实现是"独立线程 + 放弃等待"，

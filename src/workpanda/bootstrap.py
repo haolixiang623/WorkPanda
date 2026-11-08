@@ -35,7 +35,6 @@ from workpanda.infrastructure.adapters import ScriptedExecutor
 from workpanda.infrastructure.demo_flows import demo_flows, demo_intent_rules
 from workpanda.infrastructure.event_broker import EventBroker
 from workpanda.infrastructure.memory_store import InMemoryConfirmationStore, InMemoryTaskStore
-from workpanda.infrastructure.octop_runtime import OctopHarnessExecutor, OctopHarnessGateway
 from workpanda.infrastructure.rate_limit import TokenBucketLimiter
 from workpanda.infrastructure.redis_client import RedisClient
 from workpanda.infrastructure.redis_shared_state import (
@@ -272,9 +271,13 @@ def build_container(
     tool_threads: Callable[[], dict[str, int]] | None = None
 
     if executor is None:
-        # 优先级：通用 harness > Octop 运行时 > 脚手架执行器。
-        # harness 用的是我们自己的受控循环（工具白名单 + 预算 + 留痕），
-        # Octop 运行时作为备选：它能执行步骤，但工具循环不由我们控制。
+        # 真实执行路径只有内置 harness 一条：工具白名单、预算、留痕、取消都在我们
+        # 自己的循环里，才能做到「每次工具调用」级别的受控。另一个分支是脚手架占位
+        # （ScriptedExecutor），它不跑模型循环，只用于验证任务链路。
+        #
+        # 曾经存在的 Octop 运行时备选已移除：把整步委托出去后，工具循环不在本服务
+        # 内，取消、预算、留痕、确认都只能落到「整步」粒度，无法证明某次副作用是否
+        # 发生。这属于能力边界，不是配置选项。
         if settings.harness_enabled and settings.model_configured:
             tool_registry, tool_closers = default_registry(
                 allowed_hosts=settings.allowed_hosts,
@@ -318,24 +321,8 @@ def build_container(
             closers.extend(checkpoint_closers)
             closers.extend(lease_closers)
             closers.extend(budget_closers)
-        elif settings.octop_enabled:
-            gateway = OctopHarnessGateway(
-                agent_name=settings.octop_agent_name,
-                model=settings.octop_model,
-                provider=settings.octop_provider,
-                api_key=settings.octop_api_key,
-                base_url=settings.octop_base_url,
-                workspace=settings.octop_workspace,
-            )
-            # Octop 的工具循环不归本服务控制，读不到取消令牌；至少让"开始前
-            # 已经取消"这一步不白跑：包装器统一了所有执行器的第一道边界。
-            executor_instance: Executor = CancellableExecutor(
-                OctopHarnessExecutor(gateway, timeout_seconds=settings.octop_timeout_seconds),
-                cancellations,
-            )
-            closers.append(gateway.close)
         else:
-            # 脚手架执行器同样不读令牌，取消对它就只是账面上的状态翻转。
+            # 脚手架执行器不读取消令牌，取消对它就只是账面上的状态翻转。
             executor_instance = CancellableExecutor(ScriptedExecutor(), cancellations)
     else:
         executor_instance = executor
