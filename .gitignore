@@ -42,3 +42,8 @@ out/
 # 必须纳入版本控制；上面的 dist/ 规则会误伤。
 !plugins/workpanda-ops/ui/dist/
 !plugins/workpanda-ops/ui/dist/*
+
+# 管理侧配置台前端的编译产物随仓库交付（静态托管只需 index.html + dist/main.js），
+# 安装时不跑 tsc；同样要排除 dist/ 规则的误伤。
+!admin-ui/dist/
+!admin-ui/dist/*

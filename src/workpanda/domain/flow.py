@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
@@ -136,6 +137,20 @@ class FlowRegistry:
         validate_flow(flow)
         self._flows[(flow.flow_id, flow.version)] = flow
 
+    def reload(self, store: FlowStore) -> None:
+        """从版本库重新装载，**原地替换**字典，保持本对象身份不变。
+
+        管理侧发布 / 回滚 / 停用改的是库里的指针，而 `TaskService`、`FlowRunner`
+        与路由器都持有本对象的引用。若改为"新建一个 registry 塞回容器"，这些
+        已建好的服务仍盯着旧对象，群众侧就会继续跑旧版本——看起来"发布成功"
+        却没生效。整表一次赋值保证并发读只会看到旧表或新表，不会看到半张表。
+
+        历史版本全部保留（不是只留指针那一条）：在途任务用 `require(flow_id,
+        旧版本)` 继续推进，回滚不能把它们打断。
+        """
+
+        self._flows = type(self).from_store(store)._flows
+
     def versions(self) -> list[FlowDefinition]:
         """全部版本（含未发布），按 `(flow_id, version)` 排序。
 
@@ -190,25 +205,78 @@ class FlowRegistry:
         return flow
 
 
+@dataclass(frozen=True, slots=True)
+class FlowFieldError:
+    """一条可定位到具体字段的校验错误。
+
+    `loc` 用 JSON 路径风格（如 `("steps", 0, "tool")`），管理侧前端据此把错误
+    标到对应的输入框，而不是只弹一句"保存失败"。
+    """
+
+    loc: tuple[str | int, ...]
+    message: str
+
+
+def flow_field_errors(flow: FlowDefinition) -> list[FlowFieldError]:
+    """结构与权限的自洽校验，返回**全部**错误及其字段位置。
+
+    纯函数：管理侧保存草稿时用它在界面上定位，存储层写入时仍由 `validate_flow`
+    兜底。两处共用同一套规则，避免"前端能构造出后端不允许的流程"。
+    """
+
+    errors: list[FlowFieldError] = []
+    seen: set[str] = set()
+    for index, step in enumerate(flow.steps):
+        if step.step_id in seen:
+            errors.append(
+                FlowFieldError(
+                    loc=("steps", index, "step_id"),
+                    message=(
+                        f"duplicate step_id {step.step_id!r} in flow {flow.flow_id!r}"
+                    ),
+                )
+            )
+        seen.add(step.step_id)
+        if step.kind is StepKind.EXECUTE:
+            if not step.tool:
+                errors.append(
+                    FlowFieldError(
+                        loc=("steps", index, "tool"),
+                        message=f"execute step {step.step_id!r} must declare a tool",
+                    )
+                )
+        else:
+            if step.tool:
+                errors.append(
+                    FlowFieldError(
+                        loc=("steps", index, "tool"),
+                        message=(
+                            f"step {step.step_id!r} may only declare a tool when executing"
+                        ),
+                    )
+                )
+            if step.requires_confirmation:
+                errors.append(
+                    FlowFieldError(
+                        loc=("steps", index, "requires_confirmation"),
+                        message=(
+                            f"step {step.step_id!r} may only require confirmation when executing"
+                        ),
+                    )
+                )
+    return errors
+
+
 def validate_flow(flow: FlowDefinition) -> None:
     """结构与权限的自洽校验。持久化之前和装载之后都要过这一道。
 
     放在模块级而不是 `FlowRegistry` 的私有方法里：存储层写入一条版本时也必须
     校验，否则"库里有一条跑不起来的流程"会直到第一次执行才暴露。
+
+    只抛第一条错误：存储层只需要"写不进去"这一个结论；字段级清单由
+    `flow_field_errors` 提供给管理侧界面。消息文本与逐条规则一一对应，不额外包装。
     """
 
-    seen: set[str] = set()
-    for step in flow.steps:
-        if step.step_id in seen:
-            raise ValueError(f"duplicate step_id {step.step_id!r} in flow {flow.flow_id!r}")
-        seen.add(step.step_id)
-        if step.kind is StepKind.EXECUTE:
-            if not step.tool:
-                raise ValueError(f"execute step {step.step_id!r} must declare a tool")
-        else:
-            if step.tool:
-                raise ValueError(f"step {step.step_id!r} may only declare a tool when executing")
-            if step.requires_confirmation:
-                raise ValueError(
-                    f"step {step.step_id!r} may only require confirmation when executing"
-                )
+    errors = flow_field_errors(flow)
+    if errors:
+        raise ValueError(errors[0].message)

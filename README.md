@@ -2,7 +2,7 @@
 
 WorkPanda 是面向群众的自然语言公共服务入口。当前仓库处于**工程骨架**阶段：已建立统一业务后端、固定流程执行、任务状态与确认凭证机制，并具备受控执行能力（模型可调用受控工具、结果可核验）；尚未接入具体业务事项与外部业务系统。
 
-业务目标见 [business-goals.md](business-goals.md)，目标架构见 [recommended-architecture.md](recommended-architecture.md)。工程实现细节见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，受控执行层见 [docs/HARNESS.md](docs/HARNESS.md)，识别与展示契约（含评测集）见 [docs/INTENT-EVAL.md](docs/INTENT-EVAL.md)，发布前回放与发布门禁见 [docs/SOP-REPLAY.md](docs/SOP-REPLAY.md)，协作规范见 [AGENTS.md](AGENTS.md) 与 [docs/DEVELOPMENT-OPERATING-MECHANISM.md](docs/DEVELOPMENT-OPERATING-MECHANISM.md)，界面约束见 [design/DESIGN.md](design/DESIGN.md)。
+业务目标见 [business-goals.md](business-goals.md)，目标架构见 [recommended-architecture.md](recommended-architecture.md)。工程实现细节见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，受控执行层见 [docs/HARNESS.md](docs/HARNESS.md)，识别与展示契约（含评测集）见 [docs/INTENT-EVAL.md](docs/INTENT-EVAL.md)，发布前回放与发布门禁见 [docs/SOP-REPLAY.md](docs/SOP-REPLAY.md)，管理侧配置台见 [docs/ADMIN-CONSOLE.md](docs/ADMIN-CONSOLE.md)，协作规范见 [AGENTS.md](AGENTS.md) 与 [docs/DEVELOPMENT-OPERATING-MECHANISM.md](docs/DEVELOPMENT-OPERATING-MECHANISM.md)，界面约束见 [design/DESIGN.md](design/DESIGN.md)。
 
 ## 已实现
 
@@ -20,6 +20,10 @@ WorkPanda 是面向群众的自然语言公共服务入口。当前仓库处于*
   终态与"不得出现未授权工具"；回放用不持有工具注册表的隔离执行器，带副作用的工具
   一律按未确认记账。用例与版本一起存库，有用例时回放未通过不得发布
   （见 [docs/SOP-REPLAY.md](docs/SOP-REPLAY.md)，Issue #50）；
+- **管理侧 SOP 配置台**（Issue #51）：独立凭据与 viewer/admin 角色、表单化草稿编辑、
+  回放用例维护、发布预演 / 发布 / 停用 / 回滚；发布后进程内流程目录原地重载，
+  群众侧下一次创建任务即命中新版本，在途任务仍按各自版本推进
+  （见 [docs/ADMIN-CONSOLE.md](docs/ADMIN-CONSOLE.md)）；
 - 签名会话令牌、任务归属隔离与按会话限流；
 - **通用 harness 受控执行层**：工具白名单、参数校验、四重预算（步数/调用/token/耗时）、
   工具限期执行与有界重试、非幂等操作防重复提交、逐次留痕；
@@ -39,7 +43,9 @@ WorkPanda 是面向群众的自然语言公共服务入口。当前仓库处于*
 - 真实业务系统工具（尚无外部 API 接入）；
 - Octop 控制台插件、Octop Browser；
 - 登录、实名核验、权限分级与审计后台；
-- 流程管理后台与发布审核（Issue #51）：回放与门禁已可用，但操作面仍是脚本；
+- 多级审批流、意图样例的运行时路由（Issue #52）与多实例发布同步（Issue #53）；
+  管理侧配置台已可用（Issue #51），但启用前仍需业务与安全责任人确认权限边界，
+  且真实浏览器里的一次完整操作走查仍待人工完成；
 - PostgreSQL、多实例部署、监控告警。
 
 ## 环境要求
@@ -90,6 +96,12 @@ uvicorn workpanda.main:app --app-dir src --reload
 
 列表接口的响应体是数组，翻页靠 `X-Next-Cursor` 响应头（没有这个头就是到头了）。
 
+管理侧配置台接口 `/api/admin/flows/*` 使用第三套独立凭据
+`X-WorkPanda-Admin-Token`（`WORKPANDA_ADMIN_TOKENS`），未配置时整体 404；
+`viewer` 只读，`admin` 才能写版本、用例与发布指针。发布先过回放门禁，
+`apply=false` 可预演而不移动指针。接口清单、权限矩阵、影响面与已知限制见
+[docs/ADMIN-CONSOLE.md](docs/ADMIN-CONSOLE.md)，前端在 `admin-ui/`。
+
 任务按会话隔离：访问不属于自己的任务返回 404，不暴露任务是否存在。超限返回 429 并带 `Retry-After`。
 
 任务响应带 `ui_state`（群众可见状态键，与 `status` 一一对应，映射见
@@ -113,6 +125,7 @@ uvicorn workpanda.main:app --app-dir src --reload
 | `WORKPANDA_RATE_LIMIT_BURST` | `30` | 每会话瞬时突发上限 |
 | `WORKPANDA_OPS_TOKEN` | 空 | 单主体运维凭据（等价 admin）；为空且未配 `OPS_TOKENS` 时接口不可用 |
 | `WORKPANDA_OPS_TOKENS` | 空 | 多主体运维凭据 `主体:角色:密钥`，逗号分隔，角色取 `admin`/`viewer` |
+| `WORKPANDA_ADMIN_TOKENS` | 空 | 管理侧配置台凭据，格式同上但独立发放；为空时 `/api/admin/flows/*` 整体不可用 |
 | `WORKPANDA_BIND_HOST` | `127.0.0.1` | 监听地址；非回环需显式确认并启用 TLS |
 | `WORKPANDA_BIND_PORT` | `8000` | 监听端口 |
 | `WORKPANDA_ALLOW_NETWORK_BIND` | `false` | 确认把服务暴露到非回环地址（安全边界变更） |
