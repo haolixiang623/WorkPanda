@@ -79,6 +79,9 @@ DEMO_FLOW = FlowDefinition(
             title="收集必要信息",
             required_fields=("subject",),
             prompt="请补充需要办理的主题。",
+            # 群众侧页面只按 `field_labels` 显示字段名，缺标签就回退成 `subject`。
+            # 真实浏览器走查里这一屏确实印出了 `subject`——机制在，但没接线。
+            field_labels={"subject": "办理主题"},
         ),
         StepDefinition(
             step_id="execute_demo",

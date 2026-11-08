@@ -104,6 +104,7 @@ export function screenOf(view) {
             const summary = collected(view);
             return {
                 ...base,
+                hint: view.current_step_prompt ?? base.hint,
                 field,
                 summary,
                 actions: field === null ? [CANCEL] : [SUBMIT, CANCEL],

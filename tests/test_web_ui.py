@@ -35,6 +35,7 @@ from workpanda.config import Settings
 from workpanda.domain.flow import FlowDefinition, FlowStatus, StepDefinition, StepKind
 from workpanda.domain.models import Task, TaskAnswerRequest, TaskCreateRequest, TaskView
 from workpanda.infrastructure.adapters import ScriptedExecutor
+from workpanda.infrastructure.demo_flows import demo_flows
 from workpanda.main import create_app
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -316,6 +317,32 @@ def test_walkthrough_create_answer_confirm_complete() -> None:
         container.close()
 
 
+def test_demo_flow_labels_every_field_it_asks_for() -> None:
+    """凡是让群众填的字段，都得有一个能读的名字。
+
+    群众侧只按 `field_labels` 显示，缺标签就回退成内部字段名。机制早就有了，
+    但 `demo.generic` 一直没接线——真实浏览器里那一屏印的就是 `subject`。
+    """
+
+    for flow in demo_flows():
+        for step in flow.steps:
+            for name in step.required_fields:
+                assert step.field_labels.get(name), (
+                    f"{flow.flow_id}/{step.step_id}/{name} 缺 field_labels"
+                )
+
+
+def test_page_declares_an_icon_so_no_favicon_404() -> None:
+    """不给浏览器留一个必然 404 的 `/favicon.ico`。
+
+    走查时控制台里唯一一条错误就是它；页面在 `/web` 挂载下，根路径的 favicon
+    永远打不到，声明一个内联空图标比补一个静态文件更省事。
+    """
+
+    html = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    assert re.search(r'<link rel="icon" href="data:', html), html[:200]
+
+
 # ---------- 纯投影函数（编译产物） ----------
 
 _NODE_PROBE = """
@@ -353,7 +380,9 @@ const view = (overrides) => ({ ...base, ...overrides });
 const shape = (screen) => ({
   state: screen.state,
   title: screen.title,
+  hint: screen.hint,
   field: screen.field === null ? null : screen.field.name,
+  fieldLabel: screen.field === null ? null : screen.field.label,
   fieldValue: screen.field === null ? null : screen.field.value,
   summary: screen.summary.map((row) => row.label + "=" + row.value),
   impact: screen.impact,
@@ -378,6 +407,15 @@ out.states["awaiting_input_empty_pending"] = shape(
       pending_fields: [],
       ui_title: "标题:ui",
       ui_hint: "提示:ui",
+    }),
+  ),
+);
+out.states["awaiting_input_without_prompt"] = shape(
+  mod.screenOf(
+    view({
+      ui_state: "awaiting_input",
+      current_step_prompt: null,
+      ui_hint: "提示:缺省",
     }),
   ),
 );
@@ -477,6 +515,22 @@ def test_clarification_asks_one_labelled_field_at_a_time() -> None:
     assert screen["actions"] == ["answer", "cancel"]
     assert probe["requests"]["canSubmitEmpty"] is False
     assert probe["requests"]["canSubmitFilled"] is True
+
+
+def test_clarification_shows_the_step_authors_prompt() -> None:
+    """澄清屏要说"这一步补什么"，而不是一句通用的"请补充提示的内容"。
+
+    `ui_hint` 是状态级的（"补齐后会继续办理"），步骤作者的 `prompt` 才回答"补什么"。
+    真实浏览器走查里群众看到的正是那句通用文案，标签又是 `subject`——两项加起来
+    等于让群众自己猜。
+    """
+
+    probe = _run_probe()
+    assert probe["states"]["awaiting_input"]["hint"] == "请说一下要报修什么。"
+    # 没有作者文案时回退到服务端的状态提示，不自造一句。
+    assert probe["states"]["awaiting_input_without_prompt"]["hint"] == "提示:缺省"
+    # 由它派生出的「需要用户操作」不受影响：那一屏有自己的三要素。
+    assert probe["states"]["awaiting_input_empty_pending"]["hint"] != "请说一下要报修什么。"
 
 
 def test_confirmation_shows_action_fields_and_impact() -> None:
