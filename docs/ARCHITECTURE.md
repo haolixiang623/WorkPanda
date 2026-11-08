@@ -186,6 +186,10 @@ created → running → waiting_for_user → running
 - 运维读接口 `/api/ops/*` 由按主体发放的凭据保护（`WORKPANDA_OPS_TOKENS`），
   未配置时整体 404；`viewer` 只见列表与聚合，明细要求 `admin`，见
   [OPS-ACCESS-CONTROL.md](OPS-ACCESS-CONTROL.md)；
+- 工作人员（第四类主体）用独立凭据 `X-WorkPanda-Staff-Token` 访问 `/api/staff/*`，
+  能对哪些流程做什么动作由工作人员目录授予，**不继承** `admin` 的流程编辑能力；
+  IM 身份通过显式映射表换成工作人员主体，未映射者一律拒绝并留痕，见
+  [STAFF-IDENTITY.md](STAFF-IDENTITY.md)；
 - 控制台只读，不写业务状态，避免双写冲突。
 
 ## 4. 接口
@@ -199,6 +203,9 @@ created → running → waiting_for_user → running
 | POST | `/api/tasks/{task_id}/confirm` | 提交确认意图；服务端签发凭证并继续 |
 | POST | `/api/tasks/{task_id}/cancel` | 取消未终结任务 |
 | GET | `/api/tasks/{task_id}/events` | SSE 事件流，支持 `after` 断线补发 |
+| GET | `/api/staff/me` | 工作人员自查主体与授权（`X-WorkPanda-Staff-Token`） |
+| GET | `/api/staff/flows` | 本人被授权办理的流程与动作 |
+| * | `/api/admin/identities/*` | 工作人员目录与 IM 身份映射维护（管理侧凭据） |
 
 客户端不直接指定工具、步骤或流程推进方式。
 
@@ -215,6 +222,9 @@ created → running → waiting_for_user → running
 | 422 | `request_rejected` | 参数或流程不满足约束 |
 | 422 | `clarification_required` | 无法确定事项，需澄清或转人工 |
 | 422 | `flow_not_published` | 流程存在但未发布 |
+| 401 | `staff_token_invalid` | 工作人员凭据无效 |
+| 403 | `staff_not_provisioned` | 主体未开通工作人员身份或已停用 |
+| 403 | `im_identity_unmapped` 等 | IM 身份未映射到可用的工作人员（`im_identity_disabled` / `im_principal_missing` / `im_principal_disabled`） |
 | 429 | `rate_limited` | 请求过于频繁，按 `Retry-After` 重试 |
 
 ## 6. 已知限制
@@ -227,6 +237,8 @@ created → running → waiting_for_user → running
   脚本 `scripts/replay_flow.py`，不是界面；
 - 意图路由是确定性规则（`domain/intent.py`），默认无规则即"识别不了→澄清"，
   尚未接入模型分类，也没有同义改写能力；
+- 工作人员侧目前只有"我是谁 / 我能对哪些流程做什么"，没有能推进流程的入口
+  （企业微信网关与深链确认见 Issue #64、#65）；IM 身份映射需手工维护，未做组织架构同步；
 - 群众可见状态由服务端映射（`domain/presentation.py`，随 `TaskView.ui_state` 下发），
   但只到状态键与文案，组件与无障碍由前端实现；
 - harness 的工具是同步执行，预算按调用次数与耗时计（不按 token），无 checkpoint 恢复；

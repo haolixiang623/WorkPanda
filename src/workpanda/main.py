@@ -10,9 +10,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from workpanda.api.admin import router as admin_router
+from workpanda.api.admin_identities import router as admin_identities_router
 from workpanda.api.errors import register_error_handlers
 from workpanda.api.ops import router as ops_router
 from workpanda.api.routes import router
+from workpanda.api.staff import router as staff_router
 from workpanda.bootstrap import Container, build_container
 from workpanda.config import Settings, get_settings
 
@@ -44,12 +46,13 @@ def create_app(settings: Settings | None = None, container: Container | None = N
             CORSMiddleware,
             allow_origins=list(origins),
             allow_credentials=True,
-            allow_methods=["GET", "POST"],
+            allow_methods=["GET", "POST", "PUT", "DELETE"],
             allow_headers=[
                 "Content-Type",
                 "X-WorkPanda-Session",
                 "X-WorkPanda-Ops-Token",
                 "X-WorkPanda-Admin-Token",
+                "X-WorkPanda-Staff-Token",
             ],
         )
 
@@ -61,6 +64,8 @@ def create_app(settings: Settings | None = None, container: Container | None = N
     app.include_router(router)
     app.include_router(ops_router)
     app.include_router(admin_router)
+    app.include_router(admin_identities_router)
+    app.include_router(staff_router)
     return app
 
 

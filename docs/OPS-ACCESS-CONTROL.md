@@ -71,21 +71,29 @@ export WORKPANDA_OPS_TOKEN='<随机串>'
 > 密钥一律通过环境变量或部署侧的密钥渠道注入，不写入仓库、不写进 `.env` 提交，
 > 也不回显到日志或运维接口响应里。
 
-## 3. 两侧鉴权不串味
+## 3. 四侧鉴权不串味
 
-群众侧与运维侧是两个独立凭据体系，互不认账：
+群众侧、运维侧、管理侧、工作人员侧是四套独立凭据体系，互不认账：
 
 | 尝试 | 结果 |
 |---|---|
-| 群众会话令牌放进 `X-WorkPanda-Ops-Token` | 401（不是任何运维主体的密钥） |
-| 运维凭据放进 `X-WorkPanda-Session` | 401（不是合法签名会话） |
+| 群众会话令牌放进 `X-WorkPanda-Ops-Token` / `-Admin-Token` / `-Staff-Token` | 401（不是任何主体的密钥） |
+| 运维凭据放进 `X-WorkPanda-Session` / `-Admin-Token` / `-Staff-Token` | 401 |
+| 管理凭据放进 `X-WorkPanda-Session` / `-Ops-Token` / `-Staff-Token` | 401 |
+| 工作人员凭据放进 `X-WorkPanda-Session` / `-Ops-Token` / `-Admin-Token` | 401 |
 
-两者都走各自的签名/比对逻辑，没有"任一通过即放行"的分支。回归用例见
-`tests/test_ops_access.py::test_session_token_cannot_reach_ops_endpoints`。
+各自都走自己的签名/比对逻辑，没有"任一通过即放行"的分支。回归用例见
+`tests/test_ops_access.py::test_session_token_cannot_reach_ops_endpoints`
+与 `tests/test_staff_identity.py`（每类凭据各一条）。
+
+工作人员（第四类主体）的凭据、授权模型与 IM 身份映射见
+[STAFF-IDENTITY.md](STAFF-IDENTITY.md)：它有独立凭据，能对哪些流程做什么动作由
+工作人员目录授予，**不继承** `admin` 的流程编辑能力。
 
 需要强调的范围边界：当前会话身份是**匿名签名会话**，`subject` 只是会话标识，
 不是实名身份。因此本节证明的是"通道不串味"，不等于"多个真人用户之间已隔离"；
 实名认证与真实身份绑定仍待后续实现。
+
 
 ## 4. TLS 与绑定地址
 

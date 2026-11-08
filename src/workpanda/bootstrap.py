@@ -13,6 +13,7 @@ from workpanda.application.ports import Executor, IntentRouter
 from workpanda.application.release import FlowReleaseService
 from workpanda.application.replay import FlowReplay
 from workpanda.application.runner import FlowRunner
+from workpanda.application.staff_access import ImIdentityResolver, StaffDirectoryService
 from workpanda.application.task_service import TaskService
 from workpanda.capacity import validate_deployment_topology
 from workpanda.config import Settings, get_settings
@@ -21,6 +22,7 @@ from workpanda.domain.identity import SessionSigner, new_secret
 from workpanda.domain.intent import IntentRule, RuleIntentRouter
 from workpanda.domain.replay import ReplayCaseStore
 from workpanda.domain.repository import ConfirmationStore, TaskStore
+from workpanda.domain.staff import STAFF_ROLE, StaffStore
 from workpanda.harness.audit import AuditJournal, JsonlAuditJournal, NullAuditJournal
 from workpanda.harness.budget import BudgetLedger
 from workpanda.harness.builtin import default_registry
@@ -62,6 +64,7 @@ from workpanda.infrastructure.sqlite_checkpoint_store import SqliteCheckpointSto
 from workpanda.infrastructure.sqlite_flow_store import SqliteFlowStore
 from workpanda.infrastructure.sqlite_store import SqliteStore
 from workpanda.infrastructure.sqlite_trace_store import SqliteTraceStore
+from workpanda.infrastructure.staff_store import InMemoryStaffStore, SqliteStaffStore
 
 
 @dataclass
@@ -80,6 +83,12 @@ class Container:
     ops_access: OpsAccessPolicy
     # 管理侧配置台的凭据与角色，与运维凭据完全独立（见 api/admin.py）。
     admin_access: OpsAccessPolicy
+    # 工作人员凭据（只认 `staff` 角色）与工作人员目录。凭据证明"你是谁"，
+    # 目录决定"能对哪些流程做什么动作"——两者分开，才能改授权不换凭据。
+    staff_access: OpsAccessPolicy
+    staff_store: StaffStore
+    # IM 身份 → 工作人员的解析器。N4 网关唯一该用的入口，未映射一律拒绝并留痕。
+    im_resolver: ImIdentityResolver
     traces: TraceStore
     audit: AuditJournal
     # 取消登记表由容器持有：取消方与执行方看到的必须是同一个对象。
@@ -94,6 +103,8 @@ class Container:
     release: FlowReleaseService | None = None
     # 管理侧配置台服务。同样只在有版本库时成立（注入定义时没有版本库）。
     admin_flows: AdminFlowService | None = None
+    # 工作人员目录的维护入口（管理侧接口用）。目录本身始终存在。
+    staff_directory: StaffDirectoryService | None = None
     closers: list = field(default_factory=list)
 
     def close(self) -> None:
@@ -159,6 +170,19 @@ def build_flow_store(settings: Settings) -> tuple[FlowStore, list[Callable[[], N
         store = SqliteFlowStore(settings.sqlite_path)
         return store, [store.close]
     return InMemoryFlowStore(), []
+
+
+def build_staff_store(settings: Settings) -> tuple[StaffStore, list[Callable[[], None]]]:
+    """工作人员目录、IM 映射与解析留痕。跟随任务存储：sqlite 时与任务库同文件。
+
+    与任务库分开存会带来一个假象："映射改了但留痕还在别处"，于是排障时两边
+    对不上。同文件才能让"改映射 + 读主体 + 写留痕"落在一个事务语义里。
+    """
+
+    if settings.store_backend == "sqlite":
+        store = SqliteStaffStore(settings.sqlite_path)
+        return store, [store.close]
+    return InMemoryStaffStore(), []
 
 
 def build_replay_case_store(
@@ -326,6 +350,11 @@ def build_container(
     # 管理侧只接受「主体:角色:密钥」多主体格式，不引入 legacy 单密钥：
     # 能改流程语义的凭据必须能定位到具体主体。配置为空时接口整体关闭。
     admin_access = build_ops_policy(None, settings.admin_tokens)
+    # 工作人员凭据只接受 `staff` 角色：把它写成 admin 就等于让每个办事员都能改
+    # 「哪一步需要群众确认」，而这正是管理侧标为高风险的能力。
+    staff_access = build_ops_policy(
+        None, settings.staff_tokens, allowed_roles=(STAFF_ROLE,), field="staff_tokens"
+    )
 
     store: TaskStore
     confirmations: ConfirmationStore
@@ -393,6 +422,11 @@ def build_container(
         if flow_store is not None and release is not None
         else None
     )
+    # 工作人员目录始终存在（与版本库不同）：它只描述人，不依赖流程是否存在。
+    staff_store, staff_closers = build_staff_store(settings)
+    closers.extend(staff_closers)
+    staff_directory = StaffDirectoryService(staff_store)
+    im_resolver = ImIdentityResolver(staff_store)
     broker = EventBroker()
     # 共享状态后端先建：取消信号、步骤租约、预算账本三处共用同一个连接与键前缀。
     shared_state, shared_closers = build_shared_state(settings)
@@ -503,6 +537,9 @@ def build_container(
         ),
         ops_access=ops_access,
         admin_access=admin_access,
+        staff_access=staff_access,
+        staff_store=staff_store,
+        im_resolver=im_resolver,
         traces=traces,
         audit=audit,
         cancellations=cancellations,
@@ -511,5 +548,6 @@ def build_container(
         replay_cases=replay_cases,
         release=release,
         admin_flows=admin_flows,
+        staff_directory=staff_directory,
         closers=closers,
     )

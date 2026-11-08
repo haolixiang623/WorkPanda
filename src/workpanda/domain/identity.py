@@ -1,7 +1,12 @@
-"""会话身份。
+"""请求主体与匿名会话身份。
 
 当前阶段没有真实登录体系，用签名会话令牌代表"某个群众的一次会话"。
 令牌带签名，客户端无法通过改 ID 冒充他人；但它不是实名身份，不能作为办事资格依据。
+
+主体分四类（`PrincipalKind`），**四类通道凭据互不认账**：会话令牌只认
+`X-WorkPanda-Session`，运维/管理/工作人员凭据各自只认自己的请求头，任何一类凭据
+放进别的通道一律 401。没有"任一通过即放行"的分支——那种分支一旦出现，最弱的
+那一类凭据就会成为整个系统实际的安全上限。
 """
 
 import base64
@@ -9,16 +14,39 @@ import hashlib
 import hmac
 import secrets
 import time
+from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
 SESSION_TTL_SECONDS = 12 * 3600
 
 
+class PrincipalKind(StrEnum):
+    """主体类型。与通道一一对应，不做跨通道的类型转换。"""
+
+    # 匿名签名会话。不是实名身份，不能作为办事资格依据。
+    CITIZEN = "citizen"
+    # 工作人员：持 staff 凭据，权限来自工作人员目录里的流程授权。
+    STAFF = "staff"
+    # 运维：持 ops 凭据，只读任务与留痕。
+    OPS = "ops"
+    # 管理：持 admin 凭据，可改流程语义。
+    ADMIN = "admin"
+
+
 class Principal(BaseModel):
-    """请求主体。`subject` 用于任务归属和确认凭证绑定。"""
+    """请求主体。`subject` 用于任务归属和确认凭证绑定。
+
+    `kind` 与 `roles` 有默认值，是为了让"匿名会话"这个最常见的主体保持一行构造；
+    需要区分的调用点必须显式传 `kind`，不要靠默认值猜——默认成 citizen 的
+    staff 主体会被当成群众，而那种错误不会报错，只会让权限静默失效。
+    """
 
     subject: str = Field(min_length=1, max_length=128)
+    kind: PrincipalKind = PrincipalKind.CITIZEN
+    # 角色/授权的字符串视图。判定权限时不要用它做前缀匹配，用各自主体的
+    # `allows()`（例如 `StaffMember.allows`）。
+    roles: tuple[str, ...] = ()
     authenticated: bool = False
 
 
@@ -53,7 +81,7 @@ class SessionSigner:
             raise InvalidSession("session signature mismatch")
         if time.time() - issued_at > self.ttl_seconds:
             raise InvalidSession("session expired")
-        return Principal(subject=session_id)
+        return Principal(subject=session_id, kind=PrincipalKind.CITIZEN)
 
     def _sign(self, session_id: str, issued_at: int) -> str:
         digest = hmac.new(

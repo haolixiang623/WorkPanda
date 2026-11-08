@@ -97,31 +97,47 @@ class OpsAccessPolicy:
         return matched
 
 
-def _parse_entry(item: str) -> _Credential:
+def _parse_entry(
+    item: str, *, allowed_roles: tuple[str, ...] = ROLES, field: str = "ops_tokens"
+) -> _Credential:
     parts = item.split(":", 2)
     if len(parts) != 3:
         raise OpsAccessConfigError(
-            "ops_tokens 每项必须是 主体:角色:密钥（角色取 admin 或 viewer）。"
+            f"{field} 每项必须是 主体:角色:密钥（角色取 {' 或 '.join(allowed_roles)}）。"
         )
     subject, role, secret = (part.strip() for part in parts)
     if not _SUBJECT_PATTERN.match(subject):
         raise OpsAccessConfigError(
-            f"ops_tokens 主体名非法：{subject!r}，只允许字母、数字、点、下划线和连字符。"
+            f"{field} 主体名非法：{subject!r}，只允许字母、数字、点、下划线和连字符。"
         )
-    if role not in ROLES:
-        raise OpsAccessConfigError(f"ops_tokens 角色非法：{role!r}，只允许 admin 或 viewer。")
+    if role not in allowed_roles:
+        raise OpsAccessConfigError(
+            f"{field} 角色非法：{role!r}，只允许 {' 或 '.join(allowed_roles)}。"
+        )
     if len(secret) < MIN_SECRET_LENGTH:
         raise OpsAccessConfigError(
-            f"ops_tokens 中主体 {subject!r} 的密钥过短，至少 {MIN_SECRET_LENGTH} 个字符。"
+            f"{field} 中主体 {subject!r} 的密钥过短，至少 {MIN_SECRET_LENGTH} 个字符。"
         )
     return _Credential(principal=OpsPrincipal(subject=subject, role=role), secret=secret.encode())
 
 
-def build_ops_policy(ops_token: str | None, ops_tokens: str) -> OpsAccessPolicy:
+def build_ops_policy(
+    ops_token: str | None,
+    ops_tokens: str,
+    *,
+    allowed_roles: tuple[str, ...] = ROLES,
+    field: str = "ops_tokens",
+    legacy_subject: str = "legacy",
+    legacy_role: str = ADMIN,
+) -> OpsAccessPolicy:
     """从配置构建凭据集合。
 
     `ops_token` 是单主体旧配置，按 admin 处理，主体名固定为 `legacy`：它没有
     主体区分能力，保留它只是为了不打断既有试点部署，新部署应改用 `ops_tokens`。
+
+    `allowed_roles` / `field` 让同一套解析逻辑也能服务工作人员凭据
+    （`WORKPANDA_STAFF_TOKENS`，角色只允许 `staff`）：三种凭据的格式、长度下限、
+    重复密钥禁令必须完全一致，各写一份迟早会漂移出"某一类凭据的密钥可以更短"。
     """
 
     credentials: list[_Credential] = []
@@ -137,17 +153,17 @@ def build_ops_policy(ops_token: str | None, ops_tokens: str) -> OpsAccessPolicy:
             )
         credentials.append(
             _Credential(
-                principal=OpsPrincipal(subject="legacy", role=ADMIN),
+                principal=OpsPrincipal(subject=legacy_subject, role=legacy_role),
                 secret=secret.encode(),
             )
         )
-        seen_secrets[secret.encode()] = "legacy"
-        roles_by_subject["legacy"] = ADMIN
+        seen_secrets[secret.encode()] = legacy_subject
+        roles_by_subject[legacy_subject] = legacy_role
 
     for item in ops_tokens.replace("\n", ",").split(","):
         if not item.strip():
             continue
-        credential = _parse_entry(item)
+        credential = _parse_entry(item, allowed_roles=allowed_roles, field=field)
         subject = credential.principal.subject
         known_role = roles_by_subject.get(subject)
         if known_role is not None and known_role != credential.principal.role:
