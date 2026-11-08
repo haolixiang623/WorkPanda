@@ -607,6 +607,7 @@ def build_container(
         if settings.harness_enabled and settings.model_configured:
             tool_registry, tool_closers = default_registry(
                 allowed_hosts=settings.allowed_hosts,
+                browser_policy=settings.browser_policy,
                 max_stuck_threads=settings.harness_max_stuck_threads,
             )
             tool_threads = tool_registry.threads.stats

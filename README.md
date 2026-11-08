@@ -182,6 +182,15 @@ cd mock-site && python -m mock_site
 | `WORKPANDA_HARNESS_RESUME_ENABLED` | `false` | 断点续跑；开启后每个工具调用落 checkpoint |
 | `WORKPANDA_HARNESS_RESUME_TTL_SECONDS` | `900` | 断点保留时限，超时拒绝续跑 |
 | `WORKPANDA_HARNESS_ALLOWED_HOSTS` | 空 | 逗号分隔的 http 工具域名白名单；为空则不注册 |
+| `WORKPANDA_HARNESS_BROWSER_ENABLED` | `false` | 启用浏览器执行器（七个 `browser_*` 工具）；关着时一个都不注册 |
+| `WORKPANDA_HARNESS_BROWSER_ALLOWED_HOSTS` | 空 | 浏览器白名单，独立于 http 白名单；支持 `host`、`host:port`、`.suffix`。跨站交接的**落地站点也要列** |
+| `WORKPANDA_HARNESS_BROWSER_PERMITTED_CLICK_TESTIDS` | 空 | 允许点击的提交类控件（按 `data-testid`），默认空=全拒。登录按钮要进去必须在这里登记 |
+| `WORKPANDA_HARNESS_BROWSER_HEADLESS` | `true` | 无头模式；本机排查可开有头 |
+| `WORKPANDA_HARNESS_BROWSER_NAVIGATION_TIMEOUT_MS` | `15000` | 单次导航时限；超时是明确失败，不重试 |
+| `WORKPANDA_HARNESS_BROWSER_ELEMENT_TIMEOUT_MS` | `6000` | 找元素/等元素的时限 |
+| `WORKPANDA_HARNESS_BROWSER_SESSION_TTL_SECONDS` | `600` | 浏览器会话空闲回收 |
+| `WORKPANDA_HARNESS_BROWSER_READ_CHARS` | `4000` | 单次读回给模型的字符上限 |
+| `WORKPANDA_HARNESS_BROWSER_ARTIFACT_DIR` | 空 | 失败现场（DOM/截图）落盘目录，先脱敏再写；为空则不留档 |
 | `WORKPANDA_ENABLE_DEMO_FLOW` | `true` | 启用骨架自检流程 `demo.generic` |
 | `WORKPANDA_REPLAY_RELEASE_GATE` | `true` | 该版本有回放用例时，回放未通过不得发布 |
 | `WORKPANDA_REPLAY_TIMEOUT_SECONDS` | `10` | 单条回放用例的时限；超时判"无结论" |
@@ -203,6 +212,17 @@ cd mock-site && python -m mock_site
 pytest
 ruff check .
 ```
+
+浏览器用例需要可选依赖与浏览器二进制（不进仓库）：
+
+```bash
+pip install -e ".[browser]"
+playwright install chromium
+WORKPANDA_REQUIRE_BROWSER=1 pytest tests/test_browser_harness.py -q
+```
+
+没装时这些用例会 skip 并写明原因；`WORKPANDA_REQUIRE_BROWSER=1`（CI 的浏览器 job
+就是这么设的）把"缺浏览器"变成失败——跳过当通过是这类门禁最典型的失效方式。
 
 ## 目录结构
 

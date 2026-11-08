@@ -13,6 +13,7 @@ from workpanda.domain.intent_eval import (
     DEFAULT_MAX_MISS_RATE,
 )
 from workpanda.domain.intent_sample import MIN_NEAR_MISS_SAMPLES, MIN_POSITIVE_SAMPLES
+from workpanda.harness.browser.policy import BrowserPolicy, policy_from_hosts
 
 # 回环主机名单。与 `server.py` 的绑定校验共用一份：两处各写一份，
 # 迟早出现"启动检查认为不对外、静态托管却认为对外"的分叉。
@@ -198,6 +199,27 @@ class Settings(BaseSettings):
     harness_cancel_poll_seconds: float = 0.1
     # 逗号分隔的域名白名单；为空则不注册 http 工具（默认关闭比默认全开安全）。
     harness_allowed_hosts: str = ""
+    # ---- 浏览器执行器（P2）----
+    # 总开关。关着的时候一个 browser 工具都不注册，模型看不到它们。
+    harness_browser_enabled: bool = False
+    # 浏览器白名单，**与 http 白名单分开**：浏览器要跨过站，名单通常更长；
+    # 共用一份会逼着运维把 http 的抓取范围一起放大。
+    # 支持 `host`、`host:port`、`.suffix`（后缀）三种写法。
+    harness_browser_allowed_hosts: str = ""
+    # 允许点击的提交类控件（按 data-testid）。默认空：任何提交类控件都拒绝。
+    # 登录按钮要进去只能在这里逐个登记——登记即代表"人确认过它只建立会话"。
+    harness_browser_permitted_click_testids: str = ""
+    harness_browser_headless: bool = True
+    # 导航与找元素的时限（毫秒）。超时是**明确失败**，不重试。
+    harness_browser_navigation_timeout_ms: int = 15_000
+    harness_browser_element_timeout_ms: int = 6_000
+    # 会话空闲回收（秒）。任务结束没有回调，只能按"多久没人用过"回收。
+    harness_browser_session_ttl_seconds: float = 600.0
+    # 单次读回给模型的字符上限。
+    harness_browser_read_chars: int = 4_000
+    # 失败现场（DOM/截图）落盘目录。为空表示不留档——默认不留，
+    # 因为留档本身就是在磁盘上多写一份群众数据。
+    harness_browser_artifact_dir: Path | None = None
     # 审计归档路径。为空则不归档（默认关闭）。归档只追加、按大小滚动，
     # 不随 trace 容量淘汰，用于事后核对"某次提交到底发出去没有"。
     harness_audit_path: Path | None = None
@@ -259,6 +281,39 @@ class Settings(BaseSettings):
     def allowed_hosts(self) -> tuple[str, ...]:
         return tuple(
             host.strip() for host in self.harness_allowed_hosts.split(",") if host.strip()
+        )
+
+    @property
+    def browser_policy(self) -> BrowserPolicy | None:
+        """浏览器工具的策略。开关关着或没配白名单时返回 None（=不注册）。
+
+        三个条件必须同时成立才有浏览器能力：显式打开开关、配了白名单、
+        装了可选依赖（后者在第一次真正打开页面时才检查，见 `session`）。
+        """
+
+        if not self.harness_browser_enabled:
+            return None
+        hosts = tuple(
+            host.strip()
+            for host in self.harness_browser_allowed_hosts.split(",")
+            if host.strip()
+        )
+        if not hosts:
+            return None
+        permitted = frozenset(
+            item.strip()
+            for item in self.harness_browser_permitted_click_testids.split(",")
+            if item.strip()
+        )
+        return policy_from_hosts(
+            hosts,
+            permitted_submit_testids=permitted,
+            navigation_timeout_ms=self.harness_browser_navigation_timeout_ms,
+            element_timeout_ms=self.harness_browser_element_timeout_ms,
+            max_read_chars=self.harness_browser_read_chars,
+            session_ttl_seconds=int(self.harness_browser_session_ttl_seconds),
+            headless=self.harness_browser_headless,
+            artifact_dir=self.harness_browser_artifact_dir,
         )
 
     @property
