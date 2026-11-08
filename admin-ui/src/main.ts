@@ -7,7 +7,18 @@
  *
  * 界面刻意不自己推断"发布成功"：一切以服务端返回的 published 字段与状态码为准。
  * 预演返回 published=false，门禁拦下返回 409 + 报告，两者都不会显示成已发布。
+ *
+ * Issue #62：意图样例随草稿一起提交。保存前的本地预检只负责「别把明显不够材料的
+ * 草稿发出去」，发布能否通过仍由服务端门禁裁决，本地数字与服务端漂移时以 409 为准。
  */
+
+import {
+  checkSamples,
+  sampleGateDecision,
+  type SampleCategory,
+  type SampleInput,
+  SAMPLE_CATEGORIES,
+} from "./sample_check.js";
 
 type StepKind = "collect" | "execute" | "handoff";
 
@@ -28,6 +39,7 @@ interface FlowDraft {
   version: string;
   title: string;
   steps: StepInput[];
+  intent_samples: SampleInput[];
 }
 
 interface FlowSummary {
@@ -98,11 +110,32 @@ interface ValidationIssue {
   msg: string;
 }
 
+interface IntentCoverage {
+  category?: string;
+  have?: number;
+  need?: number;
+  short?: boolean;
+  label?: string;
+}
+
+interface IntentFinding {
+  code?: string;
+  detail?: string;
+  blocking?: boolean;
+}
+
+/** 识别样例门禁的 409 报告：与回放报告结构不同，不能塞进 renderReport()。 */
+interface IntentEvalReportPayload {
+  status?: string;
+  coverage?: IntentCoverage[];
+  findings?: IntentFinding[];
+}
+
 interface ErrorPayload {
   code?: string;
   detail?: string | ValidationIssue[];
   fields?: FieldProblem[];
-  report?: ReplayReport;
+  report?: ReplayReport | IntentEvalReportPayload;
 }
 
 class ApiFailure extends Error {
@@ -174,6 +207,65 @@ function detailText(payload: ErrorPayload): string {
   return "请求未完成。";
 }
 
+/**
+ * FastAPI 的 HTTPException(detail={...}) 会把整个业务错误体塞在顶层 detail 里，
+ * 而全局异常处理器用的是顶层 {code, detail} 结构，422 则是 detail 数组。
+ * 统一在这里摊平，界面不必为三种响应形状各写一份分支。
+ */
+function normalizeErrorPayload(payload: unknown): ErrorPayload {
+  if (typeof payload !== "object" || payload === null) {
+    return {};
+  }
+  const raw = payload as Record<string, unknown>;
+  const nested = raw.detail;
+  if (typeof nested === "object" && nested !== null && !Array.isArray(nested)) {
+    return nested as ErrorPayload;
+  }
+  return raw as ErrorPayload;
+}
+
+function isReplayReport(
+  report: ReplayReport | IntentEvalReportPayload | undefined,
+): report is ReplayReport {
+  return report !== undefined && Array.isArray((report as ReplayReport).results);
+}
+
+function intentGateDetails(payload: ErrorPayload): string[] {
+  if (isReplayReport(payload.report) || payload.report === undefined) {
+    return [];
+  }
+  const items: string[] = [];
+  for (const row of payload.report.coverage ?? []) {
+    const have = row.have ?? 0;
+    const need = row.need ?? 0;
+    if (have < need) {
+      const label = row.label ?? row.category ?? "样例";
+      items.push(`${label}不足：${have}/${need}，还缺 ${need - have} 条`);
+    }
+  }
+  for (const finding of payload.report.findings ?? []) {
+    if (finding.detail !== undefined) {
+      items.push(finding.detail);
+    }
+  }
+  return items;
+}
+
+/** 把服务端门禁的权威结论写在样例状态条上：缺哪一类、缺几条以它为准。 */
+function renderIntentGate(payload: ErrorPayload): void {
+  const report = payload.report;
+  const items = intentGateDetails(payload);
+  if (items.length === 0 || report === undefined || isReplayReport(report)) {
+    return;
+  }
+  const box = el<HTMLDivElement>("sample-status");
+  box.className = "warn";
+  box.innerHTML =
+    `<strong>服务端发布门禁拦下（权威结论，状态 ${escapeHtml(report.status ?? "fail")}）</strong>` +
+    `<ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` +
+    "<div>界面本地条数只是提示；请按这里的缺口补齐后重新发布。</div>";
+}
+
 function showFailure(error: unknown): void {
   if (error instanceof ApiFailure) {
     const payload = error.payload;
@@ -187,16 +279,21 @@ function showFailure(error: unknown): void {
     if (problems.length > 0) {
       markInvalid(problems);
     }
-    const list = problems.length > 0
-      ? `<ul>${problems
-          .map((item) => `<li>${escapeHtml(item.loc.join("."))}：${escapeHtml(item.message)}</li>`)
-          .join("")}</ul>`
+    const entries = [
+      ...problems.map(
+        (item) => `${item.loc.join(".")}：${item.message}`,
+      ),
+      ...intentGateDetails(payload),
+    ];
+    const list = entries.length > 0
+      ? `<ul>${entries.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`
       : "";
     showMessage(
       "err",
       `<strong>[${error.status}] ${escapeHtml(payload.code ?? "request_failed")}</strong> ` +
         `${escapeHtml(detailText(payload))}${list}`,
     );
+    renderIntentGate(payload);
   } else {
     showMessage("err", escapeHtml(String(error)));
   }
@@ -224,7 +321,7 @@ async function api<T>(path: string, method: string = "GET", body?: unknown): Pro
     }
   }
   if (!response.ok) {
-    throw new ApiFailure(response.status, (payload ?? {}) as ErrorPayload);
+    throw new ApiFailure(response.status, normalizeErrorPayload(payload));
   }
   return payload as T;
 }
@@ -404,18 +501,129 @@ function readStep(row: Element): StepInput {
   };
 }
 
+// ---------- 意图样例：动态列表与本地预检 ----------
+
+const SAMPLE_TEMPLATE = `
+  <div class="field"><label>sample_id</label><input data-key="sample_id" data-loc="intent_samples.IDX.sample_id" /></div>
+  <div class="field"><label>类别</label><select data-key="category" data-loc="intent_samples.IDX.category">
+    <option value="positive">正例</option><option value="near_miss">近似误例</option>
+    <option value="out_of_scope">超范围例</option></select></div>
+  <div class="field"><label>话术（合成 / 脱敏）</label><input data-key="text" data-loc="intent_samples.IDX.text" /></div>
+  <div class="field"><label></label><button type="button" data-remove="1" class="danger">删除</button></div>
+`;
+
+function renumberSamples(): void {
+  document.querySelectorAll<HTMLElement>("#samples .sample").forEach((row, index) => {
+    row.querySelectorAll<HTMLElement>("[data-loc]").forEach((input) => {
+      const key = input.dataset.loc?.split(".").pop() ?? "";
+      input.dataset.loc = `intent_samples.${index}.${key}`;
+    });
+  });
+}
+
+function addSampleRow(category: SampleCategory, initial?: Partial<SampleInput>): void {
+  const row = document.createElement("div");
+  row.className = "sample";
+  row.innerHTML = SAMPLE_TEMPLATE.replace(/IDX/g, "__NEW__");
+  const index = el<HTMLDivElement>("samples").children.length;
+  row.querySelectorAll<HTMLElement>("[data-loc]").forEach((input) => {
+    const key = input.dataset.loc?.split(".").pop() ?? "";
+    input.dataset.loc = `intent_samples.${index}.${key}`;
+  });
+  const categoryInput = row.querySelector<HTMLSelectElement>('[data-key="category"]');
+  if (categoryInput !== null) {
+    categoryInput.value = category;
+  }
+  if (initial !== undefined) {
+    for (const [key, raw] of Object.entries(initial)) {
+      const input = row.querySelector<HTMLInputElement | HTMLSelectElement>(
+        `[data-key="${key}"]`,
+      );
+      if (input !== null && raw !== null && raw !== undefined) {
+        input.value = String(raw);
+      }
+    }
+  }
+  row.querySelector<HTMLButtonElement>("[data-remove]")?.addEventListener("click", () => {
+    row.remove();
+    renumberSamples();
+    refreshSampleGate();
+  });
+  el<HTMLDivElement>("samples").append(row);
+}
+
+function readSample(row: Element): SampleInput {
+  const read = (key: string): string => {
+    const input = row.querySelector<HTMLInputElement | HTMLSelectElement>(
+      `[data-key="${key}"]`,
+    );
+    return input === null ? "" : input.value.trim();
+  };
+  return {
+    sample_id: read("sample_id"),
+    category: read("category") as SampleCategory,
+    text: read("text"),
+  };
+}
+
+/** 每次输入都重算：按钮禁用与「缺哪一类、缺几条」由同一份纯函数给出。 */
+function refreshSampleGate(): void {
+  const samples = Array.from(document.querySelectorAll("#samples .sample")).map(readSample);
+  const decision = sampleGateDecision(checkSamples(samples));
+  const box = el<HTMLDivElement>("sample-status");
+  box.className = decision.className;
+  box.innerHTML = decision.html;
+  el<HTMLButtonElement>("save-draft").disabled = decision.disabled;
+}
+
+/** 默认摆出正好够下限的空行，让缺口一眼可见；全空行不报形状错误。 */
+function resetSamples(): void {
+  el<HTMLDivElement>("samples").replaceChildren();
+  for (const category of SAMPLE_CATEGORIES) {
+    const need = category === "positive" ? 3 : category === "near_miss" ? 2 : 1;
+    for (let index = 0; index < need; index += 1) {
+      addSampleRow(category);
+    }
+  }
+  refreshSampleGate();
+}
+
+function loadSamples(samples: SampleInput[]): void {
+  el<HTMLDivElement>("samples").replaceChildren();
+  for (const sample of samples) {
+    if (!SAMPLE_CATEGORIES.includes(sample.category)) {
+      continue;
+    }
+    addSampleRow(sample.category, sample);
+  }
+  refreshSampleGate();
+}
+
 function readDraft(): FlowDraft {
   return {
     flow_id: value("draft-flow"),
     version: value("draft-version"),
     title: value("draft-title"),
     steps: Array.from(document.querySelectorAll("#steps .step")).map(readStep),
+    intent_samples: Array.from(document.querySelectorAll("#samples .sample")).map(readSample),
   };
 }
 
 async function saveDraft(): Promise<void> {
   clearInvalid();
-  const created = await api<FlowDraft>("/api/admin/flows", "POST", readDraft());
+  const payload = readDraft();
+  const gate = checkSamples(payload.intent_samples);
+  if (!gate.ready) {
+    // 按钮已禁用；这里再兜一次，避免绕过 DOM（控制台、脚本）直接触发保存。
+    refreshSampleGate();
+    const reasons = [
+      ...gate.shortfalls,
+      ...gate.problems.map((problem) => `${problem.loc}：${problem.message}`),
+    ];
+    showMessage("err", `本地预检未通过，草稿未提交：${escapeHtml(reasons.join("；"))}`);
+    return;
+  }
+  const created = await api<FlowDraft>("/api/admin/flows", "POST", payload);
   showMessage("ok", `草稿 ${escapeHtml(created.flow_id)}@${escapeHtml(created.version)} 已保存（未发布）。`);
   await refreshFlows();
 }
@@ -433,6 +641,7 @@ async function loadIntoDraft(flow: FlowSummary): Promise<void> {
   for (const step of detail.flow.steps) {
     addStepRow(step as unknown as Partial<StepInput>);
   }
+  loadSamples(detail.flow.intent_samples ?? []);
   showMessage("ok", `已载入 ${escapeHtml(flow.flow_id)}@${escapeHtml(flow.version)}；另存请填写新版本号。`);
 }
 
@@ -589,7 +798,9 @@ async function publish(
     );
     await refreshFlows();
   } catch (error) {
-    if (error instanceof ApiFailure && error.payload.report !== undefined) {
+    // 回放门禁与识别样例门禁的 409 报告结构不同：只有前者能渲染成逐 step 表格，
+    // 后者由 showFailure()/renderIntentGate() 写成「缺哪一类、缺几条」。
+    if (error instanceof ApiFailure && isReplayReport(error.payload.report)) {
       renderReport(error.payload.report);
     }
     throw error;
@@ -636,6 +847,21 @@ function bind(id: string, action: () => Promise<void>): void {
 el<HTMLInputElement>("api-base").value = location.origin;
 addStepRow({ step_id: "collect", kind: "collect", title: "收集信息" });
 addStepRow({ step_id: "submit", kind: "execute", title: "提交", tool: "example.tool" });
+resetSamples();
+
+const samplesBox = el<HTMLDivElement>("samples");
+samplesBox.addEventListener("input", refreshSampleGate);
+samplesBox.addEventListener("change", refreshSampleGate);
+for (const [id, category] of [
+  ["add-sample-positive", "positive"],
+  ["add-sample-near-miss", "near_miss"],
+  ["add-sample-out-of-scope", "out_of_scope"],
+] as Array<[string, SampleCategory]>) {
+  el<HTMLButtonElement>(id).addEventListener("click", () => {
+    addSampleRow(category);
+    refreshSampleGate();
+  });
+}
 
 bind("refresh", refreshFlows);
 bind("save-draft", saveDraft);
@@ -660,6 +886,7 @@ el<HTMLButtonElement>("clear-draft").addEventListener("click", () => {
   }
   el<HTMLDivElement>("steps").replaceChildren();
   addStepRow();
+  resetSamples();
   clearInvalid();
-  showMessage("ok", "表单已清空。");
+  showMessage("ok", "表单已清空（含意图样例）。");
 });

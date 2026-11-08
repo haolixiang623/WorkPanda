@@ -1,4 +1,4 @@
-"use strict";
+import { checkSamples, sampleGateDecision, SAMPLE_CATEGORIES, } from "./sample_check.js";
 class ApiFailure extends Error {
     constructor(status, payload) {
         super(`HTTP ${status}`);
@@ -60,6 +60,53 @@ function detailText(payload) {
     }
     return "请求未完成。";
 }
+function normalizeErrorPayload(payload) {
+    if (typeof payload !== "object" || payload === null) {
+        return {};
+    }
+    const raw = payload;
+    const nested = raw.detail;
+    if (typeof nested === "object" && nested !== null && !Array.isArray(nested)) {
+        return nested;
+    }
+    return raw;
+}
+function isReplayReport(report) {
+    return report !== undefined && Array.isArray(report.results);
+}
+function intentGateDetails(payload) {
+    if (isReplayReport(payload.report) || payload.report === undefined) {
+        return [];
+    }
+    const items = [];
+    for (const row of payload.report.coverage ?? []) {
+        const have = row.have ?? 0;
+        const need = row.need ?? 0;
+        if (have < need) {
+            const label = row.label ?? row.category ?? "样例";
+            items.push(`${label}不足：${have}/${need}，还缺 ${need - have} 条`);
+        }
+    }
+    for (const finding of payload.report.findings ?? []) {
+        if (finding.detail !== undefined) {
+            items.push(finding.detail);
+        }
+    }
+    return items;
+}
+function renderIntentGate(payload) {
+    const report = payload.report;
+    const items = intentGateDetails(payload);
+    if (items.length === 0 || report === undefined || isReplayReport(report)) {
+        return;
+    }
+    const box = el("sample-status");
+    box.className = "warn";
+    box.innerHTML =
+        `<strong>服务端发布门禁拦下（权威结论，状态 ${escapeHtml(report.status ?? "fail")}）</strong>` +
+            `<ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` +
+            "<div>界面本地条数只是提示；请按这里的缺口补齐后重新发布。</div>";
+}
 function showFailure(error) {
     if (error instanceof ApiFailure) {
         const payload = error.payload;
@@ -73,13 +120,16 @@ function showFailure(error) {
         if (problems.length > 0) {
             markInvalid(problems);
         }
-        const list = problems.length > 0
-            ? `<ul>${problems
-                .map((item) => `<li>${escapeHtml(item.loc.join("."))}：${escapeHtml(item.message)}</li>`)
-                .join("")}</ul>`
+        const entries = [
+            ...problems.map((item) => `${item.loc.join(".")}：${item.message}`),
+            ...intentGateDetails(payload),
+        ];
+        const list = entries.length > 0
+            ? `<ul>${entries.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`
             : "";
         showMessage("err", `<strong>[${error.status}] ${escapeHtml(payload.code ?? "request_failed")}</strong> ` +
             `${escapeHtml(detailText(payload))}${list}`);
+        renderIntentGate(payload);
     }
     else {
         showMessage("err", escapeHtml(String(error)));
@@ -108,7 +158,7 @@ async function api(path, method = "GET", body) {
         }
     }
     if (!response.ok) {
-        throw new ApiFailure(response.status, (payload ?? {}));
+        throw new ApiFailure(response.status, normalizeErrorPayload(payload));
     }
     return payload;
 }
@@ -260,17 +310,112 @@ function readStep(row) {
         requires_confirmation: checkbox?.checked ?? false,
     };
 }
+const SAMPLE_TEMPLATE = `
+  <div class="field"><label>sample_id</label><input data-key="sample_id" data-loc="intent_samples.IDX.sample_id" /></div>
+  <div class="field"><label>类别</label><select data-key="category" data-loc="intent_samples.IDX.category">
+    <option value="positive">正例</option><option value="near_miss">近似误例</option>
+    <option value="out_of_scope">超范围例</option></select></div>
+  <div class="field"><label>话术（合成 / 脱敏）</label><input data-key="text" data-loc="intent_samples.IDX.text" /></div>
+  <div class="field"><label></label><button type="button" data-remove="1" class="danger">删除</button></div>
+`;
+function renumberSamples() {
+    document.querySelectorAll("#samples .sample").forEach((row, index) => {
+        row.querySelectorAll("[data-loc]").forEach((input) => {
+            const key = input.dataset.loc?.split(".").pop() ?? "";
+            input.dataset.loc = `intent_samples.${index}.${key}`;
+        });
+    });
+}
+function addSampleRow(category, initial) {
+    const row = document.createElement("div");
+    row.className = "sample";
+    row.innerHTML = SAMPLE_TEMPLATE.replace(/IDX/g, "__NEW__");
+    const index = el("samples").children.length;
+    row.querySelectorAll("[data-loc]").forEach((input) => {
+        const key = input.dataset.loc?.split(".").pop() ?? "";
+        input.dataset.loc = `intent_samples.${index}.${key}`;
+    });
+    const categoryInput = row.querySelector('[data-key="category"]');
+    if (categoryInput !== null) {
+        categoryInput.value = category;
+    }
+    if (initial !== undefined) {
+        for (const [key, raw] of Object.entries(initial)) {
+            const input = row.querySelector(`[data-key="${key}"]`);
+            if (input !== null && raw !== null && raw !== undefined) {
+                input.value = String(raw);
+            }
+        }
+    }
+    row.querySelector("[data-remove]")?.addEventListener("click", () => {
+        row.remove();
+        renumberSamples();
+        refreshSampleGate();
+    });
+    el("samples").append(row);
+}
+function readSample(row) {
+    const read = (key) => {
+        const input = row.querySelector(`[data-key="${key}"]`);
+        return input === null ? "" : input.value.trim();
+    };
+    return {
+        sample_id: read("sample_id"),
+        category: read("category"),
+        text: read("text"),
+    };
+}
+function refreshSampleGate() {
+    const samples = Array.from(document.querySelectorAll("#samples .sample")).map(readSample);
+    const decision = sampleGateDecision(checkSamples(samples));
+    const box = el("sample-status");
+    box.className = decision.className;
+    box.innerHTML = decision.html;
+    el("save-draft").disabled = decision.disabled;
+}
+function resetSamples() {
+    el("samples").replaceChildren();
+    for (const category of SAMPLE_CATEGORIES) {
+        const need = category === "positive" ? 3 : category === "near_miss" ? 2 : 1;
+        for (let index = 0; index < need; index += 1) {
+            addSampleRow(category);
+        }
+    }
+    refreshSampleGate();
+}
+function loadSamples(samples) {
+    el("samples").replaceChildren();
+    for (const sample of samples) {
+        if (!SAMPLE_CATEGORIES.includes(sample.category)) {
+            continue;
+        }
+        addSampleRow(sample.category, sample);
+    }
+    refreshSampleGate();
+}
 function readDraft() {
     return {
         flow_id: value("draft-flow"),
         version: value("draft-version"),
         title: value("draft-title"),
         steps: Array.from(document.querySelectorAll("#steps .step")).map(readStep),
+        intent_samples: Array.from(document.querySelectorAll("#samples .sample")).map(readSample),
     };
 }
 async function saveDraft() {
     clearInvalid();
-    const created = await api("/api/admin/flows", "POST", readDraft());
+    const payload = readDraft();
+    const gate = checkSamples(payload.intent_samples);
+    if (!gate.ready) {
+        refreshSampleGate();
+        const reasons = [
+            ...gate.shortfalls,
+            ...gate.problems.map((problem) => `${problem.loc}：${problem.message}`),
+        ];
+        showMessage("err", `本地预检未通过，草稿未提交：${escapeHtml(reasons.join("；"))}`);
+        return;
+    }
+    const created = await api("/api/admin/flows", "POST", payload);
     showMessage("ok", `草稿 ${escapeHtml(created.flow_id)}@${escapeHtml(created.version)} 已保存（未发布）。`);
     await refreshFlows();
 }
@@ -284,6 +429,7 @@ async function loadIntoDraft(flow) {
     for (const step of detail.flow.steps) {
         addStepRow(step);
     }
+    loadSamples(detail.flow.intent_samples ?? []);
     showMessage("ok", `已载入 ${escapeHtml(flow.flow_id)}@${escapeHtml(flow.version)}；另存请填写新版本号。`);
 }
 function versionPath() {
@@ -413,7 +559,7 @@ async function publish(flow, apply) {
         await refreshFlows();
     }
     catch (error) {
-        if (error instanceof ApiFailure && error.payload.report !== undefined) {
+        if (error instanceof ApiFailure && isReplayReport(error.payload.report)) {
             renderReport(error.payload.report);
         }
         throw error;
@@ -441,6 +587,20 @@ function bind(id, action) {
 el("api-base").value = location.origin;
 addStepRow({ step_id: "collect", kind: "collect", title: "收集信息" });
 addStepRow({ step_id: "submit", kind: "execute", title: "提交", tool: "example.tool" });
+resetSamples();
+const samplesBox = el("samples");
+samplesBox.addEventListener("input", refreshSampleGate);
+samplesBox.addEventListener("change", refreshSampleGate);
+for (const [id, category] of [
+    ["add-sample-positive", "positive"],
+    ["add-sample-near-miss", "near_miss"],
+    ["add-sample-out-of-scope", "out_of_scope"],
+]) {
+    el(id).addEventListener("click", () => {
+        addSampleRow(category);
+        refreshSampleGate();
+    });
+}
 bind("refresh", refreshFlows);
 bind("save-draft", saveDraft);
 bind("add-case", addCase);
@@ -462,6 +622,7 @@ el("clear-draft").addEventListener("click", () => {
     }
     el("steps").replaceChildren();
     addStepRow();
+    resetSamples();
     clearInvalid();
-    showMessage("ok", "表单已清空。");
+    showMessage("ok", "表单已清空（含意图样例）。");
 });
