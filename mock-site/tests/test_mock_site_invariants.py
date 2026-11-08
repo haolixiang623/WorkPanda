@@ -88,6 +88,29 @@ def test_socket_is_only_used_for_port_probing() -> None:
     assert users == {"__main__.py"}, f"只有启动脚本可以碰 socket，实际：{users}"
 
 
+def test_mock_site_never_calls_request_form() -> None:
+    """`request.form()` 会把 `python-multipart` 变成隐式硬依赖。
+
+    Starlette 的 `Request.form()` 一进函数就断言 `python-multipart` 装了，哪怕这次
+    请求只是 urlencoded。本地装了看不出来，CI 上没装就是 500 —— 所以这里从语法树
+    上禁掉：urlencoded 走 `shared.form_body`，multipart 走 `mock_site.multipart`。
+    """
+
+    for path in sorted(PACKAGE_ROOT.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        offenders = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "form"
+        ]
+        assert not offenders, (
+            f"{path.name} 在第 {offenders} 行调用了 .form()："
+            "它会隐式依赖 python-multipart，改用 shared.form_body"
+        )
+
+
 def test_product_code_never_imports_the_mock_site() -> None:
     for path in sorted((REPO_ROOT / "src" / "workpanda").rglob("*.py")):
         source = path.read_text(encoding="utf-8")

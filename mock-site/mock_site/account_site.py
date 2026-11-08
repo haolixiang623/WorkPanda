@@ -18,6 +18,8 @@ from mock_site.shared import (
     LOGIN_COOKIE,
     attach_session,
     cookie_value,
+    first_value,
+    form_body,
     install_error_handlers,
     json_body,
     require_loopback,
@@ -68,14 +70,14 @@ def create_account_app(state: MockState, config: MockConfig | None = None) -> Fa
 
     @app.post("/login")
     async def login_submit(request: Request) -> Response:
-        form = await request.form()
-        username = str(form.get("username", "")).strip()
+        form = await form_body(request)
+        username = first_value(form, "username").strip()
         try:
             session = state.login(
                 username=username,
-                password=str(form.get("password", "")),
-                captcha_id=str(form.get("captcha_id", "")),
-                captcha_code=str(form.get("captcha_code", "")),
+                password=first_value(form, "password"),
+                captcha_id=first_value(form, "captcha_id"),
+                captcha_code=first_value(form, "captcha_code"),
             )
         except MockDomainError as exc:
             captcha_id, code = state.issue_captcha()

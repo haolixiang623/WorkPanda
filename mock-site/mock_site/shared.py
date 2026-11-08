@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+from urllib.parse import parse_qs
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -39,6 +40,31 @@ async def json_body(request: Request) -> dict[str, object]:
     if not isinstance(parsed, dict):
         raise MockDomainError(400, "invalid_json", "请求体必须是 JSON 对象")
     return parsed
+
+
+async def form_body(request: Request) -> dict[str, list[str]]:
+    """读 `application/x-www-form-urlencoded`，保留同名多值。
+
+    刻意不用 Starlette 的 `request.form()`：它一进函数就断言 `python-multipart` 存在，
+    哪怕这次请求只是 urlencoded。那会把「模拟站不依赖额外解析器」这条边界悄悄破掉，
+    本地装了依赖看不出来，CI 没装就是 500。multipart 走 `mock_site/multipart.py`。
+    """
+
+    raw = await request.body()
+    if not raw:
+        return {}
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise MockDomainError(400, "invalid_form", "表单请求体不是合法 UTF-8") from exc
+    return {key: list(values) for key, values in parse_qs(text, keep_blank_values=True).items()}
+
+
+def first_value(form: dict[str, list[str]], name: str) -> str:
+    """取单值字段；缺字段与空字段都当空串，交给 `state` 去判该报什么错。"""
+
+    values = form.get(name) or []
+    return values[0] if values else ""
 
 
 def cookie_value(request: Request, name: str) -> str | None:

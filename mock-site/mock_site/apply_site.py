@@ -22,6 +22,8 @@ from mock_site.shared import (
     APPLY_COOKIE,
     attach_session,
     cookie_value,
+    first_value,
+    form_body,
     install_error_handlers,
     json_body,
     require_loopback,
@@ -98,14 +100,13 @@ def create_apply_app(state: MockState, config: MockConfig | None = None) -> Fast
     @app.post("/apply/tab1")
     async def tab_basic_submit(request: Request) -> Response:
         session = _session(request)
-        form = await request.form()
-        situations = [str(item) for item in form.getlist("situations")]
+        form = await form_body(request)
         errors = state.save_basic(
             session.sid,
-            domicile_type=str(form.get("domicile_type", "")),
-            situations=situations,
-            phone=str(form.get("phone", "")),
-            address=str(form.get("address", "")),
+            domicile_type=first_value(form, "domicile_type"),
+            situations=form.get("situations", []),
+            phone=first_value(form, "phone"),
+            address=first_value(form, "address"),
         )
         if errors:
             by_field = {item["field"]: item["message"] for item in errors}
@@ -167,8 +168,8 @@ def create_apply_app(state: MockState, config: MockConfig | None = None) -> Fast
     @app.post("/apply/tab2/delete")
     async def tab_materials_delete(request: Request) -> Response:
         session = _session(request)
-        form = await request.form()
-        state.delete_attachment(session.sid, str(form.get("file_id", "")))
+        form = await form_body(request)
+        state.delete_attachment(session.sid, first_value(form, "file_id"))
         return RedirectResponse("/apply/tab2", status_code=303)
 
     @app.get("/apply/tab3", response_class=HTMLResponse)
