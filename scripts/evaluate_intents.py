@@ -61,12 +61,13 @@ def run_eval(
 ) -> IntentEvalReport:
     """评"发布口径"的语料。规则装配走 `bootstrap.build_intent_router`，与服务端同源。
 
-    规则按**全部已注册版本**裁剪（含草稿），否则一条草稿版本会把规则悄悄裁掉；
-    评测对象仍然只是已发布的那些版本。
+    规则取自**已发布版本**（`FlowDefinition.intent_rules`，D2=B）：草稿版本的
+    规则如果也进路由器，它会去抢已发布版本的样例，评出来的是"两版互相打架"，
+    不是线上真实口径。
     """
 
     published = [flow for flow in registry.versions() if flow.status is FlowStatus.PUBLISHED]
-    router = build_intent_router(registry.versions())
+    router = build_intent_router(published)
     return IntentEvalRunner(timeout_seconds=timeout_seconds).run(
         published,
         router,

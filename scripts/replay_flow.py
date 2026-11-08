@@ -50,7 +50,6 @@ from workpanda.application.intent_eval import (  # noqa: E402
 )
 from workpanda.application.release import FlowReleaseBlocked, FlowReleaseService  # noqa: E402
 from workpanda.application.replay import FlowReplay  # noqa: E402
-from workpanda.bootstrap import build_intent_router  # noqa: E402
 from workpanda.domain.intent_eval import IntentEvalReport  # noqa: E402
 from workpanda.domain.replay import ReplayCase, ReplayCaseExists, ReplayReport  # noqa: E402
 from workpanda.infrastructure.replay_cases import SqliteReplayCaseStore  # noqa: E402
@@ -140,8 +139,9 @@ def main(argv: list[str] | None = None) -> int:
             timeout_seconds=args.timeout,
             side_effecting=lambda name: name not in side_effect_free,
         )
-        # 识别规则与服务端同一套装配：门禁要评的就是"线上会用的路由器"。
-        intent_gate = IntentReleaseGate(router=build_intent_router(flows.list_versions()))
+        # 门禁按"发布后会生效的那组定义"自己装路由器（规则随流程版本走，D2=B）；
+        # 不在这里注入一台按当前指针建的路由器——那台还不认识待发布版本的规则。
+        intent_gate = IntentReleaseGate()
         service = FlowReleaseService(
             flows=flows,
             cases=cases,

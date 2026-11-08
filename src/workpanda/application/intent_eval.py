@@ -17,6 +17,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Sequence
 
+from workpanda.application.intent_routing import router_for
 from workpanda.application.ports import IntentRouter
 from workpanda.domain.flow import FlowDefinition
 from workpanda.domain.intent_eval import (
@@ -102,12 +103,20 @@ class IntentEvalRunner:
 
 
 class IntentReleaseGate:
-    """发布前的识别样例门禁：条数够、误路由为 0、漏路由不超限。"""
+    """发布前的识别样例门禁：条数够、误路由为 0、漏路由不超限。
+
+    `router` 留空时按**待评语料**自己装配（规则取自该语料的流程版本）。这是发布
+    门禁的正确口径：要评的是"这个版本发布之后线上会用的那台路由器"，而不是"现在
+    线上正在用的那台"——后者还不认识新版本的规则，新版本的样例必然被判漏路由，
+    于是谁也发不上去（#73）。
+
+    显式传 `router` 只给测试与特殊场景用；注入时口径由调用方负责。
+    """
 
     def __init__(
         self,
         *,
-        router: IntentRouter,
+        router: IntentRouter | None = None,
         runner: IntentEvalRunner | None = None,
         min_positive: int = MIN_POSITIVE_SAMPLES,
         min_near_miss: int = MIN_NEAR_MISS_SAMPLES,
@@ -128,7 +137,7 @@ class IntentReleaseGate:
         corpus.append(flow)
         return self.runner.run(
             corpus,
-            self.router,
+            self.router or router_for(corpus),
             min_positive=self.min_positive,
             min_near_miss=self.min_near_miss,
             max_miss_rate=self.max_miss_rate,

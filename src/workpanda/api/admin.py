@@ -31,6 +31,7 @@ from workpanda.application.intent_eval import IntentEvalBlocked
 from workpanda.application.release import FlowReleaseBlocked
 from workpanda.bootstrap import Container
 from workpanda.domain.flow import FlowDefinition, FlowStatus, StepDefinition
+from workpanda.domain.intent import IntentRule
 from workpanda.domain.intent_sample import IntentSample
 from workpanda.domain.replay import ReplayCase, ReplayExpectation
 
@@ -105,6 +106,10 @@ class FlowDraftRequest(BaseModel):
     建流程、后补样例，发布时由 `IntentReleaseGate` 用服务端阈值判定，避免前后端各写
     一份阈值而漂移。形状（id / text / category）与重复由 pydantic 和
     `flow_field_errors` 兜底，重复项会带 `intent_samples.<i>.<field>` 的 loc。
+
+    `intent_rules` 同理随版本走（D2=B，#73）：识别规则是这一版的一部分，发布这一版
+    就等于换掉识别口径。规则必须指向**自己这一版**，指错版本会被 `flow_field_errors`
+    以 `intent_rules.<i>.flow_id` 拦下——留到运行时才发现，报出来会像是群众说错了话。
     """
 
     flow_id: str = Field(min_length=1, max_length=128)
@@ -112,6 +117,7 @@ class FlowDraftRequest(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     steps: tuple[StepDefinition, ...] = Field(min_length=1)
     intent_samples: tuple[IntentSample, ...] = ()
+    intent_rules: tuple[IntentRule, ...] = ()
 
 
 class CaseDraftRequest(BaseModel):
@@ -174,6 +180,7 @@ async def create_draft(
         status=FlowStatus.DRAFT,
         steps=draft.steps,
         intent_samples=draft.intent_samples,
+        intent_rules=draft.intent_rules,
     )
     service = _service(container)
     try:

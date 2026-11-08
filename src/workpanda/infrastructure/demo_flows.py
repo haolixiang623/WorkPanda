@@ -47,6 +47,26 @@ DEMO_INTENT_SAMPLES: tuple[IntentSample, ...] = (
     ),
 )
 
+# 自检流程的意图规则。只认自检话术，别的话一律不路由——占位规则越"宽容"，
+# 真实试点上线时越容易被误当成业务识别能力。
+#
+# 它随版本内容一起入库、一起发布（`FlowDefinition.intent_rules`）：规则存在哪里，
+# 决定了"发布"是不是一次生效。留在代码常量里时，发布只移动了指针。
+DEMO_INTENT_RULES: tuple[IntentRule, ...] = (
+    IntentRule(
+        intent_id="demo.generic.selfcheck",
+        flow_id="demo.generic",
+        flow_version="1",
+        keywords=("自检", "演示"),
+        slot_patterns={
+            "subject": (
+                r"(?:主题|内容)[:：]\s*([^\s,，。;；]+)",
+                r"自检[:：]\s*([^\s,，。;；]+)",
+            )
+        },
+    ),
+)
+
 DEMO_FLOW = FlowDefinition(
     flow_id="demo.generic",
     version="1",
@@ -74,32 +94,14 @@ DEMO_FLOW = FlowDefinition(
         ),
     ),
     intent_samples=DEMO_INTENT_SAMPLES,
-)
-
-# 自检流程的意图规则。只认自检话术，别的话一律不路由——占位规则越"宽容"，
-# 真实试点上线时越容易被误当成业务识别能力。
-DEMO_INTENT_RULES: tuple[IntentRule, ...] = (
-    IntentRule(
-        intent_id="demo.generic.selfcheck",
-        flow_id=DEMO_FLOW.flow_id,
-        flow_version=DEMO_FLOW.version,
-        keywords=("自检", "演示"),
-        slot_patterns={
-            "subject": (
-                r"(?:主题|内容)[:：]\s*([^\s,，。;；]+)",
-                r"自检[:：]\s*([^\s,，。;；]+)",
-            )
-        },
-    ),
+    # 规则随版本走（D2=B）：发布这一版等于同时换掉识别口径。#73 之前它是装配期
+    # 代码常量，发布新版本只移动了指针、识别仍按旧版本，群众侧直接 FlowNotRunnable。
+    intent_rules=DEMO_INTENT_RULES,
 )
 
 
 def demo_flows() -> list[FlowDefinition]:
     return [DEMO_FLOW]
-
-
-def demo_intent_rules() -> tuple[IntentRule, ...]:
-    return DEMO_INTENT_RULES
 
 
 def demo_intent_samples() -> tuple[IntentSample, ...]:
