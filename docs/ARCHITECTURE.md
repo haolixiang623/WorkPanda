@@ -248,7 +248,7 @@ created → running → waiting_for_user → running
 - 群众可见状态由服务端映射（`domain/presentation.py`，随 `TaskView.ui_state` 与
   `ui_title`/`ui_hint` 下发）。群众侧最小页面在 `web/`（Issue #77），状态只从
   `GET /api/tasks/{id}` 派生、事件流仅作触发刷新，静态托管默认只挂回环；但
-  「需要用户操作」（验证码 / 扫码 / 本人操作）在事件层还没有信号（Issue #79），
+  「需要用户操作」（验证码 / 扫码 / 本人操作）在事件层还没有信号（Issue #80），
   页面只能按"在等用户、但没让用户填表"派生这一屏，指引里的有效期无可信来源，
   只写"以办理页面为准"；页面尚未做过真实浏览器的人工走查与无障碍验收；
 - harness 的工具是同步执行，预算按调用次数与耗时计（不按 token），无 checkpoint 恢复；
