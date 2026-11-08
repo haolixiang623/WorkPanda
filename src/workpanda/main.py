@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from workpanda.api.admin import router as admin_router
 from workpanda.api.admin_identities import router as admin_identities_router
 from workpanda.api.errors import register_error_handlers
+from workpanda.api.im import router as im_router
 from workpanda.api.ops import router as ops_router
 from workpanda.api.routes import router
 from workpanda.api.staff import router as staff_router
@@ -66,6 +67,7 @@ def create_app(settings: Settings | None = None, container: Container | None = N
     app.include_router(admin_router)
     app.include_router(admin_identities_router)
     app.include_router(staff_router)
+    app.include_router(im_router)
     return app
 
 

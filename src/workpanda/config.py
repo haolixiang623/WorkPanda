@@ -49,6 +49,29 @@ class Settings(BaseSettings):
     # 而是维护在工作人员目录（`/api/admin/identities/staff/*`）中，改授权不必换凭据。
     # 未配置时 /api/staff/* 整体不可用（404），不接受 ops / admin 凭据代用。
     staff_tokens: str = ""
+    # 企业微信 IM 网关。默认关闭：未开启时 /api/im/* 整体 404，不暴露接口存在性。
+    # 开启后必须先有回调 Token（明文模式）；没有 Token 的"跳过验签"是不存在的选项。
+    # 配置与限制见 docs/IM-GATEWAY.md。
+    im_gateway_enabled: bool = False
+    # 回调验签 Token。与 EncodingAESKey 互斥：本轮只实现明文模式，
+    # 配了 AESKey 会在启动时直接失败，而不是收下短信却解不开。
+    wecom_callback_token: str = ""
+    wecom_encoding_aes_key: str = ""
+    # 明文模式的时间窗（秒）。签名不覆盖消息体，时间窗是抗重放的第一道闸。
+    wecom_callback_max_skew_seconds: int = 300
+    # 出站卡片：企业微信应用消息。四项（corp_id / agent_id / app_secret / 深链基址）
+    # 必须齐备或全空，只配一部分时启动即失败——否则表现为"配置看起来对、卡片永远不到"。
+    wecom_corp_id: str = ""
+    wecom_agent_id: str = ""
+    wecom_app_secret: str = ""
+    wecom_api_base: str = "https://qyapi.weixin.qq.com"
+    # 是否沿用系统代理。企业微信域名通常需要直连，被代理拦截时置为 false。
+    wecom_trust_env: bool = True
+    notification_deep_link_base: str = ""
+    # 单次投递的超时。卡片是附带通知，不能让对方接口的响应时间决定任务响应时间。
+    notification_timeout_seconds: float = 3.0
+    # 待投递事件的有界队列长度。满了就丢并计数，绝不阻塞任务推进。
+    notification_max_pending: int = 64
     # 网络绑定与 TLS。默认只监听回环且不启用 TLS，也就是"不对外暴露"的状态。
     bind_host: str = "127.0.0.1"
     bind_port: int = 8000

@@ -8,8 +8,9 @@ from dataclasses import dataclass, field
 
 from workpanda.api.ops_auth import OpsAccessPolicy, build_ops_policy
 from workpanda.application.admin_flows import AdminFlowService
+from workpanda.application.im_gateway import ImInboundService, ImMessageStore, TaskEventNotifier
 from workpanda.application.intent_eval import IntentEvalRunner, IntentReleaseGate
-from workpanda.application.ports import Executor, IntentRouter
+from workpanda.application.ports import EventPublisher, Executor, IntentRouter
 from workpanda.application.release import FlowReleaseService
 from workpanda.application.replay import FlowReplay
 from workpanda.application.runner import FlowRunner
@@ -19,6 +20,7 @@ from workpanda.capacity import validate_deployment_topology
 from workpanda.config import Settings, get_settings
 from workpanda.domain.flow import FlowDefinition, FlowRegistry, FlowStore, FlowVersionExists
 from workpanda.domain.identity import SessionSigner, new_secret
+from workpanda.domain.im_gateway import NotificationCounters, ReplayGuard
 from workpanda.domain.intent import IntentRule, RuleIntentRouter
 from workpanda.domain.replay import ReplayCaseStore
 from workpanda.domain.repository import ConfirmationStore, TaskStore
@@ -42,6 +44,10 @@ from workpanda.harness.trace import InMemoryTraceStore, TraceStore
 from workpanda.infrastructure.adapters import ScriptedExecutor
 from workpanda.infrastructure.demo_flows import demo_flows, demo_intent_rules
 from workpanda.infrastructure.event_broker import EventBroker
+from workpanda.infrastructure.im_message_store import (
+    InMemoryImMessageStore,
+    SqliteImMessageStore,
+)
 from workpanda.infrastructure.memory_store import (
     InMemoryConfirmationStore,
     InMemoryFlowStore,
@@ -65,6 +71,14 @@ from workpanda.infrastructure.sqlite_flow_store import SqliteFlowStore
 from workpanda.infrastructure.sqlite_store import SqliteStore
 from workpanda.infrastructure.sqlite_trace_store import SqliteTraceStore
 from workpanda.infrastructure.staff_store import InMemoryStaffStore, SqliteStaffStore
+from workpanda.infrastructure.wecom_gateway import (
+    NotificationQueue,
+    NotifyingEventPublisher,
+    build_card_sender,
+    build_transport,
+    outbound_configured,
+    validate_im_gateway,
+)
 
 
 @dataclass
@@ -95,6 +109,12 @@ class Container:
     cancellations: CancelRegistry
     # 工具线程台账：超时后仍在跑的线程数。只有 harness 分支才有，其余为 None。
     tool_threads: Callable[[], dict[str, int]] | None = None
+    # 通知投递计数：队列（丢件）与通知器（投递结果）共用同一个对象。
+    notification_counters: NotificationCounters | None = None
+    # IM 回调回放闸：每个 nonce 只接受一次，进程内记 2048 条。
+    # 多实例部署下进程间不共享（同一 nonce 的第二次请求落到另一实例仍会通过）；
+    # 跨实例重放防护需要签名覆盖消息体，列为后续项（见 docs/IM-GATEWAY.md）。
+    callback_replay: ReplayGuard = field(default_factory=ReplayGuard)
     # 流程版本库。测试注入定义时为 None（那些定义不落库）。
     flow_store: FlowStore | None = None
     # 回放用例库。与流程版本同后端：用例跟着版本走，换后端不该丢基线。
@@ -105,9 +125,19 @@ class Container:
     admin_flows: AdminFlowService | None = None
     # 工作人员目录的维护入口（管理侧接口用）。目录本身始终存在。
     staff_directory: StaffDirectoryService | None = None
+    # IM 网关的入站服务。未开启时为 None，/api/im/* 整体 404。
+    im_gateway: ImInboundService | None = None
+    # 入站消息的幂等登记（重投只处理一次）。与任务库同后端。
+    im_messages: ImMessageStore | None = None
+    # 卡片投递队列。持有它才能与进程一起关掉后台线程；未配置出站时为 None。
+    notifications: NotificationQueue | None = None
     closers: list = field(default_factory=list)
 
     def close(self) -> None:
+        # 先停投递线程再关存储：反过来的话，退出瞬间还在队列里的事件会拿到一个
+        # 已关闭的连接，把"正常关机"写成一条堆栈。
+        if self.notifications is not None:
+            self.notifications.close()
         for closer in self.closers:
             closer()
 
@@ -183,6 +213,21 @@ def build_staff_store(settings: Settings) -> tuple[StaffStore, list[Callable[[],
         store = SqliteStaffStore(settings.sqlite_path)
         return store, [store.close]
     return InMemoryStaffStore(), []
+
+
+def build_im_message_store(
+    settings: Settings,
+) -> tuple[ImMessageStore, list[Callable[[], None]]]:
+    """入站消息的幂等登记。跟随任务存储：sqlite 时与任务库同文件。
+
+    同文件的原因和工作人员目录一样：一次"判重 + 留痕"要落在同一个事务语义里，
+    分库之后会出现"消息判过重了、留痕还没写"的对不上的现场。
+    """
+
+    if settings.store_backend == "sqlite":
+        store = SqliteImMessageStore(settings.sqlite_path)
+        return store, [store.close]
+    return InMemoryImMessageStore(), []
 
 
 def build_replay_case_store(
@@ -345,6 +390,9 @@ def build_container(
     # 部署形态门禁最先跑：声明多实例却仍用进程内状态时，不能先占住存储/连接
     # 再抛错。它只做纯配置校验，选 redis 后的探活仍由 build_shared_state 负责。
     validate_deployment_topology(settings)
+    # IM 网关的配置门禁与部署门禁同批跑：验签用空 token、出站只配了一半，都属于
+    # "配了但等于没配"，必须在打开任何存储之前失败。
+    validate_im_gateway(settings)
     # 凭据配置在打开任何存储之前校验：配置写错时不该先占住数据库连接再抛错。
     ops_access = build_ops_policy(settings.ops_token, settings.ops_tokens)
     # 管理侧只接受「主体:角色:密钥」多主体格式，不引入 legacy 单密钥：
@@ -427,6 +475,16 @@ def build_container(
     closers.extend(staff_closers)
     staff_directory = StaffDirectoryService(staff_store)
     im_resolver = ImIdentityResolver(staff_store)
+
+    # IM 网关默认关闭：未开启时不建任何对象，/api/im/* 按不存在处理。
+    im_messages: ImMessageStore | None = None
+    im_gateway: ImInboundService | None = None
+    notifications: NotificationQueue | None = None
+    if settings.im_gateway_enabled:
+        im_messages, im_store_closers = build_im_message_store(settings)
+        closers.extend(im_store_closers)
+        im_gateway = ImInboundService(resolver=im_resolver, messages=im_messages)
+
     broker = EventBroker()
     # 共享状态后端先建：取消信号、步骤租约、预算账本三处共用同一个连接与键前缀。
     shared_state, shared_closers = build_shared_state(settings)
@@ -501,11 +559,36 @@ def build_container(
     else:
         executor_instance = executor
 
+    # 事件发布之后投递卡片。出站未配置时 publisher 就是 broker 本身——
+    # 不装一层空壳，避免"看起来有通知能力、其实什么也不做"。
+    publisher: EventPublisher = broker
+    notification_counters: NotificationCounters | None = None
+    if im_gateway is not None and outbound_configured(settings):
+        notification_counters = NotificationCounters()
+        transport, transport_closers = build_transport(settings)
+        closers.extend(transport_closers)
+        sender = build_card_sender(settings, transport)
+        if sender is not None:
+            notifier = TaskEventNotifier(
+                store=store,
+                staff=staff_store,
+                sender=sender,
+                flows=registry,
+                deep_link_base=settings.notification_deep_link_base,
+                counters=notification_counters,
+            )
+            notifications = NotificationQueue(
+                notifier.handle,
+                max_pending=settings.notification_max_pending,
+                counters=notification_counters,
+            )
+            publisher = NotifyingEventPublisher(broker, notifications)
+
     runner = FlowRunner(
         store=store,
         confirmations=confirmations,
         executor=executor_instance,
-        publisher=broker,
+        publisher=publisher,
         flows=registry,
         confirmation_ttl_seconds=settings.confirmation_ttl_seconds,
     )
@@ -540,6 +623,10 @@ def build_container(
         staff_access=staff_access,
         staff_store=staff_store,
         im_resolver=im_resolver,
+        im_gateway=im_gateway,
+        im_messages=im_messages,
+        notifications=notifications,
+        notification_counters=notification_counters,
         traces=traces,
         audit=audit,
         cancellations=cancellations,
