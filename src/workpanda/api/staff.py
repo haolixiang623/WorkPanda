@@ -11,18 +11,26 @@
 - **403**：凭据有效，但这个主体没有开通工作人员身份（停用或未建），
   或者有身份但没有该动作的授权（`staff_not_provisioned` / `staff_forbidden`）。
 
-本轮只回答"我是谁、我能对哪些流程做什么"。真正推进流程的动作在 N4/N5 落地，
-这里先不给出任何能改动任务状态的入口——**没有入口的权限，比有入口但靠自觉更可靠**。
+本轮（N5）在"我是谁"之外只多一件事：为待确认步骤发**一次性深链**。它不改任务
+状态、不签发确认凭证，落地后仍由群众自己的会话走既有的 `/confirm`。除此之外
+仍然没有任何能改动任务状态的 staff 入口——**没有入口的权限，比有入口但靠自觉更可靠**。
 """
 
 from __future__ import annotations
+
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel
 
 from workpanda.api.dependencies import get_container
 from workpanda.api.ops_auth import OpsDisabled, OpsUnauthenticated
+from workpanda.application.deeplink_confirm import (
+    ConfirmationLinkForbidden,
+    ConfirmationLinkTicket,
+)
 from workpanda.bootstrap import Container
+from workpanda.domain.deeplink import ConfirmationLinkAttempt
 from workpanda.domain.identity import Principal, PrincipalKind
 from workpanda.domain.staff import StaffAction, StaffGrant, StaffMember
 
@@ -119,3 +127,58 @@ async def list_granted_flows(
             )
         )
     return granted
+
+
+# ---------- 卡片深链（N5） ----------
+#
+# 这里**没有**、也不应该有 `/api/staff/tasks/{id}/confirm`：工作人员的主体不签发
+# 确认凭证（D3 红线）。IM 文本回复（"确认""yes""同意"）在结构上就没有落点，
+# 因为能处理它的只有 `/api/tasks/{id}/confirm`，而那条路径只认任务所属的会话。
+# `tests/test_confirmation_deeplink.py::test_im_text_reply_never_issues_confirmation`
+# 把"这个端点不存在"与"凭证没被签发"一起钉在 CI 里。
+
+
+def _forbidden(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={"code": "staff_forbidden", "detail": message},
+    )
+
+
+@router.post(
+    "/tasks/{task_id}/confirmation-links",
+    response_model=ConfirmationLinkTicket,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_confirmation_link(
+    task_id: UUID,
+    member: StaffMember = Depends(get_staff_member),
+    container: Container = Depends(get_container),
+) -> ConfirmationLinkTicket:
+    """为当前待确认步骤发一张一次性深链。
+
+    发出去的东西**不是**确认凭证：它只是"去哪一页确认"的导航，落地后仍由群众
+    自己的会话说 `/confirm`。所以这里既不需要、也不允许调用确认签发路径。
+    """
+
+    try:
+        return container.confirmation_links.issue(task_id, member)
+    except ConfirmationLinkForbidden as exc:
+        raise _forbidden(str(exc)) from exc
+
+
+@router.get(
+    "/tasks/{task_id}/confirmation-links/attempts",
+    response_model=list[ConfirmationLinkAttempt],
+)
+async def list_confirmation_link_attempts(
+    task_id: UUID,
+    member: StaffMember = Depends(get_staff_member),
+    container: Container = Depends(get_container),
+) -> list[ConfirmationLinkAttempt]:
+    """这张任务的深链留痕：谁发的、谁点开的、为什么打不开。"""
+
+    try:
+        return container.confirmation_links.attempts_for(task_id, member)
+    except ConfirmationLinkForbidden as exc:
+        raise _forbidden(str(exc)) from exc

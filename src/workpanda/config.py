@@ -4,8 +4,10 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from workpanda.domain.deeplink import MAX_TTL_SECONDS
 from workpanda.domain.intent_eval import (
     DEFAULT_EVAL_TIMEOUT_SECONDS,
     DEFAULT_MAX_MISS_RATE,
@@ -28,6 +30,12 @@ class Settings(BaseSettings):
     expected_instances: int = 1
     intent_confidence_threshold: float = 0.6
     confirmation_ttl_seconds: int = 300
+    # 卡片深链（N5）的有效期：只用于把浏览器导航到确认页，所以比确认凭证更短。
+    # 上限 900 秒——再长就不再是"一次性"，一张留在浏览历史里的卡能被反复点开。
+    confirmation_link_ttl_seconds: int = 300
+    # 卡片按钮的落地地址（形如 https://wpa.example.com，不带路径）。
+    # 留空时接口只返回相对路径：服务端不猜自己的对外域名。
+    confirmation_link_base_url: str = ""
     event_keepalive_seconds: float = 15.0
     # 会话令牌签名密钥。未配置时使用进程级随机值，重启后旧会话失效。
     session_secret: str | None = None
@@ -211,6 +219,40 @@ class Settings(BaseSettings):
             if origin not in origins:
                 origins.append(origin)
         return tuple(origins)
+
+    @property
+    def confirmation_link_base(self) -> str:
+        """卡片深链的落地前缀，校验后不带结尾斜杠。
+
+        与 `cors_origins` 同一套严格度：写成 `wpa.example.com`（漏了 scheme）或
+        带了路径时启动就失败。否则卡片会指向一个打不开的地址，而排障会先从
+        "深链过期了吗"开始查——那是最难查的一类问题。
+        """
+
+        raw = self.confirmation_link_base_url.strip()
+        if not raw:
+            return ""
+        parts = urlsplit(raw)
+        if parts.scheme not in {"http", "https"} or not parts.netloc:
+            raise ValueError(
+                f"confirmation_link_base_url 必须是带 scheme 的地址（例如 https://wpa.example.com）：{raw}"
+            )
+        if parts.path not in {"", "/"} or parts.query or parts.fragment:
+            # 带路径的地址会与卡片自身的落地路径拼成 `/confirm/confirm`，
+            # 而那种 404 会被当成"深链过期"。宁可在启动时就拒绝。
+            raise ValueError(f"confirmation_link_base_url 只能是不带路径的站点根：{raw}")
+        return raw.rstrip("/")
+
+    @field_validator("confirmation_link_ttl_seconds")
+    @classmethod
+    def _check_link_ttl(cls, value: int) -> int:
+        # 上限与 domain.deeplink.MAX_TTL_SECONDS 同一个理由：深链只是一次导航，
+        # 有效期越长，"一次性"就越容易被浏览历史稀释成"随时可点"。
+        if value <= 0 or value > MAX_TTL_SECONDS:
+            raise ValueError(
+                f"confirmation_link_ttl_seconds 必须在 1..{MAX_TTL_SECONDS} 秒之间：{value}"
+            )
+        return value
 
 
 @lru_cache

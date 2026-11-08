@@ -12,6 +12,7 @@ from workpanda.application.errors import (
     TaskConflict,
 )
 from workpanda.domain.confirmation import ConfirmationError
+from workpanda.domain.deeplink import ConfirmationLinkRejected
 from workpanda.domain.flow import FlowNotFound, FlowNotRunnable
 from workpanda.domain.presentation import UiState
 from workpanda.domain.repository import TaskNotFoundError
@@ -64,6 +65,16 @@ def register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(ConfirmationError)
     async def _confirmation(request: Request, exc: ConfirmationError) -> JSONResponse:
         return _error(status.HTTP_409_CONFLICT, "confirmation_invalid", str(exc))
+
+    @app.exception_handler(ConfirmationLinkRejected)
+    async def _confirmation_link(request: Request, exc: ConfirmationLinkRejected) -> JSONResponse:
+        # 失败分档只进留痕，不回给调用方：区分"链接有效但你不是这张任务的会话"
+        # 等于告诉持卡人"这张卡是真的，去搞到那个会话"。对外只有一句话。
+        return _error(
+            status.HTTP_409_CONFLICT,
+            "confirmation_link_invalid",
+            "确认链接无效或已失效，请重新发起。",
+        )
 
     @app.exception_handler(AuthenticationRequired)
     async def _unauthenticated(request: Request, exc: AuthenticationRequired) -> JSONResponse:

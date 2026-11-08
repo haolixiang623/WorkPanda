@@ -119,16 +119,60 @@ IM 号"和"两个人被拦"。`origin` 区分真实入站（`gateway`）与管�
 为什么不做降级：降级之后，"没配好"表现为"能办事但记不到人"，而且不报错。等发现
 时已经有一批业务找不到经办人。
 
-## 5. 与后续 issue 的衔接
+## 5. 卡片深链确认（Issue #65）
+
+IM 卡片上的按钮不能直接"把任务推进到下一步"，但也不该让人为此多点几次跳转——
+折中的做法是发一张**一次性深链**：它只负责把浏览器带到确认页，到了之后仍然走
+既有的群众侧确认流程。
+
+| 方法与路径 | 主体 | 作用 |
+|---|---|---|
+| `POST /api/staff/tasks/{task_id}/confirmation-links` | staff（需该流程的 `handle`） | 为当前待确认步骤发一张深链；任务不处于 `waiting_for_confirmation` 时 409 |
+| `GET /api/staff/tasks/{task_id}/confirmation-links/attempts` | staff（该流程任一动作） | 深链留痕：谁发的、谁点开的、为什么打不开 |
+| `POST /api/tasks/{task_id}/confirmation-link` | 群众会话 | 落地：只回答"该确认哪一步"，**不签发凭证** |
+
+发卡返回 `{token, url, task_id, step_id, flow_version, expires_at}`；`url` 形如
+`https://<站点根>/confirm?task_id=…&link=…`（未配置 `WORKPANDA_CONFIRMATION_LINK_BASE_URL`
+时只给相对路径，服务端不猜自己的对外域名）。前端从查询串取出 `link`，带着**用户自己的
+会话** POST 到落地接口，拿到 `{task_id, step_id, flow_version, confirm_path}`，
+再按 `confirm_path` 调 `/api/tasks/{id}/confirm`。
+
+配置：`WORKPANDA_CONFIRMATION_LINK_TTL_SECONDS`（默认 300，上限 900）、
+`WORKPANDA_CONFIRMATION_LINK_BASE_URL`（必须是不带路径的站点根，否则启动即失败）。
+
+### 5.1 为什么这不是第二条签发路径（D3 红线）
+
+- **落地接口不返回凭证**：响应体只有"该确认哪一步"和既有确认接口的地址，
+  没有任何 token 字段。凭证仍由 `TaskService.confirm` 在 `/confirm` 上当场签发，
+  绑定 `task + flow_version + step + 参数摘要 + user_ref + TTL`（见 `domain/confirmation.py`）；
+- **落地不等于授权**：落地的前提仍是任务所属的会话（`task.user_ref`），深链既不能
+  替代会话，也不能把任意浏览器的会话变成这张任务的会话；
+- **IM 文本回复不构成授权**：能签发凭证的只有 `/confirm`，而它只认任务所属的会话。
+  "确认""yes""同意"这些文本在结构上就没有落点——工作人员主体没有、也不应该有
+  任何可推进任务状态的入口（`test_staff_surface_has_no_task_state_mutating_route`
+  把这条钉成白名单断言）；
+- **转发不再有收益**：别人点开深链，用的是他自己的会话，`session_not_owner` 直接拒绝。
+
+### 5.2 深链的失败分档（只进留痕）
+
+一次性、TTL、跨任务、换步、会话不符，五种拒绝原因分别是 `link_already_used` /
+`link_expired` / `link_task_mismatch` / `link_step_changed` / `link_session_not_owner`。
+**对外统一回 `confirmation_link_invalid`**：把"这张卡是真的、只是你不是那个人"单独
+返回，等于告诉持卡人去搞到那个会话。分档留给运维查"为什么这个人打不开"。
+
+被拒绝**不消耗卡片**（除真正被用掉的那张）：跨任务试探、他人会话试探之后，
+任务主人手里的卡仍然可用。
+
+## 6. 与后续 issue 的衔接
 
 - **N4（企业微信网关）**：入站只做验签 → 归一化 → 调
   `container.im_resolver.resolve(channel, im_user_id)` → 用返回的 `Principal`
   调**同一套** application service。网关不得自己拼 `TaskService`，也不得在解析
   失败时"先当群众用"；
-- **N5（卡片深链确认）**：`Principal(kind=staff)` 不带任何签发确认凭证的能力，
-  IM 文本回复仍然不构成授权（D3 红线不变）。
+- **N5（卡片深链确认）**：见第 5 节。`Principal(kind=staff)` 不带任何签发确认凭证的
+  能力，IM 文本回复仍然不构成授权（D3 红线不变）。
 
-## 6. 验证证据
+## 7. 验证证据
 
 `pytest tests/test_staff_identity.py`：28 项，覆盖
 
@@ -140,5 +184,15 @@ IM 号"和"两个人被拦"。`origin` 区分真实入站（`gateway`）与管�
 - `WORKPANDA_STAFF_TOKENS` 非法配置启动即失败（角色写成 admin、密钥过短、跨主体共用）；
 - sqlite 后端重建容器后目录/映射/留痕仍在。
 
-未覆盖（属 N4/N5 范围）：真实企业微信回调验签、卡片投递、IM 内的业务操作。
+未覆盖（属 N4 范围）：真实企业微信回调验签、卡片投递、IM 内的业务操作。
 本轮没有开放任何能改动任务状态的 staff 入口——**没有入口的权限，比有入口但靠自觉更可靠**。
+
+`pytest tests/test_confirmation_deeplink.py`：25 项，覆盖
+
+- 红线 `test_im_text_reply_never_issues_confirmation`：IM 常见文本打不到任何签发路径，
+  发卡也不产生凭证，只有本人会话确认才产生凭证并推进任务；
+- 负例各一条：一次性（重复落地 409）、TTL 到期、跨任务、转发他人会话、任务已推进；
+- 契约：凭证绑定字段集合与 `parameter_digest` 未被改动；
+- 一次性在并发下成立（8 线程，memory 与 sqlite 各一）；
+- 发卡侧授权（缺 `handle` → 403）、前置状态（非待确认 → 409）、留痕（只存指纹）；
+- 配置门禁：站点根带路径/漏 scheme、TTL 越界都在启动期失败。
