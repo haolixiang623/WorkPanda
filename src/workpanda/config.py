@@ -121,6 +121,13 @@ class Settings(BaseSettings):
     harness_audit_backups: int = 3
     # 骨架自检流程，只用于验证任务链路；正式接入业务前必须关闭。
     enable_demo_flow: bool = True
+    # 发布门禁：该版本写了回放用例时，回放未通过不得发布。
+    # 默认开启——关掉它意味着"用例只是摆设"，而这恰好是最难被发现的失效方式；
+    # 没写用例的版本不受影响（这条门禁不假装覆盖没有基线的流程）。
+    replay_release_gate: bool = True
+    # 单条用例的回放时限。回放不碰网络，正常在毫秒级完成；超时说明流程不收敛或
+    # 代码有问题，此时判"无结论"而不是继续等。
+    replay_timeout_seconds: float = 10.0
 
     @property
     def shared_backend(self) -> str:

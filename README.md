@@ -2,7 +2,7 @@
 
 WorkPanda 是面向群众的自然语言公共服务入口。当前仓库处于**工程骨架**阶段：已建立统一业务后端、固定流程执行、任务状态与确认凭证机制，并具备受控执行能力（模型可调用受控工具、结果可核验）；尚未接入具体业务事项与外部业务系统。
 
-业务目标见 [business-goals.md](business-goals.md)，目标架构见 [recommended-architecture.md](recommended-architecture.md)。工程实现细节见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，受控执行层见 [docs/HARNESS.md](docs/HARNESS.md)，识别与展示契约（含评测集）见 [docs/INTENT-EVAL.md](docs/INTENT-EVAL.md)，协作规范见 [AGENTS.md](AGENTS.md) 与 [docs/DEVELOPMENT-OPERATING-MECHANISM.md](docs/DEVELOPMENT-OPERATING-MECHANISM.md)，界面约束见 [design/DESIGN.md](design/DESIGN.md)。
+业务目标见 [business-goals.md](business-goals.md)，目标架构见 [recommended-architecture.md](recommended-architecture.md)。工程实现细节见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)，受控执行层见 [docs/HARNESS.md](docs/HARNESS.md)，识别与展示契约（含评测集）见 [docs/INTENT-EVAL.md](docs/INTENT-EVAL.md)，发布前回放与发布门禁见 [docs/SOP-REPLAY.md](docs/SOP-REPLAY.md)，协作规范见 [AGENTS.md](AGENTS.md) 与 [docs/DEVELOPMENT-OPERATING-MECHANISM.md](docs/DEVELOPMENT-OPERATING-MECHANISM.md)，界面约束见 [design/DESIGN.md](design/DESIGN.md)。
 
 ## 已实现
 
@@ -16,6 +16,10 @@ WorkPanda 是面向群众的自然语言公共服务入口。当前仓库处于*
 - 关键动作的服务端一次性确认凭证（绑定任务、流程版本、步骤和参数摘要）；
 - **流程定义持久化**：版本不可变、发布状态由指针表达；发布/停用/回滚 = 移动指针，
   历史版本保留，回滚后在途任务仍按创建时的版本继续（Issue #49）；
+- **发布前回放**：按 `(flow_id, version)` 用固定用例跑一遍，断言步骤序列、工具集合、
+  终态与"不得出现未授权工具"；回放用不持有工具注册表的隔离执行器，带副作用的工具
+  一律按未确认记账。用例与版本一起存库，有用例时回放未通过不得发布
+  （见 [docs/SOP-REPLAY.md](docs/SOP-REPLAY.md)，Issue #50）；
 - 签名会话令牌、任务归属隔离与按会话限流；
 - **通用 harness 受控执行层**：工具白名单、参数校验、四重预算（步数/调用/token/耗时）、
   工具限期执行与有界重试、非幂等操作防重复提交、逐次留痕；
@@ -35,7 +39,7 @@ WorkPanda 是面向群众的自然语言公共服务入口。当前仓库处于*
 - 真实业务系统工具（尚无外部 API 接入）；
 - Octop 控制台插件、Octop Browser；
 - 登录、实名核验、权限分级与审计后台；
-- 流程管理后台与发布审核（Issue #51）、发布前回放测试（Issue #50）；
+- 流程管理后台与发布审核（Issue #51）：回放与门禁已可用，但操作面仍是脚本；
 - PostgreSQL、多实例部署、监控告警。
 
 ## 环境要求
@@ -134,6 +138,8 @@ uvicorn workpanda.main:app --app-dir src --reload
 | `WORKPANDA_HARNESS_RESUME_TTL_SECONDS` | `900` | 断点保留时限，超时拒绝续跑 |
 | `WORKPANDA_HARNESS_ALLOWED_HOSTS` | 空 | 逗号分隔的 http 工具域名白名单；为空则不注册 |
 | `WORKPANDA_ENABLE_DEMO_FLOW` | `true` | 启用骨架自检流程 `demo.generic` |
+| `WORKPANDA_REPLAY_RELEASE_GATE` | `true` | 该版本有回放用例时，回放未通过不得发布 |
+| `WORKPANDA_REPLAY_TIMEOUT_SECONDS` | `10` | 单条回放用例的时限；超时判"无结论" |
 
 运维访问控制（角色、凭据轮换、TLS、回退）见
 [docs/OPS-ACCESS-CONTROL.md](docs/OPS-ACCESS-CONTROL.md)。
@@ -155,8 +161,8 @@ ruff check .
 ```text
 src/workpanda/
 ├── api/             路由、错误映射、依赖
-├── application/     任务服务、流程推进器、端口协议
-├── domain/          状态机、流程定义、确认凭证、存储协议
+├── application/     任务服务、流程推进器、回放与发布门禁、端口协议
+├── domain/          状态机、流程定义、回放用例与断言、确认凭证、存储协议
 ├── harness/         通用受控执行层（工具循环、预算、脱敏、留痕、契约）
 ├── infrastructure/  内存/SQLite 存储、事件总线
 ├── bootstrap.py     依赖装配
@@ -164,7 +170,7 @@ src/workpanda/
 └── main.py          应用入口
 
 tests/               单元与接口测试
-scripts/             端到端冒烟脚本
+scripts/             端到端冒烟、压测与回放脚本
 docs/                架构、受控执行层与开发运营机制
 design/              UI/UX 设计契约
 ```

@@ -8,12 +8,15 @@ from dataclasses import dataclass, field
 
 from workpanda.api.ops_auth import OpsAccessPolicy, build_ops_policy
 from workpanda.application.ports import Executor, IntentRouter
+from workpanda.application.release import FlowReleaseService
+from workpanda.application.replay import FlowReplay
 from workpanda.application.runner import FlowRunner
 from workpanda.application.task_service import TaskService
 from workpanda.config import Settings, get_settings
 from workpanda.domain.flow import FlowDefinition, FlowRegistry, FlowStore, FlowVersionExists
 from workpanda.domain.identity import SessionSigner, new_secret
 from workpanda.domain.intent import IntentRule, RuleIntentRouter
+from workpanda.domain.replay import ReplayCaseStore
 from workpanda.domain.repository import ConfirmationStore, TaskStore
 from workpanda.harness.audit import AuditJournal, JsonlAuditJournal, NullAuditJournal
 from workpanda.harness.budget import BudgetLedger
@@ -47,6 +50,10 @@ from workpanda.infrastructure.redis_shared_state import (
     RedisSharedState,
     RedisStepLeaseStore,
 )
+from workpanda.infrastructure.replay_cases import (
+    InMemoryReplayCaseStore,
+    SqliteReplayCaseStore,
+)
 from workpanda.infrastructure.sqlite_cancel_store import SqliteCancelSignalStore
 from workpanda.infrastructure.sqlite_checkpoint_store import SqliteCheckpointStore
 from workpanda.infrastructure.sqlite_flow_store import SqliteFlowStore
@@ -74,6 +81,12 @@ class Container:
     cancellations: CancelRegistry
     # 工具线程台账：超时后仍在跑的线程数。只有 harness 分支才有，其余为 None。
     tool_threads: Callable[[], dict[str, int]] | None = None
+    # 流程版本库。测试注入定义时为 None（那些定义不落库）。
+    flow_store: FlowStore | None = None
+    # 回放用例库。与流程版本同后端：用例跟着版本走，换后端不该丢基线。
+    replay_cases: ReplayCaseStore | None = None
+    # 发布门禁。没有版本库时无从裁决，为 None。
+    release: FlowReleaseService | None = None
     closers: list = field(default_factory=list)
 
     def close(self) -> None:
@@ -139,6 +152,21 @@ def build_flow_store(settings: Settings) -> tuple[FlowStore, list[Callable[[], N
         store = SqliteFlowStore(settings.sqlite_path)
         return store, [store.close]
     return InMemoryFlowStore(), []
+
+
+def build_replay_case_store(
+    settings: Settings,
+) -> tuple[ReplayCaseStore, list[Callable[[], None]]]:
+    """回放用例库。与流程版本同后端：用例跟着版本走，换后端不该丢基线。
+
+    sqlite 时同库同文件：发布门禁要"读版本 + 读用例"，同一个连接才能避免读到
+    两个时刻的库。
+    """
+
+    if settings.store_backend == "sqlite":
+        store = SqliteReplayCaseStore(settings.sqlite_path)
+        return store, [store.close]
+    return InMemoryReplayCaseStore(), []
 
 
 def seed_demo_flows(store: FlowStore, *, enabled: bool) -> None:
@@ -292,12 +320,26 @@ def build_container(
     if flows is not None:
         # 测试与嵌入场景直接给定义：不落库，也不碰库里已有的版本。
         registry = FlowRegistry(flows)
+        flow_store: FlowStore | None = None
     else:
         # 流程定义以库为准：进程内不再有"代码里那一份"作为第二个真相。
         flow_store, flow_closers = build_flow_store(settings)
         closers.extend(flow_closers)
         seed_demo_flows(flow_store, enabled=settings.enable_demo_flow)
         registry = FlowRegistry.from_store(flow_store)
+    replay_cases, replay_closers = build_replay_case_store(settings)
+    closers.extend(replay_closers)
+    # 发布门禁只在有版本库时成立：注入定义的那些定义不在库里，"发布"无从谈起。
+    release = (
+        FlowReleaseService(
+            flows=flow_store,
+            cases=replay_cases,
+            replay=FlowReplay(timeout_seconds=settings.replay_timeout_seconds),
+            gate_enabled=settings.replay_release_gate,
+        )
+        if flow_store is not None
+        else None
+    )
     registered = registry.versions()
     broker = EventBroker()
     # 共享状态后端先建：取消信号、步骤租约、预算账本三处共用同一个连接与键前缀。
@@ -416,5 +458,8 @@ def build_container(
         audit=audit,
         cancellations=cancellations,
         tool_threads=tool_threads,
+        flow_store=flow_store,
+        replay_cases=replay_cases,
+        release=release,
         closers=closers,
     )

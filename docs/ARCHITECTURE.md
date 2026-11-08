@@ -76,6 +76,19 @@ infrastructure/  存储、事件总线
 `require` 不看发布状态是因为回滚只移动指针：若它也要求"当前已发布"，一次回滚就会让
 在途任务的回答与确认全部失败。
 
+**发布前回放**（`domain/replay.py`、`application/replay.py`、`application/release.py`）：
+
+- 用例绑定 `(flow_id, version)` 存库（`replay_cases`），是数据不是代码；
+- 回放用不持有工具注册表的隔离执行器 `ReplayExecutor` 跑完整链路，观测步骤序列、
+  工具调用（名 + 参数摘要）与终态；带副作用的工具一律按 `unconfirmed` + `replay=true` 记账；
+- 断言四件事：步骤序列、工具集合、终态、以及"工具调用不得越过所在步骤的声明"（未授权工具）；
+- 判定分 `pass`/`fail`/`invalid`/`unconfirmed`/`aborted`：用例写错与流程回归分开报，
+  超时与崩溃一律"无结论"，谁也不降级成通过；
+- 门禁（`FlowReleaseService`）先裁决再移动指针：该版本有回放用例时，未通过即拦下，
+  指针不动。没有用例的版本照旧可发，但报告里明确标出"没有回放依据"。
+
+细节见 [SOP-REPLAY.md](SOP-REPLAY.md)。
+
 ### 3.2 状态机（`domain/state_machine.py`）
 
 ```text
@@ -197,13 +210,16 @@ created → running → waiting_for_user → running
 - 事件总线与限流都是单进程内实现，多实例部署需要外部共享组件；
 - 会话是匿名签名令牌，不是实名认证，也没有权限分级；
 - 无流程管理后台：流程定义已从库加载（版本不可变 + 发布指针 + 回滚），但编辑与发布
-  仍需直接调用存储接口，运维没有操作面（Issue #51）；发布前回放测试同样未实现（Issue #50）；
+  仍需直接调用存储接口，运维没有操作面（Issue #51）；发布前回放已可用，但入口是
+  脚本 `scripts/replay_flow.py`，不是界面；
 - 意图路由是确定性规则（`domain/intent.py`），默认无规则即"识别不了→澄清"，
   尚未接入模型分类，也没有同义改写能力；
 - 群众可见状态由服务端映射（`domain/presentation.py`，随 `TaskView.ui_state` 下发），
   但只到状态键与文案，组件与无障碍由前端实现；
 - harness 的工具是同步执行，预算按调用次数与耗时计（不按 token），无 checkpoint 恢复；
 - 尚无真实业务系统工具，外部访问能力默认关闭（`http_fetch` 需显式白名单）；
+- 回放只观测"步骤要求调用哪个工具"，不覆盖"模型实际调用了几次"；回放报告不落库，
+  需要留档时自行保存命令行输出；
 - 无审计日志与指标导出。
 
 ## 7. 下一步建议顺序
