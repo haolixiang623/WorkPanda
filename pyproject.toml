@@ -26,7 +26,10 @@ dev = [
 packages = ["src/workpanda"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+# `mock-site` 也在这里：模拟站是独立应用（不进 `src/`），但它的接口级回归要和全量
+# 测试一起跑，否则「靶子自己坏了」不会在 CI 里红。它只提供 `mock_site` 一个包名，
+# 与产品包不重叠。
+pythonpath = ["src", "mock-site"]
 asyncio_mode = "auto"
 
 [tool.ruff]
