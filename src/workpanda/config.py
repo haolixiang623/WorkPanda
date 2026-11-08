@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     # 运维只读凭据能看任务明细，不能改流程的确认语义与工具白名单。
     # 未配置时 /api/admin/* 整体不可用（404），不接受 ops_tokens 代用。
     admin_tokens: str = ""
+    # 工作人员凭据：`主体:staff:密钥`，多个用逗号分隔。与 ops / admin 完全独立，
+    # 角色只接受 `staff`——工作人员的"能对哪些流程做什么动作"不写在凭据里，
+    # 而是维护在工作人员目录（`/api/admin/identities/staff/*`）中，改授权不必换凭据。
+    # 未配置时 /api/staff/* 整体不可用（404），不接受 ops / admin 凭据代用。
+    staff_tokens: str = ""
     # 网络绑定与 TLS。默认只监听回环且不启用 TLS，也就是"不对外暴露"的状态。
     bind_host: str = "127.0.0.1"
     bind_port: int = 8000
