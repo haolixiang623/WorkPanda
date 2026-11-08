@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from workpanda.api.ops_auth import OpsAccessPolicy, build_ops_policy
 from workpanda.application.admin_flows import AdminFlowService
 from workpanda.application.deeplink_confirm import ConfirmationLinkService
+from workpanda.application.im_cards import CardQueue, NotifyingEventPublisher
+from workpanda.application.im_gateway import ImGatewayService, ReadOnlyTasks
 from workpanda.application.intent_eval import IntentEvalRunner, IntentReleaseGate
 from workpanda.application.intent_routing import RegistryIntentRouter, router_for
 from workpanda.application.ports import Executor, IntentRouter
@@ -22,6 +24,7 @@ from workpanda.config import Settings, get_settings
 from workpanda.domain.deeplink import ConfirmationLinkStore
 from workpanda.domain.flow import FlowDefinition, FlowRegistry, FlowStore, FlowVersionExists
 from workpanda.domain.identity import SessionSigner, new_secret
+from workpanda.domain.im_gateway import CardSender, ImGatewayStore
 from workpanda.domain.intent import RuleIntentRouter
 from workpanda.domain.replay import ReplayCaseStore
 from workpanda.domain.repository import ConfirmationStore, TaskStore
@@ -49,6 +52,10 @@ from workpanda.infrastructure.deeplink_store import (
 )
 from workpanda.infrastructure.demo_flows import demo_flows
 from workpanda.infrastructure.event_broker import EventBroker
+from workpanda.infrastructure.im_gateway_store import (
+    InMemoryImGatewayStore,
+    SqliteImGatewayStore,
+)
 from workpanda.infrastructure.memory_store import (
     InMemoryConfirmationStore,
     InMemoryFlowStore,
@@ -72,6 +79,13 @@ from workpanda.infrastructure.sqlite_flow_store import SqliteFlowStore
 from workpanda.infrastructure.sqlite_store import SqliteStore
 from workpanda.infrastructure.sqlite_trace_store import SqliteTraceStore
 from workpanda.infrastructure.staff_store import InMemoryStaffStore, SqliteStaffStore
+from workpanda.infrastructure.wecom import (
+    WeComCallbackAdapter,
+    WeComCardSender,
+    WeComConfigError,
+    validate_wecom_config,
+    validate_wecom_outbound,
+)
 
 
 @dataclass
@@ -114,6 +128,13 @@ class Container:
     admin_flows: AdminFlowService | None = None
     # 工作人员目录的维护入口（管理侧接口用）。目录本身始终存在。
     staff_directory: StaffDirectoryService | None = None
+    # IM 网关（N4）。未配置企业微信回调参数时为 None，`/api/im/*` 整体按不存在处理。
+    im_gateway: ImGatewayService | None = None
+    # 入站去重与投递留痕。网关没启用时也建着：它是"这条消息处理过没有"的唯一真相，
+    # 开关一次不该把历史抹掉。
+    im_store: ImGatewayStore | None = None
+    # 出站卡片队列。没配发送凭据或站点根时为 None，事件发布直接走总线。
+    im_cards: CardQueue | None = None
     closers: list = field(default_factory=list)
 
     def close(self) -> None:
@@ -207,6 +228,82 @@ def build_confirmation_link_store(
         store = SqliteConfirmationLinkStore(settings.sqlite_path)
         return store, [store.close]
     return InMemoryConfirmationLinkStore(), []
+
+
+def build_im_store(settings: Settings) -> tuple[ImGatewayStore, list[Callable[[], None]]]:
+    """入站去重与投递留痕。跟随任务存储：sqlite 时与任务库同文件。
+
+    同库不是为了省事：重启后"这条消息处理过没有"必须还在，否则 IM 重投会被
+    当成新消息，重复回卡片。
+    """
+
+    if settings.store_backend == "sqlite":
+        store = SqliteImGatewayStore(settings.sqlite_path)
+        return store, [store.close]
+    return InMemoryImGatewayStore(), []
+
+
+def build_im_gateway(
+    settings: Settings,
+    *,
+    staff_store: StaffStore,
+    im_store: ImGatewayStore,
+    tasks,
+    sender: CardSender | None,
+) -> tuple[ImGatewayService | None, list[Callable[[], None]]]:
+    """装配 IM 网关。三项回调配置全空时返回 None：`/api/im/*` 整体按不存在处理。
+
+    与 staff 凭据同一个立场——**没有配置就是没有这个入口**，而不是"存在但每次都
+    报错"。后者会把一个配置问题变成一串看起来像攻击的 400。
+    """
+
+    # 先校验再判"配没配"：半套配置（配了 token 却漏了密钥）必须启动即失败，
+    # 而不是被当成"没配置"静默关掉——那是一种没人会发现的失效。
+    token, aes_key, corp_id = validate_wecom_config(
+        token=settings.wecom_callback_token,
+        encoding_aes_key=settings.wecom_encoding_aes_key,
+        corp_id=settings.wecom_corp_id,
+    )
+    # 站点根在这里读一次：格式错误（带路径、漏 scheme）要在启动期就失败，
+    # 而不是等第一张卡片发出去才指向一个 404。
+    console_base = settings.staff_console_base
+    corp_secret, agent_id = validate_wecom_outbound(
+        corp_secret=settings.wecom_corp_secret,
+        agent_id=settings.wecom_agent_id,
+        console_base_url=console_base,
+    )
+    if not token:
+        if corp_secret:
+            # 出站只在网关装配之后才可能发生。没有回调配置就没有网关，
+            # 此时配了发送凭据只会得到"任务在跑、卡片没有"——按配置错误处理。
+            raise WeComConfigError(
+                "配置了企业微信出站凭据，但没有回调配置：网关不会装配，卡片发不出去。"
+                "请补齐 wecom_callback_token / wecom_encoding_aes_key / wecom_corp_id，"
+                "或清空出站凭据。"
+            )
+        return None, []
+    adapter = WeComCallbackAdapter(token=token, encoding_aes_key=aes_key, corp_id=corp_id)
+    closers: list[Callable[[], None]] = []
+    if sender is None and corp_secret:
+        # 出站凭据齐全才建真实发送器；留空表示只接入站，投递记成 skipped。
+        real_sender = WeComCardSender(
+            corp_id=corp_id,
+            corp_secret=corp_secret,
+            agent_id=agent_id,
+            timeout_seconds=settings.wecom_timeout_seconds,
+        )
+        sender = real_sender
+        closers.append(real_sender.close)
+    gateway = ImGatewayService(
+        adapter=adapter,
+        resolver=ImIdentityResolver(staff_store),
+        staff_store=staff_store,
+        tasks=tasks,
+        store=im_store,
+        sender=sender,
+        console_base_url=console_base,
+    )
+    return gateway, closers
 
 
 def build_replay_case_store(
@@ -353,6 +450,7 @@ def build_container(
     flows: list[FlowDefinition] | None = None,
     executor: Executor | None = None,
     router: IntentRouter | None = None,
+    im_sender: CardSender | None = None,
 ) -> Container:
     settings = settings or get_settings()
     # 部署形态门禁最先跑：声明多实例却仍用进程内状态时，不能先占住存储/连接
@@ -449,6 +547,32 @@ def build_container(
     link_store, link_closers = build_confirmation_link_store(settings)
     closers.extend(link_closers)
     broker = EventBroker()
+    # IM 网关只拿只读任务视图（ReadOnlyTasks）：它没有 commit/answer/confirm/cancel
+    # 可调用，"网关不会改任务状态"因此是没有入口，而不是自觉。
+    im_store, im_store_closers = build_im_store(settings)
+    closers.extend(im_store_closers)
+    im_gateway, im_gateway_closers = build_im_gateway(
+        settings,
+        staff_store=staff_store,
+        im_store=im_store,
+        tasks=ReadOnlyTasks(store),
+        sender=im_sender,
+    )
+    closers.extend(im_gateway_closers)
+    # 出站卡片走队列：发送在后台线程里做，流程线程只投一个任务号。缺站点根或
+    # 缺发送凭据时不建队列，事件发布直接走总线（少一个线程，也少一类"发了但
+    # 打不开"的卡片）。
+    im_cards: CardQueue | None = None
+    if (
+        im_gateway is not None
+        and im_gateway.sender is not None
+        and im_gateway.console_base_url
+    ):
+        im_cards = CardQueue(
+            im_gateway.notify_task, capacity=settings.im_card_queue_capacity
+        )
+        closers.append(im_cards.close)
+    publisher = NotifyingEventPublisher(broker, im_cards)
     # 共享状态后端先建：取消信号、步骤租约、预算账本三处共用同一个连接与键前缀。
     shared_state, shared_closers = build_shared_state(settings)
     closers.extend(shared_closers)
@@ -526,7 +650,7 @@ def build_container(
         store=store,
         confirmations=confirmations,
         executor=executor_instance,
-        publisher=broker,
+        publisher=publisher,
         flows=registry,
         confirmation_ttl_seconds=settings.confirmation_ttl_seconds,
     )
@@ -576,5 +700,8 @@ def build_container(
         release=release,
         admin_flows=admin_flows,
         staff_directory=staff_directory,
+        im_gateway=im_gateway,
+        im_store=im_store,
+        im_cards=im_cards,
         closers=closers,
     )

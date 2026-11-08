@@ -19,6 +19,27 @@ from workpanda.domain.intent_sample import MIN_NEAR_MISS_SAMPLES, MIN_POSITIVE_S
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
 
+def _validated_site_root(raw: str, field: str) -> str:
+    """校验"站点根"配置：必须是带 scheme 的 http(s) 地址，且不带路径。
+
+    两个配置项（深链落地前缀、工作人员任务页）共用这一份校验。带路径的地址会与
+    自身的落地路径拼成 `/confirm/confirm` 或 `/tasks/tasks`，而那种 404 会被当成
+    "链接过期"。宁可在启动时就拒绝。
+    """
+
+    value = (raw or "").strip()
+    if not value:
+        return ""
+    parts = urlsplit(value)
+    if parts.scheme not in {"http", "https"} or not parts.netloc:
+        raise ValueError(
+            f"{field} 必须是带 scheme 的地址（例如 https://wpa.example.com）：{value}"
+        )
+    if parts.path not in {"", "/"} or parts.query or parts.fragment:
+        raise ValueError(f"{field} 只能是不带路径的站点根：{value}")
+    return value.rstrip("/")
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="WORKPANDA_", env_file=".env", extra="ignore")
 
@@ -61,6 +82,24 @@ class Settings(BaseSettings):
     # 而是维护在工作人员目录（`/api/admin/identities/staff/*`）中，改授权不必换凭据。
     # 未配置时 /api/staff/* 整体不可用（404），不接受 ops / admin 凭据代用。
     staff_tokens: str = ""
+    # 企业微信网关（N4）。三项回调配置必须同时给出，缺一项启动即失败：
+    # 半套配置会让接口看起来开着、实际每条回调都失败，而那看起来像"对方配错了"。
+    # token 与 EncodingAESKey 来自企业微信后台的回调配置，corp_id 是企业 ID——
+    # 它同时用于校验解密后的 receive_id（挡住"发给别家企业微信的包"）。
+    wecom_callback_token: str = ""
+    wecom_encoding_aes_key: str = ""
+    wecom_corp_id: str = ""
+    # 出站发卡片需要的应用凭据。留空表示"只接入站、不发卡片"：投递会被记成
+    # skipped 而不是 failed，因为那不是故障，是没启用。
+    wecom_corp_secret: str = ""
+    wecom_agent_id: int = 0
+    wecom_timeout_seconds: float = 5.0
+    # 工作人员端任务页面的站点根（形如 https://wpa.example.com，不带路径）。
+    # 卡片里的深链由它拼出；留空则不发出站卡片——服务端不猜自己的对外域名，
+    # 猜错的后果是卡片指向一个不存在的站点，而排障会先怀疑代码。
+    staff_console_base_url: str = ""
+    # 出站卡片队列容量。满了就丢卡片（只记日志），绝不阻塞任务推进。
+    im_card_queue_capacity: int = 200
     # 网络绑定与 TLS。默认只监听回环且不启用 TLS，也就是"不对外暴露"的状态。
     bind_host: str = "127.0.0.1"
     bind_port: int = 8000
@@ -262,19 +301,17 @@ class Settings(BaseSettings):
         "深链过期了吗"开始查——那是最难查的一类问题。
         """
 
-        raw = self.confirmation_link_base_url.strip()
-        if not raw:
-            return ""
-        parts = urlsplit(raw)
-        if parts.scheme not in {"http", "https"} or not parts.netloc:
-            raise ValueError(
-                f"confirmation_link_base_url 必须是带 scheme 的地址（例如 https://wpa.example.com）：{raw}"
-            )
-        if parts.path not in {"", "/"} or parts.query or parts.fragment:
-            # 带路径的地址会与卡片自身的落地路径拼成 `/confirm/confirm`，
-            # 而那种 404 会被当成"深链过期"。宁可在启动时就拒绝。
-            raise ValueError(f"confirmation_link_base_url 只能是不带路径的站点根：{raw}")
-        return raw.rstrip("/")
+        return _validated_site_root(self.confirmation_link_base_url, "confirmation_link_base_url")
+
+    @property
+    def staff_console_base(self) -> str:
+        """工作人员端任务页面的站点根。校验规则与深链前缀完全一致。
+
+        两个地址分开配置而不是共用一个：深链落到确认页，卡片落到任务页，
+        它们未来可能不是同一个站点（确认页要对外、任务页只在办公网）。
+        """
+
+        return _validated_site_root(self.staff_console_base_url, "staff_console_base_url")
 
     @field_validator("confirmation_link_ttl_seconds")
     @classmethod
