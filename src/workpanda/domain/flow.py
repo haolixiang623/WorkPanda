@@ -2,9 +2,15 @@
 
 流程定义只存在于服务端，不下发到浏览器，也不允许模型生成或改写步骤。
 本模块只描述结构与校验，不包含任何具体业务事项。
+
+版本与发布：版本内容不可变，发布状态由**指针**表达（见 `FlowStore`）。同一条
+记录既当"已发布"又当"草稿"必然漂移，所以库里只存版本，指针只有一个。
 """
 
+from __future__ import annotations
+
 from enum import StrEnum
+from typing import Protocol
 
 from pydantic import BaseModel, Field
 
@@ -66,26 +72,95 @@ class FlowNotRunnable(ValueError):
     """流程存在但未发布。"""
 
 
+class FlowVersionExists(ValueError):
+    """同一 (flow_id, version) 已存在。版本不可变，不允许覆盖。"""
+
+
+class FlowReleaseMissing(LookupError):
+    """发布指针指向的版本不存在。"""
+
+
+class FlowStore(Protocol):
+    """流程定义的持久化端口。
+
+    只表达两件事：**有哪些版本**、**哪个版本是当前发布指针**。发布状态不写进
+    版本内容——否则"发布"要改两条记录，改一半就是两种真相。
+    """
+
+    def add_version(self, flow: FlowDefinition) -> None:
+        """新增一个版本。已存在则抛 `FlowVersionExists`，绝不覆盖。"""
+
+    def publish(self, flow_id: str, version: str) -> None:
+        """把发布指针移向指定版本。版本不存在则抛 `FlowReleaseMissing`。"""
+
+    def disable(self, flow_id: str) -> None:
+        """清空发布指针。历史版本保留，回滚就是再把指针移回去。"""
+
+    def published_versions(self) -> dict[str, str]:
+        """`flow_id -> 已发布版本`。没有指针的流程不出现在结果里。"""
+
+    def list_versions(self, flow_id: str | None = None) -> list[FlowDefinition]:
+        """按 `(flow_id, version)` 排序返回版本，不做发布状态过滤。"""
+
+
 class FlowRegistry:
-    """进程内流程目录；生产环境应由持久化配置和发布审核替代。"""
+    """进程内流程目录。启动时由 `FlowStore` 装载，运行期只读。
+
+    发布状态在装载时**派生**：指针指向的版本是 `PUBLISHED`，其余是 `DRAFT`。
+    因此版本内容里的 `status` 字段是作者态标记，不参与运行语义。
+    """
 
     def __init__(self, flows: list[FlowDefinition] | None = None) -> None:
         self._flows: dict[tuple[str, str], FlowDefinition] = {}
         for flow in flows or []:
             self.register(flow)
 
+    @classmethod
+    def from_store(cls, store: FlowStore) -> FlowRegistry:
+        pointers = store.published_versions()
+        derived = [
+            flow.model_copy(
+                update={
+                    "status": (
+                        FlowStatus.PUBLISHED
+                        if pointers.get(flow.flow_id) == flow.version
+                        else FlowStatus.DRAFT
+                    )
+                }
+            )
+            for flow in store.list_versions()
+        ]
+        return cls(derived)
+
     def register(self, flow: FlowDefinition) -> None:
-        self._validate(flow)
+        validate_flow(flow)
         self._flows[(flow.flow_id, flow.version)] = flow
 
+    def versions(self) -> list[FlowDefinition]:
+        """全部版本（含未发布），按 `(flow_id, version)` 排序。
+
+        装配期裁剪意图规则时用：规则要指向**已注册**的流程，而不是"已发布"的
+        流程——后者会让一条草稿版本把规则悄悄裁掉。
+        """
+
+        return [flow for _, flow in sorted(self._flows.items())]
+
     def resolve(self, flow_id: str, version: str | None = None) -> FlowDefinition:
-        key = (flow_id, version) if version else None
-        if key is not None and key in self._flows:
-            return self._published(self._flows[key])
+        """取**可执行**的流程：新任务只能落在发布指针上。
+
+        指定版本时不做"退回最大版本"的兜底——那会让"请求 v2、拿到 v3"变成静默行为。
+        """
+
+        if version is not None:
+            try:
+                flow = self._flows[(flow_id, version)]
+            except KeyError as exc:
+                raise FlowNotFound(
+                    f"flow {flow_id!r} version {version!r} is not registered"
+                ) from exc
+            return self._published(flow)
         candidates = [
-            flow
-            for (registered_id, _), flow in self._flows.items()
-            if registered_id == flow_id
+            flow for (registered_id, _), flow in self._flows.items() if registered_id == flow_id
         ]
         if not candidates:
             raise FlowNotFound(f"flow {flow_id!r} is not registered")
@@ -95,11 +170,18 @@ class FlowRegistry:
         return max(published, key=lambda flow: flow.version)
 
     def require(self, flow_id: str, version: str) -> FlowDefinition:
+        """取**已存在**的版本，不检查发布状态。
+
+        已建任务必须能继续跑：回滚只移动发布指针，若这里也要求"当前已发布"，
+        一次回滚就会让在途任务的回答与确认全部失败。新任务的准入走 `resolve`。
+        """
+
         try:
-            flow = self._flows[(flow_id, version)]
+            return self._flows[(flow_id, version)]
         except KeyError as exc:
-            raise FlowNotFound(f"flow {flow_id!r} version {version!r} is not registered") from exc
-        return self._published(flow)
+            raise FlowNotFound(
+                f"flow {flow_id!r} version {version!r} is not registered"
+            ) from exc
 
     @staticmethod
     def _published(flow: FlowDefinition) -> FlowDefinition:
@@ -107,22 +189,26 @@ class FlowRegistry:
             raise FlowNotRunnable(f"flow {flow.flow_id!r} is not published")
         return flow
 
-    @staticmethod
-    def _validate(flow: FlowDefinition) -> None:
-        seen: set[str] = set()
-        for step in flow.steps:
-            if step.step_id in seen:
-                raise ValueError(f"duplicate step_id {step.step_id!r} in flow {flow.flow_id!r}")
-            seen.add(step.step_id)
-            if step.kind is StepKind.EXECUTE:
-                if not step.tool:
-                    raise ValueError(f"execute step {step.step_id!r} must declare a tool")
-            else:
-                if step.tool:
-                    raise ValueError(
-                        f"step {step.step_id!r} may only declare a tool when executing"
-                    )
-                if step.requires_confirmation:
-                    raise ValueError(
-                        f"step {step.step_id!r} may only require confirmation when executing"
-                    )
+
+def validate_flow(flow: FlowDefinition) -> None:
+    """结构与权限的自洽校验。持久化之前和装载之后都要过这一道。
+
+    放在模块级而不是 `FlowRegistry` 的私有方法里：存储层写入一条版本时也必须
+    校验，否则"库里有一条跑不起来的流程"会直到第一次执行才暴露。
+    """
+
+    seen: set[str] = set()
+    for step in flow.steps:
+        if step.step_id in seen:
+            raise ValueError(f"duplicate step_id {step.step_id!r} in flow {flow.flow_id!r}")
+        seen.add(step.step_id)
+        if step.kind is StepKind.EXECUTE:
+            if not step.tool:
+                raise ValueError(f"execute step {step.step_id!r} must declare a tool")
+        else:
+            if step.tool:
+                raise ValueError(f"step {step.step_id!r} may only declare a tool when executing")
+            if step.requires_confirmation:
+                raise ValueError(
+                    f"step {step.step_id!r} may only require confirmation when executing"
+                )
