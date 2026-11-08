@@ -190,6 +190,9 @@ created → running → waiting_for_user → running
   能对哪些流程做什么动作由工作人员目录授予，**不继承** `admin` 的流程编辑能力；
   IM 身份通过显式映射表换成工作人员主体，未映射者一律拒绝并留痕，见
   [STAFF-IDENTITY.md](STAFF-IDENTITY.md)；
+- 企业微信网关 `/api/im/wecom/callback` 是**通道**：验签 → 幂等去重 → 身份解析 →
+  固定命令（`状态 <task_id>`）；它只拿到只读任务视图，没有任何改任务状态的入口。
+  出站卡片只有状态与深链，发送失败只留痕、不阻塞流程，见 [IM-GATEWAY.md](IM-GATEWAY.md)；
 - 控制台只读，不写业务状态，避免双写冲突。
 
 ## 4. 接口
@@ -209,6 +212,8 @@ created → running → waiting_for_user → running
 | GET | `/api/staff/tasks/{task_id}/confirmation-links/attempts` | 深链留痕（谁发的 / 谁点开的 / 为什么打不开） |
 | POST | `/api/tasks/{task_id}/confirmation-link` | 深链落地：只回答"该确认哪一步"，**不签发凭证** |
 | * | `/api/admin/identities/*` | 工作人员目录与 IM 身份映射维护（管理侧凭据） |
+| GET | `/api/im/wecom/callback` | 企业微信回调 URL 验证：验签后回显 `echostr` |
+| POST | `/api/im/wecom/callback` | 企业微信消息回调：验签 → 去重 → 身份解析 → 固定命令；成功一律空 body |
 
 客户端不直接指定工具、步骤或流程推进方式。
 
@@ -229,6 +234,9 @@ created → running → waiting_for_user → running
 | 401 | `staff_token_invalid` | 工作人员凭据无效 |
 | 403 | `staff_not_provisioned` | 主体未开通工作人员身份或已停用 |
 | 403 | `im_identity_unmapped` 等 | IM 身份未映射到可用的工作人员（`im_identity_disabled` / `im_principal_missing` / `im_principal_disabled`） |
+| 403 | `im_signature_invalid` | 企业微信回调验签失败；不进入业务层 |
+| 400 | `im_payload_invalid` | 回调体不可解析（非 XML/未加密/解密后 `receive_id` 不符） |
+| 413 | `im_payload_too_large` | 回调体超过上限，在读 body 之前按 `Content-Length` 拒绝 |
 | 429 | `rate_limited` | 请求过于频繁，按 `Retry-After` 重试 |
 
 ## 6. 已知限制
@@ -243,8 +251,8 @@ created → running → waiting_for_user → running
   尚未接入模型分类，也没有同义改写能力；规则随流程版本走（`FlowDefinition.intent_rules`，
   只从已发布版本收集，发布后惰性重建），但管理页还没有规则表单；
 - 工作人员侧目前只有"我是谁 / 我能对哪些流程做什么 / 为待确认步骤发深链"，仍然没有
-  任何能推进流程状态或签发确认凭证的入口（企业微信网关见 Issue #64）；深链落地页与
-  卡片投递由前端与网关实现，本仓库只提供接口；IM 身份映射需手工维护，未做组织架构同步；
+  任何能推进流程状态或签发确认凭证的入口；企业微信网关已接入（#64），但**未与真实租户
+  联调**，卡片上的任务页与深链落地页仍由前端实现；IM 身份映射需手工维护，未做组织架构同步；
 - 群众可见状态由服务端映射（`domain/presentation.py`，随 `TaskView.ui_state` 与
   `ui_title`/`ui_hint` 下发）。群众侧最小页面在 `web/`（Issue #77），状态只从
   `GET /api/tasks/{id}` 派生、事件流仅作触发刷新，静态托管默认只挂回环；但
