@@ -176,6 +176,11 @@ def build_replay_case_store(
     return InMemoryReplayCaseStore(), []
 
 
+# 装配期播种是系统动作，没有「已鉴权的人」可用。用固定的、明显不是人员主体的
+# 名字，避免把启动过程伪装成某位运维的发布；真正的发布一律走管理侧接口署名。
+BOOTSTRAP_ACTOR = "bootstrap"
+
+
 def seed_demo_flows(store: FlowStore, *, enabled: bool) -> None:
     """把骨架自检流程同步到库里的真实状态。
 
@@ -188,13 +193,13 @@ def seed_demo_flows(store: FlowStore, *, enabled: bool) -> None:
 
     for flow in demo_flows():
         if not enabled:
-            store.disable(flow.flow_id)
+            store.disable(flow.flow_id, actor=BOOTSTRAP_ACTOR)
             continue
         try:
             store.add_version(flow)
         except FlowVersionExists:
             pass
-        store.publish(flow.flow_id, flow.version)
+        store.publish(flow.flow_id, flow.version, actor=BOOTSTRAP_ACTOR)
 
 
 def build_shared_state(

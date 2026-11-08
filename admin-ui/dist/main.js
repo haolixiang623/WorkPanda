@@ -28,6 +28,10 @@ function escapeHtml(raw) {
         return table[char] ?? char;
     });
 }
+/** 结果消息里的署名片段；服务端没给就不显示，绝不本地编一个主体名。 */
+function actorSuffix(actor, label) {
+    return actor ? `；${label}：<strong>${escapeHtml(actor)}</strong>` : "";
+}
 function showMessage(kind, html) {
     const box = el("message");
     box.className = kind;
@@ -153,6 +157,16 @@ function renderFlows(flows) {
             tag.className = "tag off";
             tag.textContent = "草稿";
             stateCell.replaceChildren(tag);
+        }
+        // 责任锚点：已发布显示发布人，停用后显示最近停用人；服务端没有署名时留空。
+        const actorNote = flow.published
+            ? (flow.published_by ? `发布人：${flow.published_by}` : "")
+            : (flow.disabled_by ? `最近停用：${flow.disabled_by}` : "");
+        if (actorNote !== "") {
+            const note = document.createElement("div");
+            note.className = "muted";
+            note.textContent = actorNote;
+            stateCell.append(note);
         }
         row.insertCell().textContent = String(flow.case_count);
         const actions = row.insertCell();
@@ -394,7 +408,8 @@ async function publish(flow, apply) {
     try {
         const outcome = await api(`/api/admin/flows/${encodeURIComponent(flow.flow_id)}/publish`, "POST", { version: flow.version, apply });
         showMessage("ok", `<strong>${outcome.published ? "已发布" : "预演通过，未发布"}</strong>：` +
-            `${escapeHtml(outcome.message)}；回放门禁${outcome.replay_ran ? "已执行" : "未执行（该版本没有用例）"}。`);
+            `${escapeHtml(outcome.message)}；回放门禁${outcome.replay_ran ? "已执行" : "未执行（该版本没有用例）"}` +
+            `${outcome.published ? actorSuffix(outcome.published_by, "发布人") : ""}。`);
         await refreshFlows();
     }
     catch (error) {
@@ -405,8 +420,9 @@ async function publish(flow, apply) {
     }
 }
 async function rollback(flow) {
-    await api(`/api/admin/flows/${encodeURIComponent(flow.flow_id)}/rollback`, "POST", { version: flow.version });
-    showMessage("ok", `已回滚 ${escapeHtml(flow.flow_id)} 到 ${escapeHtml(flow.version)}；在途任务仍按各自版本继续。`);
+    const result = await api(`/api/admin/flows/${encodeURIComponent(flow.flow_id)}/rollback`, "POST", { version: flow.version });
+    showMessage("ok", `已回滚 ${escapeHtml(flow.flow_id)} 到 ${escapeHtml(flow.version)}；在途任务仍按各自版本继续` +
+        `${actorSuffix(result.published_by, "回滚操作人")}。`);
     await refreshFlows();
 }
 async function disable() {
@@ -414,8 +430,9 @@ async function disable() {
     if (flowId === "") {
         throw new Error("请先填写 flow_id。");
     }
-    await api(`/api/admin/flows/${encodeURIComponent(flowId)}/disable`, "POST");
-    showMessage("ok", `${escapeHtml(flowId)} 已停用（历史版本保留，可随时回滚）。`);
+    const result = await api(`/api/admin/flows/${encodeURIComponent(flowId)}/disable`, "POST");
+    showMessage("ok", `${escapeHtml(flowId)} 已停用（历史版本保留，可随时回滚）` +
+        `${actorSuffix(result.disabled_by, "停用操作人")}。`);
     await refreshFlows();
 }
 function bind(id, action) {

@@ -49,6 +49,13 @@ export WORKPANDA_ADMIN_TOKENS='duty01:viewer:<随机串>,sop01:admin:<随机串>
 草稿提交体没有 `status` 字段：版本内容里的 status 只是作者态标记，服务端固定写成
 `draft`，只有发布指针能让流程生效。前端因此无法构造出一个"自带 published"的版本。
 
+发布 / 回滚 / 停用的请求体同样**没有** `published_by`、`disabled_by`、`actor` 一类
+字段：署名一律取 `require_admin_role` 返回的 `OpsPrincipal.subject`，请求体里自报的
+同名字段被忽略（有回归）。理由与运维侧的人工备注一致——可自报的署名等于没有署名。
+三个操作的响应分别带 `published_by`（发布、回滚）与 `disabled_by`（停用），版本列表
+`GET /api/admin/flows` 的每一项也带当前指针上的两个署名，供事后核对「谁把 v3 换成了
+v4」。署名只记**最近一次**动作；预演（`apply=false`）不移动指针，返回 `null`。
+
 ## 3. 关键设计决策
 
 ### 3.1 发布后群众侧必须立即命中（本轮最重要的一处）
@@ -87,6 +94,23 @@ pydantic 先挡字段形状（422 带 `loc`），再由 `flow_field_errors()` �
 `ReplayReport.verdict` / `publishable` 是 property，不进 `model_dump()`。管理侧用
 `serialize_report()` 在服务端补齐这两个字段：否则前端只能从逐条结果自行重算门禁口径，
 迟早和后端对不上。
+
+### 3.5 发布署名与幂等迁移（#61）
+
+`FlowStore.publish(flow_id, version, *, actor)` 与 `disable(flow_id, *, actor)` 把
+`actor` 定为**仅关键字必填**参数：漏传是类型错误，不会静默记成空串。`flow_releases`
+在既有三列之外增加 `published_by` / `disabled_by`；`SqliteFlowStore` 启动时按
+`PRAGMA table_info` 判断并 `ALTER TABLE ... ADD COLUMN`，迁移可重复执行，旧行的两列为
+`NULL`（表示迁移前发生的操作没有署名），读取侧不猜、不回填。
+
+停用不再 `DELETE` 那一行——删掉会把 `disabled_by` 一起抹掉。改为在这行上写停用标记，
+`published_versions()` 过滤带标记的行，「没有指针」的对外语义不变；重新发布时清掉
+停用标记，避免界面同时显示两个互相矛盾的责任人。版本内容一行都不删，回滚就是
+一次 `publish`，所以 `published_by` 一并覆盖「谁回滚的」。
+
+装配期播种（`seed_demo_flows`）是系统动作，署名固定为 `bootstrap`，明显不是人员主体；
+CLI `scripts/replay_flow.py --publish` 必须显式给 `--actor`。本轮**不做双人复核，也不
+预留 `reviewed_by`**：留一个永远为空的字段会让人误以为环节存在但没人用。
 
 ## 4. 验收标准对照
 
@@ -144,6 +168,13 @@ pydantic 先挡字段形状（422 带 `loc`），再由 `flow_field_errors()` �
   新增 `tests/test_admin_flows_api.py` 22 项覆盖第 4 节表格。
 - 远端两项 CI（Python 检查、文档与敏感信息基础检查）在 PR head 与 main 均为 success。
 - 前端 `tsc --strict --noEmitOnError` 编译通过，产物 `admin-ui/dist/main.js` 已提交。
+- 发布署名（#61）：`tests/test_flow_store.py` 覆盖 actor 仅关键字必填 / 非空、发布与
+  回滚署名、停用与重新发布、旧库幂等迁移（旧数据为 `NULL`）、内存实现同语义；
+  `tests/test_admin_flows_api.py` 覆盖请求体伪造 `published_by` 无效、viewer 不能靠
+  伪造署名提权、预演不产生发布人。
+- 本轮环境未安装 `tsc`，`admin-ui/dist/main.js` 按 `src/main.ts` 逐处手工同步，
+  **未做 TypeScript 类型编译验证**；后续在装有 TypeScript 的环境应复跑
+  `tsc --project admin-ui/tsconfig.json` 并核对产物无差异。
 
 ## 8. 复盘
 

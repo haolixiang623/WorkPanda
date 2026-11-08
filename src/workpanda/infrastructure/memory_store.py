@@ -9,8 +9,10 @@ from uuid import UUID
 from workpanda.domain.confirmation import Confirmation, ConfirmationError
 from workpanda.domain.flow import (
     FlowDefinition,
+    FlowReleaseInfo,
     FlowReleaseMissing,
     FlowVersionExists,
+    require_actor,
     validate_flow,
 )
 from workpanda.domain.models import EventType, Task, TaskEvent, TaskStatus, utc_now
@@ -210,6 +212,11 @@ class InMemoryFlowStore:
     def __init__(self) -> None:
         self._versions: dict[tuple[str, str], FlowDefinition] = {}
         self._pointers: dict[str, str] = {}
+        # `_releases` 记「这一行指针存在」，与 SQLite 的 flow_releases 行同形：
+        # 停用只清指针、不删行，否则 disabled_by 会跟着一起消失。
+        self._releases: set[str] = set()
+        self._published_by: dict[str, str] = {}
+        self._disabled_by: dict[str, str] = {}
         self._lock = Lock()
 
     def close(self) -> None:
@@ -225,7 +232,8 @@ class InMemoryFlowStore:
                 )
             self._versions[key] = flow.model_copy()
 
-    def publish(self, flow_id: str, version: str) -> None:
+    def publish(self, flow_id: str, version: str, *, actor: str) -> None:
+        require_actor(actor)
         with self._lock:
             if (flow_id, version) not in self._versions:
                 raise FlowReleaseMissing(
@@ -233,14 +241,30 @@ class InMemoryFlowStore:
                     "先写入版本再发布"
                 )
             self._pointers[flow_id] = version
+            self._releases.add(flow_id)
+            self._published_by[flow_id] = actor
+            self._disabled_by.pop(flow_id, None)
 
-    def disable(self, flow_id: str) -> None:
+    def disable(self, flow_id: str, *, actor: str) -> None:
+        require_actor(actor)
         with self._lock:
+            # 与 SQLite 的 `AND disabled_by IS NULL` 对齐：状态没变就不改署名。
+            if flow_id in self._releases and flow_id not in self._disabled_by:
+                self._disabled_by[flow_id] = actor
             self._pointers.pop(flow_id, None)
 
     def published_versions(self) -> dict[str, str]:
         with self._lock:
             return dict(self._pointers)
+
+    def release_info(self, flow_id: str) -> FlowReleaseInfo | None:
+        with self._lock:
+            if flow_id not in self._releases:
+                return None
+            return FlowReleaseInfo(
+                published_by=self._published_by.get(flow_id),
+                disabled_by=self._disabled_by.get(flow_id),
+            )
 
     def list_versions(self, flow_id: str | None = None) -> list[FlowDefinition]:
         with self._lock:

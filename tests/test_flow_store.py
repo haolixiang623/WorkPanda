@@ -7,11 +7,12 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
 
-from workpanda.bootstrap import build_container
+from workpanda.bootstrap import BOOTSTRAP_ACTOR, build_container
 from workpanda.config import Settings
 from workpanda.domain.flow import (
     FlowDefinition,
@@ -83,7 +84,7 @@ def test_existing_version_content_is_not_overwritten(store: SqliteFlowStore) -> 
 
 def test_publish_requires_an_existing_version(store: SqliteFlowStore) -> None:
     with pytest.raises(FlowReleaseMissing):
-        store.publish(FLOW_ID, "1")
+        store.publish(FLOW_ID, "1", actor="testsuite")
 
     # 失败不能留下半个指针，否则下一次启动会指向一个空洞。
     assert store.published_versions() == {}
@@ -93,10 +94,10 @@ def test_rollback_is_moving_the_pointer_back(store: SqliteFlowStore) -> None:
     store.add_version(make_flow("1"))
     store.add_version(make_flow("2"))
 
-    store.publish(FLOW_ID, "2")
+    store.publish(FLOW_ID, "2", actor="testsuite")
     assert FlowRegistry.from_store(store).resolve(FLOW_ID).version == "2"
 
-    store.publish(FLOW_ID, "1")
+    store.publish(FLOW_ID, "1", actor="testsuite")
     assert FlowRegistry.from_store(store).resolve(FLOW_ID).version == "1"
     # 回滚不删历史：v2 仍在库里，随时可以再发回去。
     assert [flow.version for flow in store.list_versions(FLOW_ID)] == ["1", "2"]
@@ -107,9 +108,9 @@ def test_disabled_flow_does_not_fall_back_to_the_highest_version(
 ) -> None:
     store.add_version(make_flow("1"))
     store.add_version(make_flow("2"))
-    store.publish(FLOW_ID, "2")
+    store.publish(FLOW_ID, "2", actor="testsuite")
 
-    store.disable(FLOW_ID)
+    store.disable(FLOW_ID, actor="testsuite")
 
     registry = FlowRegistry.from_store(store)
     with pytest.raises(FlowNotRunnable):
@@ -142,10 +143,10 @@ def test_require_still_returns_a_version_after_rollback(store: SqliteFlowStore) 
 
     store.add_version(make_flow("1"))
     store.add_version(make_flow("2"))
-    store.publish(FLOW_ID, "2")
+    store.publish(FLOW_ID, "2", actor="testsuite")
 
     registry = FlowRegistry.from_store(store)
-    store.publish(FLOW_ID, "1")
+    store.publish(FLOW_ID, "1", actor="testsuite")
     rolled_back = FlowRegistry.from_store(store)
 
     with pytest.raises(FlowNotRunnable):
@@ -159,7 +160,7 @@ def test_resolving_a_missing_version_does_not_fall_back(store: SqliteFlowStore) 
 
     store.add_version(make_flow("1"))
     store.add_version(make_flow("3"))
-    store.publish(FLOW_ID, "3")
+    store.publish(FLOW_ID, "3", actor="testsuite")
 
     with pytest.raises(FlowNotFound):
         FlowRegistry.from_store(store).resolve(FLOW_ID, "2")
@@ -173,7 +174,7 @@ def test_versions_and_pointer_survive_a_restart(workdir: Path) -> None:
     first = SqliteFlowStore(path)
     first.add_version(make_flow("1"))
     first.add_version(make_flow("2"))
-    first.publish(FLOW_ID, "1")
+    first.publish(FLOW_ID, "1", actor="testsuite")
     first.close()
 
     second = SqliteFlowStore(path)
@@ -243,9 +244,189 @@ def test_in_memory_store_matches_the_sqlite_contract() -> None:
     with pytest.raises(FlowVersionExists):
         memory.add_version(make_flow("1"))
     with pytest.raises(FlowReleaseMissing):
-        memory.publish(FLOW_ID, "9")
+        memory.publish(FLOW_ID, "9", actor="testsuite")
 
-    memory.publish(FLOW_ID, "1")
+    memory.publish(FLOW_ID, "1", actor="testsuite")
     assert memory.published_versions() == {FLOW_ID: "1"}
-    memory.disable(FLOW_ID)
+    memory.disable(FLOW_ID, actor="testsuite")
     assert memory.published_versions() == {}
+
+
+# ---------- 发布署名（Issue #61）----------
+
+
+def test_publish_records_actor(store: SqliteFlowStore) -> None:
+    """发布后能从库里读回主体名：不做双人复核时，署名是唯一责任锚点。"""
+
+    store.add_version(make_flow("1"))
+    assert store.release_info(FLOW_ID) is None
+
+    store.publish(FLOW_ID, "1", actor="sop.alice")
+    info = store.release_info(FLOW_ID)
+    assert info is not None
+    assert info.published_by == "sop.alice"
+    assert info.disabled_by is None
+    assert store.published_versions() == {FLOW_ID: "1"}
+
+
+def test_rollback_overwrites_published_by(store: SqliteFlowStore) -> None:
+    """回滚就是一次 publish：published_by 要覆盖成「谁回滚的」。"""
+
+    store.add_version(make_flow("1"))
+    store.add_version(make_flow("2"))
+    store.publish(FLOW_ID, "2", actor="sop.alice")
+    store.publish(FLOW_ID, "1", actor="sop.bob")
+
+    info = store.release_info(FLOW_ID)
+    assert info is not None
+    assert info.published_by == "sop.bob"
+    assert FlowRegistry.from_store(store).resolve(FLOW_ID).version == "1"
+
+
+def test_disable_records_actor_and_can_be_republished(store: SqliteFlowStore) -> None:
+    """停用留下 disabled_by；重新发布要清掉它，不能同时显示两个责任人。"""
+
+    store.add_version(make_flow("1"))
+    store.publish(FLOW_ID, "1", actor="sop.alice")
+    store.disable(FLOW_ID, actor="sop.bob")
+
+    assert store.published_versions() == {}
+    info = store.release_info(FLOW_ID)
+    assert info is not None
+    assert info.published_by == "sop.alice"
+    assert info.disabled_by == "sop.bob"
+
+    store.publish(FLOW_ID, "1", actor="sop.carol")
+    info = store.release_info(FLOW_ID)
+    assert info is not None
+    assert info.published_by == "sop.carol"
+    assert info.disabled_by is None
+    assert store.published_versions() == {FLOW_ID: "1"}
+
+
+def test_disabling_twice_keeps_the_first_actor(store: SqliteFlowStore) -> None:
+    """重复停用是空动作，不该把署名换成第二个人。"""
+
+    store.add_version(make_flow("1"))
+    store.publish(FLOW_ID, "1", actor="sop.alice")
+    store.disable(FLOW_ID, actor="sop.bob")
+    store.disable(FLOW_ID, actor="sop.eve")
+    assert store.release_info(FLOW_ID).disabled_by == "sop.bob"
+    assert store.published_versions() == {}
+
+
+def test_actor_is_keyword_only_and_required(store: SqliteFlowStore) -> None:
+    """漏传 actor 必须是 TypeError，绝不能静默记成空串或某个默认值。"""
+
+    store.add_version(make_flow("1"))
+    with pytest.raises(TypeError):
+        store.publish(FLOW_ID, "1")
+    with pytest.raises(TypeError):
+        store.publish(FLOW_ID, "1", "sop.alice")
+    with pytest.raises(TypeError):
+        store.disable(FLOW_ID)
+    assert store.published_versions() == {}
+    assert store.release_info(FLOW_ID) is None
+
+
+def test_empty_actor_is_rejected(store: SqliteFlowStore) -> None:
+    """空串署名等于没有署名：两个实现都必须在写之前挡下。"""
+
+    store.add_version(make_flow("1"))
+    with pytest.raises(ValueError):
+        store.publish(FLOW_ID, "1", actor="")
+    with pytest.raises(ValueError):
+        store.disable(FLOW_ID, actor="   ")
+    assert store.published_versions() == {}
+
+    memory = InMemoryFlowStore()
+    memory.add_version(make_flow("1"))
+    with pytest.raises(ValueError):
+        memory.publish(FLOW_ID, "1", actor="")
+    with pytest.raises(ValueError):
+        memory.disable(FLOW_ID, actor="")
+
+
+def test_old_schema_migrates_idempotently(workdir: Path) -> None:
+    """旧库（无署名列）启动自动加列，旧数据为 NULL 且读取 / 再发布都不报错。"""
+
+    path = workdir / "legacy.db"
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(
+            "CREATE TABLE flow_definitions ("
+            " flow_id TEXT NOT NULL, version TEXT NOT NULL,"
+            " body TEXT NOT NULL, created_at TEXT NOT NULL,"
+            " PRIMARY KEY (flow_id, version));"
+            "CREATE TABLE flow_releases ("
+            " flow_id TEXT PRIMARY KEY, published_version TEXT NOT NULL,"
+            " updated_at TEXT NOT NULL);"
+        )
+        conn.execute(
+            "INSERT INTO flow_releases (flow_id, published_version, updated_at)"
+            " VALUES (?, ?, ?)",
+            (FLOW_ID, "legacy", "2026-01-01T00:00:00.000000Z"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    first = SqliteFlowStore(path)
+    try:
+        info = first.release_info(FLOW_ID)
+        assert info is not None
+        assert info.published_by is None
+        assert info.disabled_by is None
+        assert first.published_versions() == {FLOW_ID: "legacy"}
+    finally:
+        first.close()
+
+    # 再开一次：迁移必须幂等，不能因为列已存在就报错。
+    second = SqliteFlowStore(path)
+    try:
+        assert second.release_info(FLOW_ID).published_by is None
+        second.add_version(make_flow("1"))
+        second.publish(FLOW_ID, "1", actor="sop.alice")
+        assert second.release_info(FLOW_ID).published_by == "sop.alice"
+    finally:
+        second.close()
+
+
+def test_in_memory_store_records_actors_like_sqlite() -> None:
+    """内存实现给出同样的署名语义，否则测试会用另一套口径骗过自己。"""
+
+    memory = InMemoryFlowStore()
+    memory.add_version(make_flow("1"))
+    memory.add_version(make_flow("2"))
+    memory.publish(FLOW_ID, "1", actor="sop.alice")
+    assert memory.release_info(FLOW_ID).published_by == "sop.alice"
+    memory.publish(FLOW_ID, "2", actor="sop.bob")
+    assert memory.release_info(FLOW_ID).published_by == "sop.bob"
+    memory.disable(FLOW_ID, actor="sop.carol")
+    assert memory.published_versions() == {}
+    info = memory.release_info(FLOW_ID)
+    assert info.published_by == "sop.bob"
+    assert info.disabled_by == "sop.carol"
+    memory.publish(FLOW_ID, "1", actor="sop.dave")
+    info = memory.release_info(FLOW_ID)
+    assert info.published_by == "sop.dave"
+    assert info.disabled_by is None
+
+
+def test_demo_seed_uses_a_non_human_actor(workdir: Path) -> None:
+    """装配期播种是系统动作，署名不能伪装成某位运维的发布。"""
+
+    container = build_container(
+        Settings(
+            store_backend="sqlite",
+            sqlite_path=workdir / "seed-actor.db",
+            enable_demo_flow=True,
+            harness_enabled=False,
+        )
+    )
+    try:
+        info = container.flow_store.release_info("demo.generic")
+        assert info is not None
+        assert info.published_by == BOOTSTRAP_ACTOR
+    finally:
+        container.close()

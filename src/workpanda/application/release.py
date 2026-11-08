@@ -65,12 +65,14 @@ class FlowReleaseService:
         self.intent_gate = intent_gate
 
     def release(
-        self, flow_id: str, version: str, *, apply: bool = True
+        self, flow_id: str, version: str, *, apply: bool = True, actor: str
     ) -> FlowReleaseOutcome:
         """裁决（并在 `apply` 时执行）一次发布。
 
         `apply=False` 是"只看能不能发"的预演：运维可以先跑一遍看报告，确认无误再
         真的移动指针。预演不写任何状态——否则"预演一次"就成了发布会。
+        `actor` 由调用方从已鉴权主体取得，只在真正移动指针时落到库里；本服务
+        不接受请求体自报的署名（见 `api/admin.py`）。
         """
 
         # 版本必须真的存在：`FlowStore.publish` 只保证指针不指向空洞，不会告诉我们
@@ -85,7 +87,7 @@ class FlowReleaseService:
 
         if not self.gate_enabled or not cases:
             if apply:
-                self.flows.publish(flow_id, version)
+                self.flows.publish(flow_id, version, actor=actor)
             return FlowReleaseOutcome(
                 flow_id=flow_id,
                 flow_version=version,
@@ -99,7 +101,7 @@ class FlowReleaseService:
             raise FlowReleaseBlocked(_blocked_message(flow_id, version, report), report)
 
         if apply:
-            self.flows.publish(flow_id, version)
+            self.flows.publish(flow_id, version, actor=actor)
         return FlowReleaseOutcome(
             flow_id=flow_id,
             flow_version=version,

@@ -36,6 +36,9 @@ interface FlowSummary {
   title: string;
   published: boolean;
   case_count: number;
+  // 当前发布指针上的责任锚点（flow 级）。旧库迁移前的操作为 null。
+  published_by: string | null;
+  disabled_by: string | null;
 }
 
 interface ReplayCaseView {
@@ -75,6 +78,14 @@ interface PublishOutcome {
   published: boolean;
   replay_ran: boolean;
   message: string;
+  // 预演不移动指针，服务端返回 null，界面不显示发布人。
+  published_by: string | null;
+}
+
+/** 回滚 / 停用响应里的署名；字段缺失时按「服务端未提供」处理，不本地猜测。 */
+interface ReleaseActionResult {
+  published_by?: string | null;
+  disabled_by?: string | null;
 }
 
 interface FieldProblem {
@@ -123,6 +134,11 @@ function escapeHtml(raw: string): string {
     };
     return table[char] ?? char;
   });
+}
+
+/** 结果消息里的署名片段；服务端没给就不显示，绝不本地编一个主体名。 */
+function actorSuffix(actor: string | null | undefined, label: string): string {
+  return actor ? `；${label}：<strong>${escapeHtml(actor)}</strong>` : "";
 }
 
 function showMessage(kind: "ok" | "err", html: string): void {
@@ -265,6 +281,16 @@ function renderFlows(flows: FlowSummary[]): void {
       tag.className = "tag off";
       tag.textContent = "草稿";
       stateCell.replaceChildren(tag);
+    }
+    // 责任锚点：已发布显示发布人，停用后显示最近停用人；服务端没有署名时留空。
+    const actorNote = flow.published
+      ? (flow.published_by ? `发布人：${flow.published_by}` : "")
+      : (flow.disabled_by ? `最近停用：${flow.disabled_by}` : "");
+    if (actorNote !== "") {
+      const note = document.createElement("div");
+      note.className = "muted";
+      note.textContent = actorNote;
+      stateCell.append(note);
     }
     // 第 5 列：用例数。
     row.insertCell().textContent = String(flow.case_count);
@@ -558,7 +584,8 @@ async function publish(
     showMessage(
       "ok",
       `<strong>${outcome.published ? "已发布" : "预演通过，未发布"}</strong>：` +
-        `${escapeHtml(outcome.message)}；回放门禁${outcome.replay_ran ? "已执行" : "未执行（该版本没有用例）"}。`,
+        `${escapeHtml(outcome.message)}；回放门禁${outcome.replay_ran ? "已执行" : "未执行（该版本没有用例）"}` +
+        `${outcome.published ? actorSuffix(outcome.published_by, "发布人") : ""}。`,
     );
     await refreshFlows();
   } catch (error) {
@@ -570,12 +597,16 @@ async function publish(
 }
 
 async function rollback(flow: { flow_id: string; version: string }): Promise<void> {
-  await api(
+  const result = await api<ReleaseActionResult>(
     `/api/admin/flows/${encodeURIComponent(flow.flow_id)}/rollback`,
     "POST",
     { version: flow.version },
   );
-  showMessage("ok", `已回滚 ${escapeHtml(flow.flow_id)} 到 ${escapeHtml(flow.version)}；在途任务仍按各自版本继续。`);
+  showMessage(
+    "ok",
+    `已回滚 ${escapeHtml(flow.flow_id)} 到 ${escapeHtml(flow.version)}；在途任务仍按各自版本继续` +
+      `${actorSuffix(result.published_by, "回滚操作人")}。`,
+  );
   await refreshFlows();
 }
 
@@ -584,8 +615,15 @@ async function disable(): Promise<void> {
   if (flowId === "") {
     throw new Error("请先填写 flow_id。");
   }
-  await api(`/api/admin/flows/${encodeURIComponent(flowId)}/disable`, "POST");
-  showMessage("ok", `${escapeHtml(flowId)} 已停用（历史版本保留，可随时回滚）。`);
+  const result = await api<ReleaseActionResult>(
+    `/api/admin/flows/${encodeURIComponent(flowId)}/disable`,
+    "POST",
+  );
+  showMessage(
+    "ok",
+    `${escapeHtml(flowId)} 已停用（历史版本保留，可随时回滚）` +
+      `${actorSuffix(result.disabled_by, "停用操作人")}。`,
+  );
   await refreshFlows();
 }
 

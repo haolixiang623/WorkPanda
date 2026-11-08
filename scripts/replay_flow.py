@@ -103,6 +103,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--publish", action="store_true", help="通过门禁后移动发布指针")
     parser.add_argument(
+        "--actor",
+        default=None,
+        help="发布署名（--publish 时必填）。CLI 没有服务端鉴权，由操作者显式声明主体名",
+    )
+    parser.add_argument(
         "--replay-only",
         action="store_true",
         help="只出回放报告，不跑识别样例门禁（用于规则/样例就位前编写用例，不能当作发布依据）",
@@ -111,6 +116,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--delete-case", default=None, metavar="CASE_ID", help="删除一条用例")
     parser.add_argument("--json", action="store_true", help="以 JSON 输出报告")
     args = parser.parse_args(argv)
+    actor = (args.actor or "").strip()
+    if args.publish and not actor:
+        parser.error("--publish 必须用 --actor 指定发布主体，不允许匿名发布")
 
     path = args.sqlite or _default_db()
     if not path.exists():
@@ -151,7 +159,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.publish:
             try:
-                outcome = service.release(args.flow, args.version)
+                outcome = service.release(args.flow, args.version, actor=actor)
             except IntentEvalBlocked as exc:
                 _emit_intents(exc.report, args.json)
                 print(f"发布被拦（识别样例）：{exc}", file=sys.stderr)

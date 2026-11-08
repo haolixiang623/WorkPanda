@@ -20,8 +20,10 @@ from threading import Lock
 
 from workpanda.domain.flow import (
     FlowDefinition,
+    FlowReleaseInfo,
     FlowReleaseMissing,
     FlowVersionExists,
+    require_actor,
     validate_flow,
 )
 from workpanda.domain.models import utc_now
@@ -39,9 +41,28 @@ CREATE TABLE IF NOT EXISTS flow_definitions (
 CREATE TABLE IF NOT EXISTS flow_releases (
     flow_id TEXT PRIMARY KEY,
     published_version TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    published_by TEXT,
+    disabled_by TEXT
 );
 """
+
+# 旧库缺的列。新库由 SCHEMA 直接带上，这里只为既有部署做幂等补齐。
+_RELEASE_ACTOR_COLUMNS = ("published_by", "disabled_by")
+
+
+def _ensure_release_actor_columns(conn: sqlite3.Connection) -> None:
+    """旧库启动时自动加列，幂等且不改旧数据。
+
+    按列名判断是否已经存在，绝不重复 `ALTER TABLE`；旧行两列自动为 `NULL`，
+    读取侧按「迁移前发生的操作没有署名」处理，不猜、不回填。没有用「删表重建」
+    是因为那会破坏与其它存储共用同一库文件的事务语义。
+    """
+
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(flow_releases)")}
+    for column in _RELEASE_ACTOR_COLUMNS:
+        if column not in existing:
+            conn.execute(f"ALTER TABLE flow_releases ADD COLUMN {column} TEXT")
 
 
 class SqliteFlowStore:
@@ -57,6 +78,7 @@ class SqliteFlowStore:
         # 与任务库同文件：短暂写冲突应等待，而不是把"发布"直接判失败。
         self._conn.execute("PRAGMA busy_timeout = 3000")
         self._conn.executescript(SCHEMA)
+        _ensure_release_actor_columns(self._conn)
         self._conn.commit()
 
     def close(self) -> None:
@@ -87,9 +109,14 @@ class SqliteFlowStore:
                 ) from exc
             self._conn.commit()
 
-    def publish(self, flow_id: str, version: str) -> None:
-        """移动发布指针。目标版本必须已经存在，否则指针会指向一个空洞。"""
+    def publish(self, flow_id: str, version: str, *, actor: str) -> None:
+        """移动发布指针，并把这次发布 / 回滚的主体记在指针上。
 
+        目标版本必须已经存在，否则指针会指向一个空洞。重新发布要清掉上一次的
+        停用署名：否则「停用 → 再发布」之后界面会同时显示两个互相矛盾的责任人。
+        """
+
+        require_actor(actor)
         with self._lock:
             row = self._conn.execute(
                 "SELECT 1 FROM flow_definitions WHERE flow_id = ? AND version = ?",
@@ -101,20 +128,34 @@ class SqliteFlowStore:
                     "先写入版本再发布"
                 )
             self._conn.execute(
-                "INSERT INTO flow_releases (flow_id, published_version, updated_at)"
-                " VALUES (?, ?, ?)"
+                "INSERT INTO flow_releases"
+                " (flow_id, published_version, updated_at, published_by, disabled_by)"
+                " VALUES (?, ?, ?, ?, NULL)"
                 " ON CONFLICT(flow_id) DO UPDATE SET"
                 " published_version = excluded.published_version,"
-                " updated_at = excluded.updated_at",
-                (flow_id, version, canonical_stamp(utc_now())),
+                " updated_at = excluded.updated_at,"
+                " published_by = excluded.published_by,"
+                " disabled_by = NULL",
+                (flow_id, version, canonical_stamp(utc_now()), actor),
             )
             self._conn.commit()
 
-    def disable(self, flow_id: str) -> None:
-        """清空发布指针。版本内容一行都不删——回滚与审计都要靠它。"""
+    def disable(self, flow_id: str, *, actor: str) -> None:
+        """停用指针并记下主体。版本内容一行都不删——回滚与审计都要靠它。
 
+        不再 `DELETE` 那一行：删掉会把 `disabled_by` 一起抹掉，事后就查不到
+        「谁停用的」。`published_versions()` 过滤带停用标记的行，对外「没有
+        指针」的语义不变；`publish()` 重新发布时清掉标记。加 `disabled_by IS NULL`
+        是为了让重复停用幂等——状态没变就不改署名和时间。
+        """
+
+        require_actor(actor)
         with self._lock:
-            self._conn.execute("DELETE FROM flow_releases WHERE flow_id = ?", (flow_id,))
+            self._conn.execute(
+                "UPDATE flow_releases SET disabled_by = ?, updated_at = ?"
+                " WHERE flow_id = ? AND disabled_by IS NULL",
+                (actor, canonical_stamp(utc_now()), flow_id),
+            )
             self._conn.commit()
 
     # ---------- 读 ----------
@@ -123,8 +164,22 @@ class SqliteFlowStore:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT flow_id, published_version FROM flow_releases"
+                " WHERE disabled_by IS NULL"
             ).fetchall()
         return {row["flow_id"]: row["published_version"] for row in rows}
+
+    def release_info(self, flow_id: str) -> FlowReleaseInfo | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT published_by, disabled_by FROM flow_releases WHERE flow_id = ?",
+                (flow_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return FlowReleaseInfo(
+            published_by=row["published_by"],
+            disabled_by=row["disabled_by"],
+        )
 
     def list_versions(self, flow_id: str | None = None) -> list[FlowDefinition]:
         with self._lock:

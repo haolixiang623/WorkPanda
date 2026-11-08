@@ -459,3 +459,113 @@ def test_admin_ui_assets_do_not_embed_credentials() -> None:
         text = path.read_text(encoding="utf-8")
         for marker in forbidden:
             assert marker not in text, f"{path.name} 含凭据或持久化存储：{marker}"
+
+
+# ---------- 发布署名（Issue #61）----------
+
+
+def test_publish_result_and_overview_carry_authenticated_actor(admin_client) -> None:
+    """署名取已鉴权主体；接口结果与版本列表都能读到，事后可追责。"""
+
+    client, _ = admin_client
+    create_version(client)
+    result = publish(client, "1")
+    assert result.status_code == 200, result.text
+    assert result.json()["published_by"] == "boss"
+
+    overview = client.get("/api/admin/flows", headers=ADMIN_HEADER).json()
+    assert overview[0]["published"] is True
+    assert overview[0]["published_by"] == "boss"
+    assert overview[0]["disabled_by"] is None
+
+
+def test_forged_published_by_in_request_body_is_ignored(admin_client) -> None:
+    """请求体自报 published_by / actor 一律无效：可自报的署名等于没有署名。"""
+
+    client, _ = admin_client
+    create_version(client)
+    forged = client.post(
+        "/api/admin/flows/admin.demo/publish",
+        headers=ADMIN_HEADER,
+        json={
+            "version": "1",
+            "apply": True,
+            "published_by": "attacker",
+            "actor": "attacker",
+        },
+    )
+    assert forged.status_code == 200, forged.text
+    assert forged.json()["published_by"] == "boss"
+    assert "attacker" not in forged.text
+
+    overview = client.get("/api/admin/flows", headers=ADMIN_HEADER).json()
+    assert overview[0]["published_by"] == "boss"
+
+
+def test_dry_run_reports_no_publisher(admin_client) -> None:
+    """预演没移动指针，也就没有「发布人」，不能显示成已发布。"""
+
+    client, _ = admin_client
+    create_version(client)
+    result = publish(client, "1", apply=False)
+    assert result.status_code == 200, result.text
+    assert result.json()["published"] is False
+    assert result.json()["published_by"] is None
+    overview = client.get("/api/admin/flows", headers=ADMIN_HEADER).json()
+    assert overview[0]["published_by"] is None
+
+
+def test_rollback_result_carries_actor_and_ignores_forgery(admin_client) -> None:
+    """回滚同样留下 published_by（谁把 v2 换回 v1），且伪造字段无效。"""
+
+    client, _ = admin_client
+    create_version(client, "1")
+    create_version(client, "2")
+    assert publish(client, "2").status_code == 200
+
+    rolled = client.post(
+        "/api/admin/flows/admin.demo/rollback",
+        headers=ADMIN_HEADER,
+        json={"version": "1", "published_by": "attacker", "actor": "attacker"},
+    )
+    assert rolled.status_code == 200, rolled.text
+    assert rolled.json()["published_by"] == "boss"
+    assert "attacker" not in rolled.text
+    assert client.get("/api/admin/flows", headers=ADMIN_HEADER).json()[0]["published_by"] == "boss"
+
+
+def test_disable_result_carries_actor_and_ignores_forgery(admin_client) -> None:
+    """停用留下 disabled_by；带请求体的伪造字段也不能改署名。"""
+
+    client, _ = admin_client
+    create_version(client)
+    assert publish(client, "1").status_code == 200
+
+    disabled = client.post(
+        "/api/admin/flows/admin.demo/disable",
+        headers=ADMIN_HEADER,
+        json={"disabled_by": "attacker", "actor": "attacker"},
+    )
+    assert disabled.status_code == 200, disabled.text
+    assert disabled.json()["disabled_by"] == "boss"
+    assert "attacker" not in disabled.text
+
+    overview = client.get("/api/admin/flows", headers=ADMIN_HEADER).json()
+    assert overview[0]["published"] is False
+    assert overview[0]["disabled_by"] == "boss"
+    # 上一个发布者仍可查：停用不抹掉发布责任。
+    assert overview[0]["published_by"] == "boss"
+
+
+def test_viewer_cannot_forge_an_actor_to_gain_write(admin_client) -> None:
+    """viewer 带伪造署名仍是 403：署名不是权限来源。"""
+
+    client, _ = admin_client
+    create_version(client)
+    response = client.post(
+        "/api/admin/flows/admin.demo/publish",
+        headers=VIEWER_HEADER,
+        json={"version": "1", "published_by": "boss", "actor": "boss"},
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "admin_forbidden"

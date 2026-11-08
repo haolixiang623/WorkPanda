@@ -87,24 +87,57 @@ class FlowReleaseMissing(LookupError):
     """发布指针指向的版本不存在。"""
 
 
+@dataclass(frozen=True, slots=True)
+class FlowReleaseInfo:
+    """一条发布指针上的责任锚点。
+
+    两个署名各自记**最近一次**动作的主体：发布 / 回滚写 `published_by`，停用写
+    `disabled_by`。旧库迁移后两者都是 `None`，表示「这一列补进来之前发生的操作
+    没有署名」——不猜、不回填一个看起来合理的值。刻意不预留 `reviewed_by`：
+    本轮已决定不做双人复核，留一个永远为空的字段会让人误以为环节存在但没人用。
+    """
+
+    published_by: str | None
+    disabled_by: str | None
+
+
+def require_actor(actor: str) -> None:
+    """署名必须是一个非空主体名：空串署名和没有署名一样，事后都追不到人。
+
+    两个 `FlowStore` 实现共用这一条，避免各写一套口径导致「内存库能写、SQLite
+    拦下」这种测试里看不出来的分叉。
+    """
+
+    if not isinstance(actor, str) or not actor.strip():
+        raise ValueError("发布 / 停用的 actor 必须是非空主体名")
+
+
 class FlowStore(Protocol):
     """流程定义的持久化端口。
 
     只表达两件事：**有哪些版本**、**哪个版本是当前发布指针**。发布状态不写进
-    版本内容——否则"发布"要改两条记录，改一半就是两种真相。
+    版本内容——否则"发布"要改两条记录，改一半就是两种真相。指针上同时记下
+    「谁动的」，因为不做双人复核时，署名是这条链路唯一的责任锚点。
     """
 
     def add_version(self, flow: FlowDefinition) -> None:
         """新增一个版本。已存在则抛 `FlowVersionExists`，绝不覆盖。"""
 
-    def publish(self, flow_id: str, version: str) -> None:
-        """把发布指针移向指定版本。版本不存在则抛 `FlowReleaseMissing`。"""
+    def publish(self, flow_id: str, version: str, *, actor: str) -> None:
+        """把发布指针移向指定版本，并记下这次发布（或回滚）的主体。
 
-    def disable(self, flow_id: str) -> None:
-        """清空发布指针。历史版本保留，回滚就是再把指针移回去。"""
+        `actor` 是**仅关键字必填**参数：漏传是类型错误，不会静默默认成空串。
+        版本不存在则抛 `FlowReleaseMissing`。
+        """
+
+    def disable(self, flow_id: str, *, actor: str) -> None:
+        """停用发布指针并记下主体。历史版本保留，回滚就是再把指针移回去。"""
 
     def published_versions(self) -> dict[str, str]:
         """`flow_id -> 已发布版本`。没有指针的流程不出现在结果里。"""
+
+    def release_info(self, flow_id: str) -> FlowReleaseInfo | None:
+        """读该流程指针上的署名；从未发布过（旧库里被删掉的指针）返回 `None`。"""
 
     def list_versions(self, flow_id: str | None = None) -> list[FlowDefinition]:
         """按 `(flow_id, version)` 排序返回版本，不做发布状态过滤。"""
