@@ -100,6 +100,17 @@
     <div class="row" style="margin-top: 12px">
       <button id="add-step">添加步骤</button>
     </div>
+    <p class="muted">「字段中文名」决定群众页显示什么：不填，页面就把内部字段名（<code>subject</code>）直接印给群众。</p>
+
+    <h2 style="margin-top: 20px">识别规则（一句话能不能命中所属事项）</h2>
+    <p class="muted">规则随版本一起保存并发布。关键词命中即参与打分，命中越多分越高；槽位抽取只在
+      规则命中后才跑，用来把群众已经说出口的字段值填进去（抽不到就留空，不会按默认值补齐）。
+      <code>flow_id</code> / <code>version</code> 取自上方输入框，不单独填写——规则指向别的版本，
+      会变成「识别命中了、建任务却报未发布」。留空表示这一版不接受一句话直达。</p>
+    <div id="rules"></div>
+    <div class="row" style="margin-top: 10px">
+      <button id="add-rule">添加识别规则</button>
+    </div>
 
     <h2 style="margin-top: 20px">意图样例（发布门禁材料）</h2>
     <p class="muted">样例随版本一起保存，发布时由服务端门禁裁决。正例必须能被识别到本流程这一版；

@@ -111,10 +111,38 @@ pydantic 先挡字段形状（422 带 `loc`），再由 `flow_field_errors()` �
 `test_server_gate_is_authoritative_when_local_thresholds_drift` 刻意把服务端阈值调高，
 钉住「前端说够了不算数」。超范围例建议写，但服务端不设条数下限，本地也只作提示。
 
-规则本身仍由装配期代码给出：本轮不做样例自动生成、不从历史任务反推样例，也不做
-「群众说一句话就自动路由到新流程」的规则装配。
+规则本身随版本走，页面上直接录（见 3.7）：本轮不做样例自动生成、不从历史任务反推样例，
+也不做「从样例反推关键词」的自动装配——规则仍要人写，只是不必再改代码。
 
-### 3.6 发布 / 回滚 / 停用的署名（Issue #61）
+### 3.7 字段中文名与识别规则（A2）
+
+界面建出的流程曾经有两处空档，两处都**不报错**：
+
+- **步骤的 `field_labels` 没有输入口**：群众页只好把内部字段名印给群众（`subject`、
+  `contact`）。机制、校验、投影（`TaskView.field_labels`）全都在，只差一个输入框。
+- **流程的 `intent_rules` 没有输入口**：一句话命不中，只能由接口显式指定 `flow_id`
+  建任务——「可维护」这条需求在页面上不成立。
+
+现在的形态：
+
+- 步骤行多了「字段中文名」，录入格式 `字段=标签`，逗号或换行分隔。**缺 `=` 的那一项
+  不会被静默丢掉**，而是原样当成"有字段名、没标签"，由服务端 `field_labels` 校验报在
+  具体输入框上。丢掉才是更糟的失败方式：管理员以为填好了，群众页照旧印内部名。
+- 新增「识别规则」区块：`intent_id`、关键词（逗号分隔）、槽位抽取（每行 `字段=正则`，
+  同一字段多行即为多条候选模式，按书写顺序尝试）。
+- **`flow_id` / `flow_version` 不由界面填写**，保存时按上方 flow_id / version 输入框补齐。
+  让作者手抄这两个值，等于把 #73（识别命中了、建任务却报未发布）重新交回人手。
+- 槽位正则在**保存时**编译校验：写坏的正则原本会在群众提交任务那一刻抛 `re.error`
+  （对外是 500，对群众是"点了没反应"）；空正则更隐蔽——`re.search("")` 恒中，会把整句
+  前半段当成字段值写进执行参数。两种都在 `flow_field_errors()` 里拦下，`loc` 指到
+  `intent_rules.<i>.slot_patterns.<field>`。
+- 服务端校验独立成立：界面补齐了版本字段，直接打 API 写错版本照样 422。
+
+回归 `tests/test_admin_ui_draft_fields.py`（10 项）：界面提交体从建草稿一路到"群众只说
+一句话就落进这个事项"（含槽位抽取与中文标签投影）、规则外的句子不被捞进来、表单覆盖性
+（可写步骤字段缺输入口即红）、编译产物接线、坏正则与空正则的字段级拒绝、能用的正则不误拦。
+
+### 3.8 发布 / 回滚 / 停用的署名（Issue #61）
 
 一条流程被推上线后，必须能回答"谁在什么时候把 v3 换成了 v4"。本轮不做双人复核，
 署名就是这条链路唯一的责任锚点——没有复核兜底，又没有署名，等于发布无人负责。
@@ -152,6 +180,9 @@ pydantic 先挡字段形状（422 带 `loc`），再由 `flow_field_errors()` �
 | #62：只用界面建出的流程能发布成功 | `test_ui_created_flow_can_publish`（界面提交体 → 草稿含样例 → 回放 → 发布） |
 | #62：样例不足时按钮禁用并写明缺什么 | `test_local_sample_gate_disables_save_until_counts_met`、`test_compiled_bundle_wires_the_sample_gate` |
 | #62：前端阈值漂移时服务端仍权威 | `test_server_gate_is_authoritative_when_local_thresholds_drift`（409 + 指针不动） |
+| A2：页面建出的流程能被一句话命中 | `test_ui_created_flow_routes_a_sentence_and_keeps_chinese_labels`（建草稿 → 发布 → 群众只说一句话 → 槽位与中文标签都对） |
+| A2：可写步骤字段必须有表单入口 | `test_every_editable_step_field_has_a_form_input`、`test_flow_level_fields_are_sent_by_the_form`、`test_compiled_bundle_carries_the_new_fields` |
+| A2：写坏的槽位正则在保存时被拦 | `test_invalid_slot_pattern_is_rejected_at_save`、`test_blank_slot_pattern_is_rejected_at_save`、`test_usable_patterns_are_accepted` |
 | #61：发布 / 回滚后能读到署名 | `test_publish_records_actor`、`test_rollback_updates_the_publisher`、`test_rollback_records_the_rolling_back_actor` |
 | #61：`actor` 仅关键字必填、空串被拒 | `test_actor_is_keyword_only_and_required`（含空串 / 纯空白） |
 | #61：伪造请求体署名无效 | `test_publish_ignores_self_reported_author`、`test_viewer_cannot_publish_with_a_forged_author` |
@@ -187,16 +218,15 @@ pydantic 先挡字段形状（422 带 `loc`），再由 `flow_field_errors()` �
    依赖"发布立即全局生效"。
 3. **回滚绕过门禁**：3.2 的取舍需责任人确认；若要求回滚也过门禁，应另做设计评审，
    并给出用例被误删时的应急通道。
-4. **意图样例已支持；规则随版本走，但页面还不能录规则（#62 / #52 / #73）**：
-   `intent_samples` 与 `intent_rules` 都随 `FlowDefinition` 落库，API 建草稿时一起
-   提交。样例表单提供三类样例的动态列表、形状校验与提交前本地预检；样例不足会禁用
-   保存并写明「缺哪一类、还缺几条」，服务端 `IntentReleaseGate` 仍按自己的阈值裁决，
-   本地数字漂移时以 409 报告为准（见 3.5）。
-   **规则（`intent_rules`）**自 #73 起是版本内容的一部分：发布这一版就等于换掉识别
-   口径，运行时路由器跟着发布指针惰性重建，不重启即生效。但 `admin-ui` 只有样例表单、
-   没有规则表单，**只用页面建出的版本仍会被漏路由拦下**——这是有意的：页面还没有能力
-   表达"这句话该办哪件事"，就不该让它发出去。补规则表单属于后续事项；在此之前，
-   带规则的事项由仓库内的流程定义（自检流程）或直接调 API 的部署侧提供。
+4. **页面建出的流程现在可以自己带识别规则（A2 已补）**：
+   `intent_samples` 与 `intent_rules` 都随 `FlowDefinition` 落库，页面也都能录：样例是
+   三类动态列表 + 形状校验 + 提交前本地预检；规则是「关键词 + 槽位正则」，其中
+   `flow_id` / `flow_version` 由输入框补齐、不由作者填写，正则保存时编译校验。
+   自 #73 起规则是版本内容的一部分，发布这一版就等于换掉识别口径，运行时路由器跟着
+   发布指针惰性重建，不重启即生效。
+   仍然保留的限制：不做样例自动生成、不从历史任务反推样例、不从样例反推关键词——
+   规则要人写，只是不必改代码。`fail_to_handoff` 也没有表单入口：默认「失败转人工」
+   是更安全的一侧，把它开放出来等于让作者可以把失败改成终态。
 5. **独立域名 / 端口 / 证书**：待部署形态确定（见 #53），本轮不决定。
 6. **人工走查未完成**：自动化覆盖的是接口契约与权限；真实浏览器里完成一次
    「建草稿 → 回放 → 发布 → 回滚」并核对群众侧表现，仍需在试点由人执行。
@@ -209,6 +239,9 @@ pydantic 先挡字段形状（422 带 `loc`），再由 `flow_field_errors()` �
   `tests/test_admin_flows_api.py` 22 项覆盖第 4 节表格。
 - Issue #62 新增 `tests/test_admin_ui_intent_samples.py` 5 项：界面提交体端到端发布、
   重复样例的字段级 `loc`、服务端阈值漂移负向回归、前端预检行为、编译产物接线。
+- A2 新增 `tests/test_admin_ui_draft_fields.py` 10 项：界面建出的流程被一句话命中并带中文
+  字段名、规则外的句子不被捞进来、表单覆盖性（漏一个字段输入口即红）、编译产物接线、
+  坏正则 / 空正则 / 指向别的版本的规则三类字段级拒绝，以及能用正则的对照组。
 - 远端两项 CI（Python 检查、文档与敏感信息基础检查）在 PR head 与 main 均为 success。
 - 前端 `tsc --strict --noEmitOnError` 编译通过，产物 `admin-ui/dist/main.js` 与
   `admin-ui/dist/sample_check.js` 已提交。

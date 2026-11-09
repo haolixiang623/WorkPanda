@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
@@ -473,6 +474,46 @@ def _intent_rule_errors(flow: FlowDefinition) -> list[FlowFieldError]:
                     message=f"intent rule {rule.intent_id!r} must declare a keyword",
                 )
             )
+        errors.extend(_slot_pattern_errors(index, rule))
+    return errors
+
+
+def _slot_pattern_errors(index: int, rule: IntentRule) -> list[FlowFieldError]:
+    """槽位正则必须能编译、且不能是空串。
+
+    这两条都只在**抽值那一刻**才炸：`re.search()` 撞上写坏的正则抛 `re.error`，
+    而它发生在群众提交任务的那次请求里——对外是一个 500，对群众是"点了没反应"。
+    空串更隐蔽：`re.search("")` 恒中，会把整句话的前半段当成字段值写进执行参数。
+    校验放在这里，错误就落在写规则的人面前（管理侧 422 带 loc）。
+    """
+
+    errors: list[FlowFieldError] = []
+    for name, patterns in sorted(rule.slot_patterns.items()):
+        for pattern in patterns:
+            loc = ("intent_rules", index, "slot_patterns", name)
+            if not pattern.strip():
+                errors.append(
+                    FlowFieldError(
+                        loc=loc,
+                        message=(
+                            f"intent rule {rule.intent_id!r} has a blank pattern "
+                            f"for field {name!r}"
+                        ),
+                    )
+                )
+                continue
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                errors.append(
+                    FlowFieldError(
+                        loc=loc,
+                        message=(
+                            f"intent rule {rule.intent_id!r} has an invalid pattern "
+                            f"for field {name!r}: {exc}"
+                        ),
+                    )
+                )
     return errors
 
 
