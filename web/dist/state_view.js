@@ -167,3 +167,179 @@ export function connectionNotice(connection) {
     }
     return { level: "offline", text: "无法连接服务端，请检查网络后重试。" };
 }
+export function maskValue(value) {
+    const chars = [...value];
+    if (chars.length <= 4)
+        return "*".repeat(chars.length);
+    const tail = 4;
+    const head = chars.length >= 12 ? 6 : 0;
+    return (chars.slice(0, head).join("") +
+        "*".repeat(chars.length - head - tail) +
+        chars.slice(-tail).join(""));
+}
+function isSensitive(view, name) {
+    return view.sensitive_fields.indexOf(name) >= 0;
+}
+export function displayValue(view, name) {
+    const value = view.slots[name] ?? "";
+    if (value === "")
+        return "";
+    return isSensitive(view, name) ? maskValue(value) : value;
+}
+function stepOf(view) {
+    return view.current_step ?? "-";
+}
+export function transcriptOf(view) {
+    const messages = [];
+    if (view === null) {
+        messages.push({
+            id: "opening:idle",
+            kind: "opening",
+            role: "assistant",
+            text: "请用一句话说您要办什么，我再一步步问清楚。",
+        });
+        return messages;
+    }
+    const state = screenStateOf(view);
+    if (view.flow_title !== null && view.flow_title !== "") {
+        messages.push({
+            id: "opening:flow",
+            kind: "opening",
+            role: "assistant",
+            text: `您要办的是：${view.flow_title}。`,
+        });
+    }
+    if (state === "needs_clarification") {
+        messages.push({
+            id: "clarify:ask",
+            kind: "assistant",
+            role: "assistant",
+            text: view.ui_hint,
+        });
+        return messages;
+    }
+    for (const name of Object.keys(view.slots)) {
+        const shown = displayValue(view, name);
+        if (shown === "")
+            continue;
+        const label = labelOf(view, name);
+        messages.push({
+            id: `q:${stepOf(view)}:${name}`,
+            kind: "field_question",
+            role: "assistant",
+            text: label,
+        });
+        messages.push({
+            id: `a:${stepOf(view)}:${name}`,
+            kind: "user_answer",
+            role: "user",
+            text: shown,
+        });
+    }
+    if (state === "awaiting_input" ||
+        state === "user_action_required" ||
+        state === "received" ||
+        state === "processing") {
+        const field = nextField(view);
+        if (field !== null && state === "awaiting_input") {
+            if (view.current_step_prompt !== null && view.current_step_prompt !== "") {
+                messages.push({
+                    id: `prompt:${stepOf(view)}`,
+                    kind: "assistant",
+                    role: "assistant",
+                    text: view.current_step_prompt,
+                });
+            }
+            messages.push({
+                id: `q:${stepOf(view)}:${field.name}:open`,
+                kind: "field_question",
+                role: "assistant",
+                text: field.label,
+            });
+        }
+        else if (state === "user_action_required") {
+            messages.push({
+                id: `guide:${stepOf(view)}:what`,
+                kind: "guide",
+                role: "assistant",
+                text: `这一步需要您本人操作：${view.current_step_title ?? "请按页面提示完成操作"}。`,
+            });
+            messages.push({
+                id: `guide:${stepOf(view)}:where`,
+                kind: "guide",
+                role: "assistant",
+                text: view.current_step_prompt ?? "请按办理页面上的提示操作。",
+            });
+            messages.push({
+                id: `guide:${stepOf(view)}:expires`,
+                kind: "guide",
+                role: "assistant",
+                text: "有效期以办理页面上的提示为准。",
+            });
+        }
+        else if (state === "received" || state === "processing") {
+            messages.push({
+                id: `status:${state}`,
+                kind: "status",
+                role: "assistant",
+                text: view.ui_hint,
+            });
+        }
+    }
+    if (state === "awaiting_confirmation") {
+        const rows = collected(view).map((row) => `${row.label}：${displayValue(view, row.name)}`);
+        messages.push({
+            id: "confirm:summary",
+            kind: "confirmation",
+            role: "assistant",
+            text: rows.length === 0
+                ? "请确认是否提交。"
+                : `请核对以下内容：${rows.join("；")}。`,
+        });
+        if (view.current_step_title !== null && view.current_step_title !== "") {
+            messages.push({
+                id: "confirm:action",
+                kind: "confirmation",
+                role: "assistant",
+                text: `将要执行：${view.current_step_title}。`,
+            });
+        }
+        if (view.confirm_message !== null && view.confirm_message !== "") {
+            messages.push({
+                id: "confirm:impact",
+                kind: "confirmation",
+                role: "assistant",
+                text: view.confirm_message,
+            });
+        }
+    }
+    if (state === "completed") {
+        for (const row of resultRows(view.result)) {
+            messages.push({
+                id: `result:${row.name}`,
+                kind: "result",
+                role: "assistant",
+                text: `${row.label}：${row.value}`,
+            });
+        }
+        messages.push({
+            id: "status:completed",
+            kind: "status",
+            role: "assistant",
+            text: view.ui_title,
+        });
+        return messages;
+    }
+    if (state === "failed" ||
+        state === "outcome_unconfirmed" ||
+        state === "handoff" ||
+        state === "cancelled") {
+        messages.push({
+            id: `status:${state}`,
+            kind: "status",
+            role: "assistant",
+            text: view.ui_title,
+        });
+    }
+    return messages;
+}

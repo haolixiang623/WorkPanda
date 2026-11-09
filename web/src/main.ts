@@ -20,10 +20,12 @@ import {
   connectionNotice,
   fieldOf,
   screenOf,
+  transcriptOf,
   type Action,
   type ActionKind,
   type Connection,
   type Field,
+  type Message,
   type Screen,
   type TaskView,
 } from "./state_view.js";
@@ -37,7 +39,9 @@ const MAX_ATTEMPTS = 5;
 
 const connectionEl = must("connection");
 const noticeEl = must("notice");
-const appEl = must("app");
+const streamEl = must("stream");
+const panelEl = must("panel");
+const composerEl = must("composer");
 
 let session = sessionStorage.getItem(SESSION_KEY) ?? "";
 let taskId = sessionStorage.getItem(TASK_KEY) ?? "";
@@ -284,9 +288,10 @@ async function perform(kind: ActionKind, field?: Field): Promise<void> {
   if (busy) return;
   busy = true;
   notice = null;
-  // 渲染会重建输入框。先把已经敲进去的话收起来，否则"点开始办理"那一下
-  // 会把人刚写的整段描述清掉。
-  const composer = document.getElementById("composer");
+  // 渲染会重建面板。先把已经敲进去的话收起来，否则"点发送"那一下
+  // 会把人刚写的整段描述清掉。输入框现在是常驻节点，但文本仍归 `keepText` 管：
+  // 它是"页面自己的东西"里唯一的例外，只在提交前存活。
+  const composer = document.getElementById("composer-text");
   if (composer instanceof HTMLTextAreaElement) keepText = composer.value;
   render();
   try {
@@ -328,7 +333,7 @@ async function dispatch(kind: ActionKind, field?: Field): Promise<void> {
 }
 
 async function startTask(): Promise<void> {
-  const composer = document.getElementById("composer");
+  const composer = document.getElementById("composer-text");
   const text =
     composer instanceof HTMLTextAreaElement ? composer.value.trim() : keepText.trim();
   if (text === "") {
@@ -394,10 +399,56 @@ function fail(error: unknown): void {
   reconnect();
 }
 
+/**
+ * 把派生出来的对话记录同步到 `#stream`。
+ *
+ * 三条规则，都是为了"重渲染不重播"：
+ *
+ * 1. **按 `id` 复用节点**：同一条消息第二次出现时不重建，只改文本。`id` 由
+ *    `transcriptOf` 从 `(状态, 步骤, 字段)` 决定，所以它对同一份视图是稳定的。
+ * 2. **消息只会变长**：服务端的派生结果只会追加或原地改写（同一个字段从"待填"
+ *    变成"已答"是 `q:...:open` 退场、`q:...` 入场），不会把中间那段删掉重排。
+ *    因此不清空容器——清空就等于把整段历史重播一遍，滚动位置也跟着跳。
+ * 3. **只在追加时滚到底**：人在往上翻旧消息时不要把他拽回来。
+ */
+function syncStream(messages: Message[]): void {
+  const wanted = new Set(messages.map((message) => message.id));
+  // 先删掉这次不该出现的（例如"返回修改"撤回了当前字段的追问）。
+  for (const node of Array.from(streamEl.children)) {
+    const id = (node as HTMLElement).dataset["msg"] ?? "";
+    if (!wanted.has(id)) node.remove();
+  }
+  const atBottom =
+    streamEl.scrollHeight - streamEl.scrollTop - streamEl.clientHeight < 24;
+  const existing = new Map<string, HTMLElement>();
+  for (const node of Array.from(streamEl.children)) {
+    const element = node as HTMLElement;
+    existing.set(element.dataset["msg"] ?? "", element);
+  }
+  let appended = false;
+  for (const message of messages) {
+    let node = existing.get(message.id);
+    if (node === undefined) {
+      node = messageNode(message);
+      streamEl.appendChild(node);
+      appended = true;
+      continue;
+    }
+    if (node.textContent !== message.text) node.textContent = message.text;
+  }
+  if (appended || atBottom) streamEl.scrollTop = streamEl.scrollHeight;
+}
+
+function messageNode(message: Message): HTMLElement {
+  const row = el("div", `msg ${message.kind} ${message.role}`);
+  row.dataset["msg"] = message.id;
+  row.appendChild(el("div", "bubble", message.text));
+  return row;
+}
+
 // ---------- 渲染 ----------
 
 function render(): void {
-  appEl.replaceChildren();
   renderConnection();
   noticeEl.className = notice === null ? "" : "notice";
   noticeEl.textContent = notice ?? "";
@@ -405,8 +456,12 @@ function render(): void {
   const screen = screenOf(view);
   // 修改态只属于确认页；状态一变就退出，避免本地模式跨状态残留。
   if (screen.state !== "awaiting_confirmation") editing = null;
-  appEl.appendChild(statusCard(screen));
-  appEl.appendChild(panel(screen));
+
+  // 消息流由服务端视图派生，页面不累积任何数组。
+  syncStream(transcriptOf(view));
+
+  panelEl.replaceChildren(statusCard(screen), panel(screen));
+  renderComposer(screen);
 }
 
 function renderConnection(): void {
@@ -443,10 +498,6 @@ function statusCard(screen: Screen): HTMLElement {
 function panel(screen: Screen): HTMLElement {
   const box = el("section", "card panel");
 
-  if (screen.state === "idle" || screen.state === "needs_clarification") {
-    box.appendChild(composer());
-  }
-
   if (screen.state === "awaiting_input" && screen.field !== null) {
     box.appendChild(fieldForm(screen.field));
     box.appendChild(summaryList(screen, false));
@@ -481,6 +532,14 @@ function panel(screen: Screen): HTMLElement {
     box.appendChild(summaryList(screen, false));
   }
 
+  if (screen.state === "failed" && view !== null && view.failure_code !== null) {
+    // 失败原因不印 `failure_message`（那是工具/模型侧原话）。这里给的是"可以去哪里
+    // 问"这一条可确认的事实，不是猜测的失败理由。
+    box.appendChild(
+      el("p", "muted", "如需要进一步说明，请携带受理编号联系办理单位。"),
+    );
+  }
+
   if (editing !== null) {
     // 修改态的操作条换成本地提交，避免同时出现"确认提交"和"保存修改"。
     return box;
@@ -489,19 +548,64 @@ function panel(screen: Screen): HTMLElement {
   return box;
 }
 
-function composer(): HTMLElement {
-  const wrapper = el("div", "composer");
-  const label = el("label", "", "请描述您要办理的事情");
-  label.setAttribute("for", "composer");
-  const area = el("textarea");
-  area.id = "composer";
-  area.rows = 3;
-  area.maxLength = 2000;
-  area.placeholder = "例如：我想给家里老人办一下高龄补贴";
-  if (keepText !== "") area.value = keepText;
-  wrapper.appendChild(label);
-  wrapper.appendChild(area);
-  return wrapper;
+/**
+ * 常驻输入框。**整页只建一次**，之后只切换启用态——这样重渲染不会清掉人正在
+ * 敲的字，焦点也不会每收一条 SSE 提醒就丢一次。
+ *
+ * "现在不能输入"不是一个按钮的禁用态，而是一句话：群众要能看出为什么打不了字，
+ * 而不是对着一个灰框发呆。所以禁用时把原因写进占位符。
+ */
+function renderComposer(screen: Screen): void {
+  const active =
+    (screen.state === "idle" || screen.state === "needs_clarification") && !busy;
+  const area = document.getElementById("composer-text");
+
+  if (composerEl.childElementCount === 0) {
+    const label = el("label", "", "请描述您要办理的事情");
+    label.setAttribute("for", "composer-text");
+    const text = el("textarea");
+    text.id = "composer-text";
+    text.rows = 2;
+    text.maxLength = 2000;
+    text.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        const send = document.getElementById("composer-send");
+        if (send instanceof HTMLButtonElement && !send.disabled) send.click();
+      }
+    });
+    const send = el("button", "primary", "发送");
+    send.id = "composer-send";
+    send.type = "submit";
+    composerEl.appendChild(label);
+    composerEl.appendChild(text);
+    composerEl.appendChild(send);
+    composerEl.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void perform("start");
+    });
+  }
+
+  if (active) {
+    (composerEl.firstElementChild as HTMLElement).textContent = "请描述您要办理的事情";
+  } else {
+    (composerEl.firstElementChild as HTMLElement).textContent = `现在不用您打字：${
+      screen.state === "awaiting_input" ? "请在下方补充这一项。" : screen.hint
+    }`;
+  }
+
+  const text = document.getElementById("composer-text");
+  if (text instanceof HTMLTextAreaElement) {
+    text.disabled = !active;
+    text.placeholder = active
+      ? "例如：我想给家里老人办一下高龄补贴"
+      : "这一步请用下面的表单或按钮继续。";
+    // 只在值真的不同时才写：否则每收一条事件都会把光标顶到末尾。
+    if (text.value !== keepText && active) text.value = keepText;
+    if (!active && text.value === "") text.value = "";
+  }
+  const send = document.getElementById("composer-send");
+  if (send instanceof HTMLButtonElement) send.disabled = !active;
 }
 
 function fieldForm(field: Field): HTMLElement {

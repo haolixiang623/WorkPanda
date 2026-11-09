@@ -1,4 +1,4 @@
-import { answerRequest, canSubmit, confirmRequest, connectionNotice, fieldOf, screenOf, } from "./state_view.js";
+import { answerRequest, canSubmit, confirmRequest, connectionNotice, fieldOf, screenOf, transcriptOf, } from "./state_view.js";
 const SESSION_HEADER = "X-WorkPanda-Session";
 const SESSION_KEY = "workpanda.session";
 const TASK_KEY = "workpanda.task";
@@ -6,7 +6,9 @@ const CONVERSATION_KEY = "workpanda.conversation";
 const MAX_ATTEMPTS = 5;
 const connectionEl = must("connection");
 const noticeEl = must("notice");
-const appEl = must("app");
+const streamEl = must("stream");
+const panelEl = must("panel");
+const composerEl = must("composer");
 let session = sessionStorage.getItem(SESSION_KEY) ?? "";
 let taskId = sessionStorage.getItem(TASK_KEY) ?? "";
 let conversationId = sessionStorage.getItem(CONVERSATION_KEY) ?? newConversationId();
@@ -230,7 +232,7 @@ async function perform(kind, field) {
         return;
     busy = true;
     notice = null;
-    const composer = document.getElementById("composer");
+    const composer = document.getElementById("composer-text");
     if (composer instanceof HTMLTextAreaElement)
         keepText = composer.value;
     render();
@@ -275,7 +277,7 @@ async function dispatch(kind, field) {
     }
 }
 async function startTask() {
-    const composer = document.getElementById("composer");
+    const composer = document.getElementById("composer-text");
     const text = composer instanceof HTMLTextAreaElement ? composer.value.trim() : keepText.trim();
     if (text === "") {
         notice = "请先描述您要办理的事情。";
@@ -338,16 +340,50 @@ function fail(error) {
     notice = "网络异常，请稍后重试。";
     reconnect();
 }
+function syncStream(messages) {
+    const wanted = new Set(messages.map((message) => message.id));
+    for (const node of Array.from(streamEl.children)) {
+        const id = node.dataset["msg"] ?? "";
+        if (!wanted.has(id))
+            node.remove();
+    }
+    const atBottom = streamEl.scrollHeight - streamEl.scrollTop - streamEl.clientHeight < 24;
+    const existing = new Map();
+    for (const node of Array.from(streamEl.children)) {
+        const element = node;
+        existing.set(element.dataset["msg"] ?? "", element);
+    }
+    let appended = false;
+    for (const message of messages) {
+        let node = existing.get(message.id);
+        if (node === undefined) {
+            node = messageNode(message);
+            streamEl.appendChild(node);
+            appended = true;
+            continue;
+        }
+        if (node.textContent !== message.text)
+            node.textContent = message.text;
+    }
+    if (appended || atBottom)
+        streamEl.scrollTop = streamEl.scrollHeight;
+}
+function messageNode(message) {
+    const row = el("div", `msg ${message.kind} ${message.role}`);
+    row.dataset["msg"] = message.id;
+    row.appendChild(el("div", "bubble", message.text));
+    return row;
+}
 function render() {
-    appEl.replaceChildren();
     renderConnection();
     noticeEl.className = notice === null ? "" : "notice";
     noticeEl.textContent = notice ?? "";
     const screen = screenOf(view);
     if (screen.state !== "awaiting_confirmation")
         editing = null;
-    appEl.appendChild(statusCard(screen));
-    appEl.appendChild(panel(screen));
+    syncStream(transcriptOf(view));
+    panelEl.replaceChildren(statusCard(screen), panel(screen));
+    renderComposer(screen);
 }
 function renderConnection() {
     const info = connectionNotice(connection);
@@ -380,9 +416,6 @@ function statusCard(screen) {
 }
 function panel(screen) {
     const box = el("section", "card panel");
-    if (screen.state === "idle" || screen.state === "needs_clarification") {
-        box.appendChild(composer());
-    }
     if (screen.state === "awaiting_input" && screen.field !== null) {
         box.appendChild(fieldForm(screen.field));
         box.appendChild(summaryList(screen, false));
@@ -413,26 +446,64 @@ function panel(screen) {
     if (screen.state === "completed" && screen.summary.length > 0) {
         box.appendChild(summaryList(screen, false));
     }
+    if (screen.state === "failed" && view !== null && view.failure_code !== null) {
+        box.appendChild(el("p", "muted", "如需要进一步说明，请携带受理编号联系办理单位。"));
+    }
     if (editing !== null) {
         return box;
     }
     box.appendChild(actionBar(screen));
     return box;
 }
-function composer() {
-    const wrapper = el("div", "composer");
-    const label = el("label", "", "请描述您要办理的事情");
-    label.setAttribute("for", "composer");
-    const area = el("textarea");
-    area.id = "composer";
-    area.rows = 3;
-    area.maxLength = 2000;
-    area.placeholder = "例如：我想给家里老人办一下高龄补贴";
-    if (keepText !== "")
-        area.value = keepText;
-    wrapper.appendChild(label);
-    wrapper.appendChild(area);
-    return wrapper;
+function renderComposer(screen) {
+    const active = (screen.state === "idle" || screen.state === "needs_clarification") && !busy;
+    const area = document.getElementById("composer-text");
+    if (composerEl.childElementCount === 0) {
+        const label = el("label", "", "请描述您要办理的事情");
+        label.setAttribute("for", "composer-text");
+        const text = el("textarea");
+        text.id = "composer-text";
+        text.rows = 2;
+        text.maxLength = 2000;
+        text.addEventListener("keydown", (event) => {
+            if (event.key === "Enter" && !event.shiftKey) {
+                event.preventDefault();
+                const send = document.getElementById("composer-send");
+                if (send instanceof HTMLButtonElement && !send.disabled)
+                    send.click();
+            }
+        });
+        const send = el("button", "primary", "发送");
+        send.id = "composer-send";
+        send.type = "submit";
+        composerEl.appendChild(label);
+        composerEl.appendChild(text);
+        composerEl.appendChild(send);
+        composerEl.addEventListener("submit", (event) => {
+            event.preventDefault();
+            void perform("start");
+        });
+    }
+    if (active) {
+        composerEl.firstElementChild.textContent = "请描述您要办理的事情";
+    }
+    else {
+        composerEl.firstElementChild.textContent = `现在不用您打字：${screen.state === "awaiting_input" ? "请在下方补充这一项。" : screen.hint}`;
+    }
+    const text = document.getElementById("composer-text");
+    if (text instanceof HTMLTextAreaElement) {
+        text.disabled = !active;
+        text.placeholder = active
+            ? "例如：我想给家里老人办一下高龄补贴"
+            : "这一步请用下面的表单或按钮继续。";
+        if (text.value !== keepText && active)
+            text.value = keepText;
+        if (!active && text.value === "")
+            text.value = "";
+    }
+    const send = document.getElementById("composer-send");
+    if (send instanceof HTMLButtonElement)
+        send.disabled = !active;
 }
 function fieldForm(field) {
     const wrapper = el("div", "composer");

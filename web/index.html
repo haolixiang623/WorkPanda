@@ -30,6 +30,23 @@
     .status.awaiting_confirmation { border-color: #cfdcf5; background: #f5f8fe; }
     .status.user_action_required { border-color: #f2e2c4; background: #fffaf1; }
     .muted { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+    /* 消息流：只追加、不重建。每条消息按 id 复用节点，重渲染不重播。 */
+    .stream { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px;
+              max-height: 58vh; overflow-y: auto; overscroll-behavior: contain; }
+    .msg { display: flex; }
+    .msg.user { justify-content: flex-end; }
+    .msg .bubble { max-width: 86%; padding: 9px 12px; border-radius: 12px;
+                   white-space: pre-wrap; word-break: break-word; }
+    .msg.assistant .bubble { background: #fff; border: 1px solid var(--line);
+                             border-top-left-radius: 4px; }
+    .msg.user .bubble { background: var(--brand); color: #fff;
+                        border-top-right-radius: 4px; }
+    .msg.opening .bubble { background: #f0f5fd; border-color: #cfdcf5; }
+    .msg.confirmation .bubble { background: #f5f8fe; border-color: #cfdcf5; }
+    .msg.guide .bubble { background: #fffaf1; border-color: #f2e2c4; }
+    .msg.result .bubble { background: #f4fbf6; border-color: #b9e3c6; }
+    .msg.status .bubble { background: #fdf6f7; border-color: #f0d6da; color: var(--warn); }
+    .msg.field_question .bubble { color: var(--muted); font-size: 14px; }
     .composer { display: flex; flex-direction: column; gap: 6px; }
     .composer label { font-size: 13px; color: var(--muted); }
     textarea, input[type="text"] { width: 100%; padding: 9px 10px; font: inherit;
@@ -76,7 +93,12 @@
 
     <div id="connection" class="connection" role="status" aria-live="polite"></div>
     <div id="notice" role="alert"></div>
-    <main id="app"></main>
+    <!-- 对话记录。由 dist/main.js 按 TaskView 派生后追加到 #stream，不从服务端拉历史文本。 -->
+    <main id="stream" class="stream" aria-live="polite" aria-label="对话记录"></main>
+    <!-- 底部的操作区：卡片（状态、待填表单、确认摘要、按钮）。 -->
+    <section id="panel"></section>
+    <!-- 常驻输入框：任何状态下都在，不能填的时候禁用并写明原因。 -->
+    <form id="composer" class="card composer" autocomplete="off"></form>
 
     <footer>
       <p>本次页面不会保存您填写的内容；关闭页面后需重新开始。</p>
