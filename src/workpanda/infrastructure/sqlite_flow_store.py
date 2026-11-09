@@ -112,6 +112,11 @@ class SqliteFlowStore:
                     ),
                 )
             except sqlite3.IntegrityError as exc:
+                # 必须回滚再抛：SQLite 在事务里遇到约束冲突只终止这一条语句，事务
+                # 与它的写锁都还在。留着它，共用同一库文件的其它存储（回放用例、
+                # 任务、留痕）会在 busy_timeout 后全部拿到 `database is locked`，
+                # 症状是"建版时多点了一次，之后整台机器存不进去，要重启才好"。
+                self._conn.rollback()
                 raise FlowVersionExists(
                     f"flow {flow.flow_id!r} version {flow.version!r} already exists"
                 ) from exc

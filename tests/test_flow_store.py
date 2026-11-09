@@ -66,6 +66,34 @@ def test_adding_same_version_twice_is_rejected(store: SqliteFlowStore) -> None:
     assert [flow.version for flow in store.list_versions(FLOW_ID)] == ["1"]
 
 
+def test_rejected_duplicate_releases_the_write_lock(workdir: Path) -> None:
+    """被拒的重复写入必须回滚，否则写锁会留给库文件里的其它连接。
+
+    生产里的表现不是"重复建版报 409"这么干净，而是：运维多点了一次发布，之后回放
+    用例、任务、留痕全部报 `database is locked`，要重启服务才好——因为流程库、用例
+    库、任务库共用同一个 sqlite 文件。
+
+    刻意用**第二条连接**来断言锁是否放掉：同一个连接上看不出这件事（SQLite 的事务
+    是按连接算的），只用 `store` 复用会让用例在修复前后一样通过。
+    """
+
+    path = workdir / "flows.db"
+    first = SqliteFlowStore(path)
+    try:
+        first.add_version(make_flow("1"))
+        with pytest.raises(FlowVersionExists):
+            first.add_version(make_flow("1"))
+
+        second = SqliteFlowStore(path)
+        try:
+            second.add_version(make_flow("2"))
+            assert [flow.version for flow in second.list_versions(FLOW_ID)] == ["1", "2"]
+        finally:
+            second.close()
+    finally:
+        first.close()
+
+
 def test_existing_version_content_is_not_overwritten(store: SqliteFlowStore) -> None:
     """同版本号的另一份内容必须写不进去：否则"回滚到 v1"回滚的是别的东西。"""
 
