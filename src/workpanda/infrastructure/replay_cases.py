@@ -98,6 +98,10 @@ class SqliteReplayCaseStore:
                     ),
                 )
             except sqlite3.IntegrityError as exc:
+                # 同 `SqliteFlowStore.add_version`：不回滚就把写锁留给下一个写入方，
+                # 而"用例重名"是运维最常撞到的一种冲突（重试一次就命中），
+                # 放过它等于让一次手滑锁死整个库文件。
+                self._conn.rollback()
                 raise ReplayCaseExists(
                     f"replay case {case.case_id!r} for "
                     f"{case.flow_id!r}@{case.flow_version} already exists"

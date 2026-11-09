@@ -516,6 +516,31 @@ def test_case_store_roundtrip_and_duplicate(backend, workdir: Path) -> None:
         store.close()
 
 
+def test_rejected_duplicate_case_does_not_lock_the_database(workdir: Path) -> None:
+    """重复用例被拒后必须回滚，否则同一库文件的其它写入方会拿到 `database is locked`。
+
+    用例重名是运维最容易撞上的冲突：提交超时后重试一次就命中。留住的写锁代价最大
+    ——之后的建版、发布、任务写入全都会失败，而且只有重启服务能恢复。
+    """
+
+    db = workdir / "cases.db"
+    first = SqliteReplayCaseStore(db)
+    try:
+        first.add(_case(READ_FLOW))
+        with pytest.raises(ReplayCaseExists):
+            first.add(_case(READ_FLOW))
+
+        second = SqliteReplayCaseStore(db)
+        try:
+            second.add(_case(READ_FLOW, case_id="second"))
+            listed = second.list(READ_FLOW.flow_id, READ_FLOW.version)
+            assert [item.case_id for item in listed] == ["happy", "second"]
+        finally:
+            second.close()
+    finally:
+        first.close()
+
+
 def test_cases_are_scoped_to_version(workdir: Path) -> None:
     store = _case_store("sqlite", workdir)
     try:
