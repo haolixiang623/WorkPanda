@@ -4,6 +4,7 @@ export const UI_STATES = [
     "processing",
     "needs_clarification",
     "awaiting_input",
+    "awaiting_action",
     "awaiting_confirmation",
     "completed",
     "failed",
@@ -81,12 +82,7 @@ export function canSubmit(field) {
 }
 export function screenStateOf(view) {
     const declared = UI_STATES.find((state) => state === view.ui_state);
-    if (declared === undefined)
-        return "outcome_unconfirmed";
-    if (declared === "awaiting_input" && view.pending_fields.length === 0) {
-        return "user_action_required";
-    }
-    return declared;
+    return declared ?? "outcome_unconfirmed";
 }
 export function screenOf(view) {
     if (view === null)
@@ -118,22 +114,29 @@ export function screenOf(view) {
             actions.push(CANCEL);
             return { ...base, summary, impact: view.confirm_message, actions };
         }
-        case "user_action_required": {
-            const field = nextField(view);
+        case "awaiting_action": {
+            const guide = view.user_action;
+            const expired = guide !== null && guide.remaining_seconds <= 0;
+            const checking = guide !== null && guide.awaiting_check;
+            const actions = [];
+            if (!expired && !checking)
+                actions.push(I_FINISHED);
+            actions.push(CANCEL);
             return {
                 ...base,
-                title: "需要您本人操作",
-                hint: "请在办理页面完成操作，完成后回到这里继续。",
-                field,
+                field: null,
+                summary: collected(view),
                 guide: {
-                    what: view.current_step_title ?? "按页面提示完成操作",
-                    where: view.current_step_prompt ?? "请按办理页面上的提示操作",
-                    expires: "有效期以办理页面上的提示为准",
+                    what: guide === null ? (view.current_step_title ?? "按页面提示完成操作") : guide.what,
+                    where: guide === null ? "请按办理页面上的提示操作" : guide.where,
+                    expires: expiresText(guide),
                 },
-                actions: [I_FINISHED, CANCEL],
-                blockedReason: field === null
-                    ? "当前没有需要提交的内容；在办理页面完成后，本页会自动更新。"
-                    : null,
+                actions,
+                blockedReason: expired
+                    ? "这次操作已经超过有效期，需要转人工协助；请不要重复尝试。"
+                    : checking
+                        ? "正在核实您刚才的操作，请稍候。"
+                        : null,
             };
         }
         case "completed":
@@ -150,6 +153,21 @@ export function screenOf(view) {
             return { ...base, actions: [START] };
     }
 }
+function expiresText(guide) {
+    if (guide === null)
+        return "有效期以办理页面上的提示为准";
+    if (guide.remaining_seconds <= 0)
+        return "已超过有效期";
+    const minutes = Math.floor(guide.remaining_seconds / 60);
+    if (minutes < 1)
+        return "请在接下来的一分钟内完成";
+    return `请在接下来的 ${minutes} 分钟内完成`;
+}
+export function finishedRequest() {
+    return { values: { [I_FINISHED_KEY]: I_FINISHED_VALUE } };
+}
+const I_FINISHED_KEY = "i_finished";
+const I_FINISHED_VALUE = "done";
 export function answerRequest(field) {
     return { values: { [field.name]: field.value } };
 }
@@ -237,7 +255,7 @@ export function transcriptOf(view) {
         });
     }
     if (state === "awaiting_input" ||
-        state === "user_action_required" ||
+        state === "awaiting_action" ||
         state === "received" ||
         state === "processing") {
         const field = nextField(view);
@@ -257,24 +275,25 @@ export function transcriptOf(view) {
                 text: field.label,
             });
         }
-        else if (state === "user_action_required") {
+        else if (state === "awaiting_action") {
+            const guide = view.user_action;
             messages.push({
                 id: `guide:${stepOf(view)}:what`,
                 kind: "guide",
                 role: "assistant",
-                text: `这一步需要您本人操作：${view.current_step_title ?? "请按页面提示完成操作"}。`,
+                text: `这一步需要您本人操作：${guide === null ? "请按页面提示完成操作" : guide.what}。`,
             });
             messages.push({
                 id: `guide:${stepOf(view)}:where`,
                 kind: "guide",
                 role: "assistant",
-                text: view.current_step_prompt ?? "请按办理页面上的提示操作。",
+                text: guide === null ? "请按办理页面上的提示操作。" : `在哪里做：${guide.where}。`,
             });
             messages.push({
                 id: `guide:${stepOf(view)}:expires`,
                 kind: "guide",
                 role: "assistant",
-                text: "有效期以办理页面上的提示为准。",
+                text: guide === null ? "有效期以办理页面上的提示为准。" : `${expiresText(guide)}。`,
             });
         }
         else if (state === "received" || state === "processing") {

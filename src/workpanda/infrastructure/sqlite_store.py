@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     completed_steps TEXT NOT NULL,
     slots TEXT NOT NULL,
     pending_fields TEXT NOT NULL,
+    user_action_expires_at TEXT,
+    user_action_confirmed_at TEXT,
     result TEXT,
     failure_code TEXT,
     failure_message TEXT,
@@ -74,6 +76,15 @@ CREATE INDEX IF NOT EXISTS idx_tasks_cursor
 CREATE INDEX IF NOT EXISTS idx_task_events_occurred
     ON task_events (task_id, occurred_at);
 """
+
+# 旧库补列。`CREATE TABLE IF NOT EXISTS` 对已存在的表什么都不做，所以必须显式检查
+# （与 `sqlite_flow_store` 同一套做法）。只加列、不改已有列：迁移本身不能成为一次
+# 数据改写的机会。补出来的列在旧行上为 NULL，读出即 `None`，与"这任务从来没进过
+# 用户操作节点"是同一种语义——不需要回填，回填反而会凭空造出一个到期时刻。
+_COLUMN_MIGRATIONS: dict[str, str] = {
+    "user_action_expires_at": "ALTER TABLE tasks ADD COLUMN user_action_expires_at TEXT",
+    "user_action_confirmed_at": "ALTER TABLE tasks ADD COLUMN user_action_confirmed_at TEXT",
+}
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -175,8 +186,25 @@ class SqliteStore:
         # trace / checkpoint 与任务数据共用同一个文件，短暂写冲突应等待而不是直接抛 locked。
         self._conn.execute("PRAGMA busy_timeout = 3000")
         self._conn.executescript(SCHEMA)
+        self._ensure_columns()
         _normalize_timestamps(self._conn)
         self._conn.commit()
+
+    def _ensure_columns(self) -> None:
+        """给旧库补列。幂等：每次启动都按实际列名核对一遍。
+
+        旧库是"能用但缺列"的库，直接 `ALTER TABLE ... ADD COLUMN` 撞上已补过的列
+        会抛 `duplicate column name`，所以先读 `PRAGMA table_info` 再决定。
+        只加列不加默认值：补出来的列在旧行上是 NULL，读出来是 `None`，语义就是
+        "这任务从来没进过用户操作节点"，不需要也不应该回填。
+        """
+
+        existing = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(tasks)").fetchall()
+        }
+        for column, statement in _COLUMN_MIGRATIONS.items():
+            if column not in existing:
+                self._conn.execute(statement)
 
     def close(self) -> None:
         with self._lock:
@@ -190,9 +218,10 @@ class SqliteStore:
                 """
                 INSERT INTO tasks (
                     task_id, conversation_id, user_ref, flow_id, flow_version, status,
-                    current_step, completed_steps, slots, pending_fields, result,
+                    current_step, completed_steps, slots, pending_fields,
+                    user_action_expires_at, user_action_confirmed_at, result,
                     failure_code, failure_message, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 self._row_values(task),
             )
@@ -212,7 +241,8 @@ class SqliteStore:
         UPDATE tasks SET
             conversation_id = ?, user_ref = ?, flow_id = ?, flow_version = ?,
             status = ?, current_step = ?, completed_steps = ?, slots = ?,
-            pending_fields = ?, result = ?, failure_code = ?, failure_message = ?,
+            pending_fields = ?, user_action_expires_at = ?, user_action_confirmed_at = ?,
+            result = ?, failure_code = ?, failure_message = ?,
             created_at = ?, updated_at = ?
         WHERE task_id = ?
     """
@@ -230,6 +260,8 @@ class SqliteStore:
             json.dumps(task.completed_steps),
             json.dumps(task.slots),
             json.dumps(task.pending_fields),
+            _iso(task.user_action_expires_at),
+            _iso(task.user_action_confirmed_at),
             json.dumps(task.result) if task.result is not None else None,
             task.failure_code,
             task.failure_message,
@@ -508,6 +540,8 @@ class SqliteStore:
             json.dumps(task.completed_steps),
             json.dumps(task.slots),
             json.dumps(task.pending_fields),
+            _iso(task.user_action_expires_at),
+            _iso(task.user_action_confirmed_at),
             json.dumps(task.result) if task.result is not None else None,
             task.failure_code,
             task.failure_message,
@@ -528,6 +562,8 @@ class SqliteStore:
             completed_steps=json.loads(row["completed_steps"]),
             slots=json.loads(row["slots"]),
             pending_fields=json.loads(row["pending_fields"]),
+            user_action_expires_at=_dt(row["user_action_expires_at"]),
+            user_action_confirmed_at=_dt(row["user_action_confirmed_at"]),
             result=json.loads(row["result"]) if row["result"] else None,
             failure_code=row["failure_code"],
             failure_message=row["failure_message"],

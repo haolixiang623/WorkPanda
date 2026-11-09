@@ -32,7 +32,13 @@ from fastapi.testclient import TestClient
 
 from workpanda.bootstrap import build_container
 from workpanda.config import Settings
-from workpanda.domain.flow import FlowDefinition, FlowStatus, StepDefinition, StepKind
+from workpanda.domain.flow import (
+    FlowDefinition,
+    FlowStatus,
+    StepDefinition,
+    StepKind,
+    UserActionSpec,
+)
 from workpanda.domain.models import Task, TaskAnswerRequest, TaskCreateRequest, TaskView
 from workpanda.infrastructure.adapters import ScriptedExecutor
 from workpanda.infrastructure.demo_flows import demo_flows
@@ -50,6 +56,7 @@ SERVER_STATES = (
     "processing",
     "needs_clarification",
     "awaiting_input",
+    "awaiting_action",
     "awaiting_confirmation",
     "completed",
     "failed",
@@ -317,6 +324,125 @@ def test_walkthrough_create_answer_confirm_complete() -> None:
         container.close()
 
 
+def test_walkthrough_i_finished_over_http() -> None:
+    """「需要本人操作」全链路：暂停 → 我已完成 → 复检 → 完成。
+
+    走的是 `web/src/main.ts` 真实发出的那串请求。这里盯三件页面拿不到第二份答案
+    的事：三要素是否由服务端给全、「我已完成」是否用 `/answers` 而不是 `/confirm`、
+    复检结果是否才是判定依据。
+    """
+
+    flow = FlowDefinition(
+        flow_id="web.verify",
+        version="1",
+        title="需要本人核验",
+        status=FlowStatus.PUBLISHED,
+        steps=(
+            StepDefinition(
+                step_id="collect",
+                kind=StepKind.COLLECT,
+                title="收集信息",
+                required_fields=("subject",),
+                field_labels={"subject": "办理事项"},
+            ),
+            StepDefinition(
+                step_id="login",
+                kind=StepKind.USER_ACTION,
+                title="在登录页输入图形验证码",
+                user_action=UserActionSpec(
+                    what="在登录页输入图片里的字符",
+                    where="社保网上办事大厅",
+                    expires_in_seconds=120,
+                    check_step="verify",
+                ),
+            ),
+            StepDefinition(
+                step_id="verify",
+                kind=StepKind.EXECUTE,
+                title="复检登录状态",
+                tool="web.verify",
+                answer_label="核验结果",
+            ),
+        ),
+    )
+    container = build_container(
+        Settings(store_backend="memory", enable_demo_flow=False),
+        flows=[flow],
+        executor=ScriptedExecutor(),
+    )
+    client = TestClient(create_app(container=container))
+    try:
+        created = client.post(
+            "/api/tasks",
+            json={
+                "conversation_id": "conversation-web",
+                "input_text": "我要核验",
+                "flow_id": "web.verify",
+                "flow_version": "1",
+                "slots": {"subject": "灵活就业补贴"},
+            },
+        )
+        assert created.status_code == 201, created.text
+        headers = {"X-WorkPanda-Session": created.headers["X-WorkPanda-Session"]}
+        task_id = created.json()["task_id"]
+        first = created.json()
+
+        assert first["ui_state"] == "awaiting_action"
+        assert first["i_finished_allowed"] is True
+        guide = first["user_action"]
+        assert guide["what"] == "在登录页输入图片里的字符"
+        assert guide["where"] == "社保网上办事大厅"
+        assert 0 < guide["remaining_seconds"] <= 120
+        assert guide["awaiting_check"] is False
+
+        # 与页面完全一致：只有 values，没有 step_id/accepted。
+        done = client.post(
+            f"/api/tasks/{task_id}/answers",
+            json={"values": {"i_finished": "done"}},
+            headers=headers,
+        )
+        assert done.status_code == 200, done.text
+        final = done.json()
+        assert final["ui_state"] == "completed"
+        # 复检那一步真的跑过：结果来自它，不是"用户说完成了"。
+        assert final["completed_steps"] == ["collect", "login", "verify"]
+    finally:
+        container.close()
+
+
+def test_i_finished_cannot_be_sent_as_a_confirmation() -> None:
+    """把 `i_finished` 发到 `/confirm` 会被拒：两条通道的语义不能互相顶替。"""
+
+    container, client = build_container_web()
+    try:
+        created = client.post(
+            "/api/tasks",
+            json={
+                "conversation_id": "conversation-web",
+                "input_text": "我要报修",
+                "flow_id": "web.repair",
+                "flow_version": "1",
+                "slots": {"subject": "厨房水管漏水", "contact": "13800000000"},
+            },
+        )
+        headers = {"X-WorkPanda-Session": created.headers["X-WorkPanda-Session"]}
+        task_id = created.json()["task_id"]
+        assert created.json()["ui_state"] == "awaiting_confirmation"
+
+        # 确认必须点名步骤；拿信号值冒充步骤号，服务端不认。
+        spoof = client.post(
+            f"/api/tasks/{task_id}/confirm",
+            json={"step_id": "i_finished", "accepted": True},
+            headers=headers,
+        )
+        assert spoof.status_code == 409, spoof.text
+        assert client.get(f"/api/tasks/{task_id}", headers=headers).json()["ui_state"] == (
+            "awaiting_confirmation"
+        )
+    finally:
+        container.close()
+
+
 def test_demo_flow_labels_every_field_it_asks_for() -> None:
     """凡是让群众填的字段，都得有一个能读的名字。
 
@@ -371,6 +497,8 @@ const base = {
   result: { receipt_no: "R-1", _internal: "x", detail: { nested: 1 } },
   failure_code: null,
   failure_message: null,
+  user_action: null,
+  i_finished_allowed: false,
   ui_state: "awaiting_input",
   ui_title: "服务端标题",
   ui_hint: "服务端提示",
@@ -402,6 +530,8 @@ for (const state of mod.UI_STATES) {
   );
 }
 
+// 「在等填表但没有待填字段」不再被页面擅自解释成"请去做件事"：服务端说在等
+// 填表，页面就显示填表（没有可填的字段时只留取消）。这条曾经是派生逻辑的入口。
 out.states["awaiting_input_empty_pending"] = shape(
   mod.screenOf(
     view({
@@ -409,6 +539,66 @@ out.states["awaiting_input_empty_pending"] = shape(
       pending_fields: [],
       ui_title: "标题:ui",
       ui_hint: "提示:ui",
+    }),
+  ),
+);
+
+// 真实的「需要用户本人操作」：三要素与剩余时间都来自服务端。
+out.states["awaiting_action_fresh"] = shape(
+  mod.screenOf(
+    view({
+      ui_state: "awaiting_action",
+      status: "waiting_for_action",
+      pending_fields: [],
+      user_action: {
+        what: "在登录页输入图片里的字符",
+        where: "社保网上办事大厅",
+        remaining_seconds: 150,
+        awaiting_check: false,
+      },
+      i_finished_allowed: true,
+    }),
+  ),
+);
+out.states["awaiting_action_expired"] = shape(
+  mod.screenOf(
+    view({
+      ui_state: "awaiting_action",
+      status: "waiting_for_action",
+      pending_fields: [],
+      user_action: {
+        what: "在登录页输入图片里的字符",
+        where: "社保网上办事大厅",
+        remaining_seconds: 0,
+        awaiting_check: false,
+      },
+      i_finished_allowed: true,
+    }),
+  ),
+);
+out.states["awaiting_action_checking"] = shape(
+  mod.screenOf(
+    view({
+      ui_state: "awaiting_action",
+      status: "waiting_for_action",
+      pending_fields: [],
+      user_action: {
+        what: "在登录页输入图片里的字符",
+        where: "社保网上办事大厅",
+        remaining_seconds: 120,
+        awaiting_check: true,
+      },
+      i_finished_allowed: true,
+    }),
+  ),
+);
+out.states["awaiting_action_without_guide"] = shape(
+  mod.screenOf(
+    view({
+      ui_state: "awaiting_action",
+      status: "waiting_for_action",
+      pending_fields: [],
+      user_action: null,
     }),
   ),
 );
@@ -425,6 +615,7 @@ out.states["unknown_state"] = shape(mod.screenOf(view({ ui_state: "brand_new_sta
 out.states["no_task"] = shape(mod.screenOf(null));
 
 out.requests.answer = mod.answerRequest({ name: "contact", label: "联系电话", value: "1" });
+out.requests.finished = mod.finishedRequest();
 out.requests.confirm = mod.confirmRequest(
   view({ ui_state: "awaiting_confirmation", current_step: "submit" }),
 );
@@ -540,8 +731,6 @@ def test_server_copy_is_shown_verbatim() -> None:
     probe = _run_probe()
     for state in SERVER_STATES:
         screen = probe["states"][state]
-        if screen["state"] == "user_action_required":
-            continue
         assert screen["title"] == "标题:" + state, state
         assert probe["states"][state]["title"] != ""
 
@@ -585,8 +774,10 @@ def test_clarification_shows_the_step_authors_prompt() -> None:
     assert probe["states"]["awaiting_input"]["hint"] == "请说一下要报修什么。"
     # 没有作者文案时回退到服务端的状态提示，不自造一句。
     assert probe["states"]["awaiting_input_without_prompt"]["hint"] == "提示:缺省"
-    # 由它派生出的「需要用户操作」不受影响：那一屏有自己的三要素。
-    assert probe["states"]["awaiting_input_empty_pending"]["hint"] != "请说一下要报修什么。"
+    # 「等填表但没有待填字段」不再变成另一屏：它仍按填表屏处理（作者文案照用），
+    # 只是没有可提交的字段时只留取消。页面不替服务端改写状态（#80）。
+    assert probe["states"]["awaiting_input_empty_pending"]["hint"] == "请说一下要报修什么。"
+    assert probe["states"]["awaiting_input_empty_pending"]["state"] == "awaiting_input"
 
 
 def test_confirmation_shows_action_fields_and_impact() -> None:
@@ -601,19 +792,66 @@ def test_confirmation_shows_action_fields_and_impact() -> None:
     assert probe["requests"]["confirm"] == {"step_id": "submit", "accepted": True}
 
 
-def test_user_action_required_needs_no_new_task_status() -> None:
-    """「需要用户操作」由服务端事实派生：在等用户，但没让用户填表。"""
+def test_user_action_screen_comes_from_the_server_state() -> None:
+    """「需要用户本人操作」是服务端状态 `awaiting_action`，不是页面推出来的。
+
+    #77 时服务端还没有这个状态，页面靠"在等填表但没待填字段"派生了一屏。那种
+    派生有两个问题：一是页面在替服务端解释状态，二是服务端一旦给出"等填表"
+    却没有字段的坏数据，页面会把它显示成"请去做件事"。这里把两件事分开断言。
+    """
 
     probe = _run_probe()
-    screen = probe["states"]["awaiting_input_empty_pending"]
-    assert screen["state"] == "user_action_required"
-    assert set(screen["guide"]) == {"what", "where", "expires"}
-    assert screen["guide"]["what"] == "收集报修信息"
-    assert screen["guide"]["where"] == "请说一下要报修什么。"
-    assert screen["title"] == "需要您本人操作"
-    assert screen["actions"] == ["i_finished", "cancel"]
-    # 服务端还没给可提交的字段时按钮不启用，并写明原因——不留一个点了就 422 的按钮。
+
+    # 真实状态：三要素、剩余时间、按钮都来自服务端。
+    fresh = probe["states"]["awaiting_action_fresh"]
+    assert fresh["state"] == "awaiting_action"
+    assert set(fresh["guide"]) == {"what", "where", "expires"}
+    assert fresh["guide"]["what"] == "在登录页输入图片里的字符"
+    assert fresh["guide"]["where"] == "社保网上办事大厅"
+    assert fresh["guide"]["expires"] == "请在接下来的 2 分钟内完成"
+    assert fresh["actions"] == ["i_finished", "cancel"]
+    assert fresh["blocked"] is False
+    # 标题也来自服务端（探针里这一屏没覆写 title，用的就是基线值）。
+    assert fresh["title"] == "服务端标题"
+
+    # 旧派生入口必须彻底消失：在等填表就是等填表，页面不改写它。
+    derived = probe["states"]["awaiting_input_empty_pending"]
+    assert derived["state"] == "awaiting_input"
+    assert derived["guide"] is None
+    assert "i_finished" not in derived["actions"]
+    assert set(derived["actions"]) == {"cancel"}
+
+
+def test_expired_action_offers_no_way_forward() -> None:
+    """二维码/验证码过期：给出说明，收掉按钮，不报成功也不静默重试。"""
+
+    probe = _run_probe()
+    screen = probe["states"]["awaiting_action_expired"]
+    assert screen["state"] == "awaiting_action"
+    assert screen["guide"]["expires"] == "已超过有效期"
+    # 没有「我已完成」可点：点下去服务端只会转人工，留个能点的按钮等于骗人。
+    assert screen["actions"] == ["cancel"]
     assert screen["blocked"] is True
+    assert "超过有效期" in screen["guide"]["expires"] or screen["blocked"] is True
+
+
+def test_checking_state_hides_the_button_again() -> None:
+    """已经点过了：显示"正在核实"，不再给重复入口（重复点只会 409）。"""
+
+    probe = _run_probe()
+    screen = probe["states"]["awaiting_action_checking"]
+    assert screen["actions"] == ["cancel"]
+    assert screen["blocked"] is True
+
+
+def test_action_screen_without_guide_does_not_invent_a_where() -> None:
+    """服务端没给指引时，页面不许拿步骤标题拼一个看起来像地址的东西。"""
+
+    probe = _run_probe()
+    screen = probe["states"]["awaiting_action_without_guide"]
+    assert screen["state"] == "awaiting_action"
+    assert screen["guide"]["where"] == "请按办理页面上的提示操作"
+    assert screen["guide"]["expires"] == "有效期以办理页面上的提示为准"
 
 
 def test_i_finished_never_builds_a_confirmation() -> None:
@@ -622,6 +860,11 @@ def test_i_finished_never_builds_a_confirmation() -> None:
     probe = _run_probe()
     assert probe["requests"]["answer"] == {"values": {"contact": "1"}}
     assert set(probe["requests"]["confirm"]) == {"step_id", "accepted"}
+    # 「我已完成」只带一个信号键：既不是字段值，也不可能被当成确认。
+    finished = probe["requests"]["finished"]
+    assert set(finished) == {"values"}
+    assert finished["values"] == {"i_finished": "done"}
+    assert "step_id" not in finished and "accepted" not in finished
 
 
 def test_outcome_unconfirmed_offers_no_resubmit() -> None:
@@ -884,8 +1127,25 @@ def test_compiled_bundle_is_in_sync_with_source() -> None:
     assert 'from "./state_view.js"' in main_js
     # 事件只是"去问一次服务端"的提醒：状态赋值只能来自 GET 响应。
     assert "view = await request" in main_js
-    # 群众侧能写服务端的入口各只有一处：确认凭证不可能从别的地方发出去。
+    # 确认凭证只有一个出口：任何第二处 `/confirm` 都是签发捷径。
     assert main_ts.count("/confirm") == 1
-    assert main_ts.count("/answers") == 1
     assert main_js.count("/confirm") == 1
-    assert main_js.count("/answers") == 1
+    # `/answers` 恰好两处，且两处都不能构造 `accepted`：
+    #   1. 补一个字段（`answerRequest`）；
+    #   2. 「我已完成」（`finishedRequest`，只有一个信号键）。
+    # 两者走同一条通道正是设计意图——它让"我已完成"在结构上不可能变成确认凭证。
+    # 一旦变成三处（=有人加了第三条写入路径），或某处出现 `accepted`，就该红。
+    assert main_ts.count("/answers") == 2
+    assert main_js.count("/answers") == 2
+    # `accepted` 只允许出现在 `state_view.ts` 的 `confirmRequest` 里，走到 `main.ts`
+    # 一个字都不能有：那说明有人在自己拼确认请求。扫代码主体，不扫注释——注释里
+    # 正是在解释"为什么不能带 accepted"。
+    body = re.sub(r"/\*.*?\*/", "", main_ts, flags=re.S)
+    body = re.sub(r"//[^\n]*", "", body)
+    assert "accepted" not in body
+    view_source = (WEB_DIR / "src" / "state_view.ts").read_text(encoding="utf-8")
+    view_body = re.sub(r"/\*.*?\*/", "", view_source, flags=re.S)
+    view_body = re.sub(r"//[^\n]*", "", view_body)
+    # 两处：`ConfirmRequest` 的接口声明与 `confirmRequest` 的实现。多一处就是
+    # 有人在自己拼确认请求。
+    assert view_body.count("accepted") == 2, "签发请求只能由 confirmRequest 构造"

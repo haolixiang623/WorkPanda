@@ -16,7 +16,13 @@ from workpanda.application.errors import (
 )
 from workpanda.application.ports import IntentRouter, StepCancellation
 from workpanda.application.runner import FlowRunner
-from workpanda.domain.flow import FlowDefinition, FlowNotFound, FlowNotRunnable, FlowRegistry
+from workpanda.domain.flow import (
+    FlowDefinition,
+    FlowNotFound,
+    FlowNotRunnable,
+    FlowRegistry,
+    StepKind,
+)
 from workpanda.domain.models import (
     EventType,
     Task,
@@ -108,6 +114,18 @@ class TaskService:
     def answer(self, task_id: UUID, request: TaskAnswerRequest, subject: str) -> Task:
         task = self._active_task(task_id, subject)
         step = self._current_step(task)
+
+        # 「我已完成」：一句信号，不是一次回答。
+        #
+        # 有意的取舍——它和"补字段"共用同一条通道（页面只发 `values`，从不构造
+        # `step_id`/`accepted`），但服务端在**能认出它**的地方把它当成另一件事：
+        # 不写槽位、不签发凭证、不带任何用户输入，只翻状态后交给复检。
+        #
+        # 为什么不给它单独一条接口：群众页写服务端的入口越少越好，多一条就多一处
+        # 可能被改成"顺手签发确认"的地方。
+        if _is_user_action_signal(step) and _is_finished_signal(request.values):
+            return self._finish_user_action(task, step, subject)
+
         # 允许补充流程中任意收集节点的字段；当前节点决定提示什么，不代表只能改它。
         allowed = self._declared_fields(task)
         unknown = sorted(set(request.values) - allowed)
@@ -122,6 +140,42 @@ class TaskService:
         self._commit(task, EventType.SLOTS_UPDATED, {"fields": sorted(request.values)})
         # 参数变化后旧凭证必须失效，执行节点会重新要求确认。
         self.confirmations.revoke(task.task_id, step.step_id)
+        return self.runner.advance(task)
+
+    def _finish_user_action(self, task: Task, step, subject: str) -> Task:
+        """用户说他做完了：翻回 RUNNING，让运行器去复检。
+
+        这里刻意**不做**三件事：
+        - 不把"已完成"写成任何凭证（`confirmations` 一行都不碰）；
+        - 不直接把任务判成功（结论只能来自复检）；
+        - 不因为超时就静默放行（运行器会按到期时刻转人工）。
+
+        严格来说 `subject` 参数用不上——归属已由调用方 `_active_task` 校验过。
+        保留它只是为了让这条路径和其余命令同形，免得将来有人以为"用户操作"这条
+        路不需要归属校验。
+        """
+
+        del subject  # 归属校验已在 `_active_task` 完成
+        expected_status = task.status
+        task.user_action_confirmed_at = utc_now()
+        # 用户操作完成后的状态是"去复检"，也就是回到 RUNNING。这是唯一一处
+        # `WAITING_FOR_ACTION → RUNNING` 的入口，由 `domain/state_machine.py` 许可。
+        task.status = TaskStatus.RUNNING
+        task.updated_at = utc_now()
+        # 这里**不发** `USER_ACTION_COMPLETED` 事件，尽管它是"用户点了"这一刻。
+        #
+        # 事件只能有一个来源：运行器在复检时发，因为它同时还知道"复检查的是哪一步"，
+        # 而这一层不知道（那是 `check_step` 决定的）。两处都发会在同一次点击上留下
+        # 两条同样的记录，事后按事件数统计"用户点了几次"就会翻倍。
+        #
+        # 所以这里只**落状态**，事件由随后的 `advance` 补上；两者之间若被取消
+        # 抢先，条件写会失败，用户那次点击连状态带事件一起作废——这正是要的。
+        self._commit(
+            task,
+            EventType.SLOTS_UPDATED,
+            {"user_action": step.step_id},
+            expected_status=expected_status,
+        )
         return self.runner.advance(task)
 
     def confirm(self, task_id: UUID, request: TaskConfirmRequest, subject: str) -> Task:
@@ -248,14 +302,26 @@ class TaskService:
 
     # ---------- 内部 ----------
 
-    def _commit(self, task: Task, event_type: EventType, data: dict[str, Any]) -> None:
+    def _commit(
+        self,
+        task: Task,
+        event_type: EventType,
+        data: dict[str, Any],
+        *,
+        expected_status: TaskStatus | None = None,
+    ) -> None:
         """把「当前状态 + 一条过程事件」绑成一笔条件提交。
 
         回答与拒绝确认都不改变任务状态（前者只补字段，后者只清掉待确认位），
         所以期望值就是入口读到的这个状态。条件不成立说明期间有别人改过任务，
         整批丢弃并报冲突——不拿旧快照覆盖，也不留下一条无主事件。
+
+        `expected_status` 只在**这条写入同时改了状态**时才显式传（用户操作完成
+        就是这种情况）：那时它必须取"入口读到的状态"，不能取已经被改过的对象。
         """
-        expected_status = task.status
+
+        if expected_status is None:
+            expected_status = task.status
         try:
             self.runner.commit_guarded(
                 task,
@@ -325,3 +391,31 @@ def _declared_fields_of(flow: FlowDefinition) -> set[str]:
     """流程声明过的全部字段。多个收集节点可以各自声明，合起来就是白名单。"""
 
     return {field for step in flow.steps for field in step.required_fields}
+
+
+# 「我已完成」的信号值。用流程步骤名而不是一个新字段名，是为了让它看起来
+# 就不像"某个字段的值"——它本来就不是给槽位用的。
+FINISHED_SIGNAL_VALUE = "done"
+
+
+def _is_user_action_signal(step) -> bool:
+    """当前步骤是否在等用户本人操作。"""
+
+    return step.kind is StepKind.USER_ACTION
+
+
+def _is_finished_signal(values: dict[str, str]) -> bool:
+    """请求体是不是一次「我已完成」。
+
+    判据刻意收紧到**整份请求恰好只有一个 `done` 键**：
+
+    - 多带一个键就不是信号了。比如 `{"done": "1", "captcha": "8H3K"}`——那是在
+      往系统里塞验证码。这种情况走下面的字段白名单，必然被拒（user_action 步骤
+      不声明任何字段），所以它宁可报 422 也不会被当成功。
+    - 空请求也不是信号：页面永远会带这一键，缺了说明不是从这一屏发出来的。
+    """
+
+    return values == {FINISHED_SIGNAL_KEY: FINISHED_SIGNAL_VALUE}
+
+
+FINISHED_SIGNAL_KEY = "i_finished"

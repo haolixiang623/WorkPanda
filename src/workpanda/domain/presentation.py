@@ -31,6 +31,9 @@ class UiState(StrEnum):
     # 无法确定要办什么（未命中、歧义、置信度不足）：必须先澄清，不产生任何副作用。
     NEEDS_CLARIFICATION = "needs_clarification"
     AWAITING_INPUT = "awaiting_input"
+    # 等用户本人在别处做完一件事（输验证码、扫码、传附件），做完回来点"我已完成"。
+    # 与 `AWAITING_INPUT` 分开：一个要用户填，一个要用户去做，页面提示完全不同。
+    AWAITING_ACTION = "awaiting_action"
     AWAITING_CONFIRMATION = "awaiting_confirmation"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -52,6 +55,7 @@ STATUS_UI: dict[TaskStatus, UiState] = {
     TaskStatus.CREATED: UiState.RECEIVED,
     TaskStatus.RUNNING: UiState.PROCESSING,
     TaskStatus.WAITING_FOR_USER: UiState.AWAITING_INPUT,
+    TaskStatus.WAITING_FOR_ACTION: UiState.AWAITING_ACTION,
     TaskStatus.WAITING_FOR_CONFIRMATION: UiState.AWAITING_CONFIRMATION,
     TaskStatus.OUTCOME_UNCONFIRMED: UiState.OUTCOME_UNCONFIRMED,
     TaskStatus.HANDOFF_REQUIRED: UiState.HANDOFF,
@@ -68,6 +72,11 @@ STATE_COPY: dict[UiState, StateCopy] = {
         "需要再确认一下", "请说明您要办理的具体事情，或者选择相近的事项。"
     ),
     UiState.AWAITING_INPUT: StateCopy("需要您补充信息", "请补充提示的内容，补齐后会继续办理。"),
+    # 文案刻意不写"验证码""二维码"这类具体形态：同一状态要同时覆盖输码、扫码、
+    # 传附件三种介入，"做什么"和"去哪里"由事件给全，这里只说清楚系统的等待方式。
+    UiState.AWAITING_ACTION: StateCopy(
+        "需要您亲自操作", "请在您自己的设备上完成后回来告知，我们会再核实。"
+    ),
     UiState.AWAITING_CONFIRMATION: StateCopy(
         "等待您确认", "请核对信息后确认提交，也可以返回修改。"
     ),

@@ -20,6 +20,7 @@ TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
         {
             TaskStatus.RUNNING,
             TaskStatus.WAITING_FOR_USER,
+            TaskStatus.WAITING_FOR_ACTION,
             TaskStatus.WAITING_FOR_CONFIRMATION,
             TaskStatus.FAILED,
             TaskStatus.CANCELLED,
@@ -29,6 +30,7 @@ TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
         {
             TaskStatus.RUNNING,
             TaskStatus.WAITING_FOR_USER,
+            TaskStatus.WAITING_FOR_ACTION,
             TaskStatus.WAITING_FOR_CONFIRMATION,
             TaskStatus.OUTCOME_UNCONFIRMED,
             TaskStatus.HANDOFF_REQUIRED,
@@ -46,10 +48,25 @@ TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
             TaskStatus.CANCELLED,
         }
     ),
+    # 用户操作完成后，服务端要回到 `RUNNING` 去复检，而不是直接判成功：
+    # "用户说做完了"与"确实做完了"之间隔着一次复检，这条边就是那次复检。
+    #
+    # 超时未完成时转人工，而不是留在原地等——留在原地会让群众一直盯着一个
+    # 早就失效的验证码 / 二维码，也不会有任何人被通知。
+    TaskStatus.WAITING_FOR_ACTION: frozenset(
+        {
+            TaskStatus.RUNNING,
+            TaskStatus.WAITING_FOR_CONFIRMATION,
+            TaskStatus.HANDOFF_REQUIRED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        }
+    ),
     TaskStatus.WAITING_FOR_CONFIRMATION: frozenset(
         {
             TaskStatus.RUNNING,
             TaskStatus.WAITING_FOR_USER,
+            TaskStatus.WAITING_FOR_ACTION,
             TaskStatus.HANDOFF_REQUIRED,
             TaskStatus.FAILED,
             TaskStatus.CANCELLED,

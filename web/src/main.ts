@@ -19,6 +19,7 @@ import {
   confirmRequest,
   connectionNotice,
   fieldOf,
+  finishedRequest,
   screenOf,
   transcriptOf,
   type Action,
@@ -314,7 +315,18 @@ async function dispatch(kind: ActionKind, field?: Field): Promise<void> {
     return;
   }
   if (view === null) return;
-  if (kind === "answer" || kind === "i_finished") {
+  if (kind === "i_finished") {
+    // 「我已完成」：只有 values，没有 step_id/accepted。它是在说"我去做过了"，
+    // 不是"我批准这个提交"——两句话的后果完全不同，请求体因此必须不同。
+    view = await request<TaskView>(
+      `/api/tasks/${view.task_id}/answers`,
+      finishedRequest(),
+    );
+    editing = null;
+    keepText = "";
+    return;
+  }
+  if (kind === "answer") {
     if (field === undefined) return;
     view = await request<TaskView>(`/api/tasks/${view.task_id}/answers`, answerRequest(field));
     editing = null;
@@ -521,11 +533,10 @@ function panel(screen: Screen): HTMLElement {
     }
   }
 
-  if (screen.state === "user_action_required") {
+  if (screen.state === "awaiting_action") {
+    // 这一屏**没有输入框**：要用户做的是"去别处做一件事"，不是"在这里填什么"。
+    // 多一个输入框，就多一处"用户以为该把验证码告诉我"的地方。
     box.appendChild(guideBox(screen));
-    if (screen.field !== null) {
-      box.appendChild(fieldForm(screen.field));
-    }
   }
 
   if (screen.state === "completed" && screen.summary.length > 0) {
@@ -683,7 +694,12 @@ function actionBar(screen: Screen): HTMLElement {
 }
 
 function onClick(action: Action, screen: Screen): void {
-  if (action.kind === "answer" || action.kind === "i_finished") {
+  if (action.kind === "i_finished") {
+    // 不看输入框：这一屏没有要提交的字段，而"用户填了什么"本来就不该进系统。
+    void perform("i_finished");
+    return;
+  }
+  if (action.kind === "answer") {
     submitField(screen.field?.name);
     return;
   }

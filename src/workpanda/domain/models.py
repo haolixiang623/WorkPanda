@@ -22,6 +22,14 @@ class TaskStatus(StrEnum):
     RUNNING = "running"
     WAITING_FOR_USER = "waiting_for_user"
     WAITING_FOR_CONFIRMATION = "waiting_for_confirmation"
+    # 等用户本人在外部页面/设备上完成一件事。与 `WAITING_FOR_USER` 分开是因为
+    # 两者的"用户在等什么"完全不同：一个是回答一个问题（填字段），一个是去
+    # 别处做一件事再回来。合成一个状态，页面上就只能二选一地显示，另一类
+    # 用户会盯着一个空表单不知道要干什么。
+    #
+    # 既有语义一点没动：`WAITING_FOR_USER` 的含义与所有转换保持原样，只是旁边
+    # 多了一个同样可进可出的分支。
+    WAITING_FOR_ACTION = "waiting_for_action"
     OUTCOME_UNCONFIRMED = "outcome_unconfirmed"
     HANDOFF_REQUIRED = "handoff_required"
     COMPLETED = "completed"
@@ -38,6 +46,16 @@ class EventType(StrEnum):
     CONFIRMATION_REQUIRED = "confirmation_required"
     CONFIRMATION_ACCEPTED = "confirmation_accepted"
     CONFIRMATION_DECLINED = "confirmation_declined"
+    # 需要用户本人在官方页面或设备上做一件事（图形验证码、扫码、自己上传附件）。
+    #
+    # 与 `CONFIRMATION_REQUIRED` 是两种东西，不能合并：
+    # - 确认问的是"要不要照这个做"，答案是**系统要的授权**，会签发一次性凭证；
+    # - 用户操作问的是"这件事只有你能做，做完告诉我"，答案是**用户自己的动作**，
+    #   不签发任何凭证，服务端只据此去复检。
+    # 合并的后果是"我已完成"被当成确认凭证，确认门禁从此形同虚设。
+    USER_ACTION_REQUIRED = "user_action_required"
+    # 用户点了「我已完成」。刻意只记信号本身：**不含**任何用户在那一步输入的内容。
+    USER_ACTION_COMPLETED = "user_action_completed"
     EXECUTION_SUCCEEDED = "execution_succeeded"
     EXECUTION_FAILED = "execution_failed"
     OUTCOME_UNCONFIRMED = "outcome_unconfirmed"
@@ -60,11 +78,25 @@ class Task(BaseModel):
     completed_steps: list[str] = Field(default_factory=list)
     slots: dict[str, str] = Field(default_factory=dict)
     pending_fields: list[str] = Field(default_factory=list)
+    # 用户操作节点的到期时刻（进入该节点时算出，与 `USER_ACTION_REQUIRED` 事件同批落盘）。
+    #
+    # 只存**到期时刻**、不存"还要等多久"：剩余时间是读出来的（`expires_at - now`），
+    # 存一个秒数会在每次读取时都要重新折算，中途重启就再无依据。
+    user_action_expires_at: datetime | None = None
+    # 用户点过「我已完成」的时刻。它是**信号**，不是凭证：没有任何"已确认"的语义，
+    # 也不参与任何执行的准入判断——准入只看复检结果。留着它只为回答两件事：
+    # "这次复检是对哪一次点击做的"，以及"是否已经点过了"（重复点击不再跑一遍复检）。
+    user_action_confirmed_at: datetime | None = None
     result: dict[str, Any] | None = None
     failure_code: str | None = None
     failure_message: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+    # **仅存在于这一轮推进内存里**的续跑点：复检通过后，告诉 `advance` 下一个
+    # 该跑哪一步。`exclude=True` 让它不落盘、不进接口响应——它描述的是"这次调用
+    # 内部走到哪儿"，不是任务的持久状态；落盘只会留下一个下次读出来毫无意义、
+    # 却可能被误当成状态的值。
+    resume_step_sid: str | None = Field(default=None, exclude=True)
 
     @property
     def is_terminal(self) -> bool:
@@ -145,6 +177,12 @@ class TaskView(BaseModel):
     current_step_title: str | None = None
     current_step_prompt: str | None = None
     confirm_message: str | None = None
+    # 当前步骤若在等用户本人操作，这里给出三要素 + 剩余秒数（#80）。
+    #
+    # 由**流程定义**投影而来，不读事件：事件流是历史，页面要的是"此刻这一屏该说
+    # 什么"。`expires_in_seconds` 是"还剩多久"，到点转人工的那一刻任务已经不是
+    # 等待态，所以宁可给一个会读到 0 的剩余量，也不把绝对时刻交给页面去换算。
+    user_action: "UserActionView | None" = None
     completed_steps: list[str]
     pending_fields: list[str]
     # 字段的群众可读名字，覆盖**这一版流程声明过的全部字段**，不只是待填的那几个：
@@ -202,6 +240,19 @@ class TaskView(BaseModel):
 
         return copy_for_status(self.status).hint
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def i_finished_allowed(self) -> bool:
+        """「我已完成」此刻能不能点。服务端说了算，页面不自己判断。
+
+        页面自己判断会多出一份"什么时候算完成"的口径，而其中最容易写错的一条
+        （「点了就等于办完」）恰好是最要命的。这里只有一条规则：任务正停在一个
+        用户操作节点上。点了之后要跑复检，复检说了算——所以这个标志从来不代表
+        "已经办完"。
+        """
+
+        return self.status is TaskStatus.WAITING_FOR_ACTION
+
     @classmethod
     def from_task(cls, task: Task, flows: "FlowRegistry | None" = None) -> "TaskView":
         """从任务投影出视图。`flows` 给了才补当前步骤的作者文案与字段标签。
@@ -241,6 +292,7 @@ class TaskView(BaseModel):
             current_step_title=None if step is None else step.title,
             current_step_prompt=None if step is None else step.prompt,
             confirm_message=None if step is None else step.confirm_message,
+            user_action=_user_action_view(task, step),
             completed_steps=list(task.completed_steps),
             pending_fields=task.pending_fields,
             field_labels=labels,
@@ -252,3 +304,42 @@ class TaskView(BaseModel):
             created_at=task.created_at,
             updated_at=task.updated_at,
         )
+
+
+class UserActionView(BaseModel):
+    """「这件事只有你能做」——页面要照着说的三要素。
+
+    刻意**没有**任何"取出用户填了什么"的字段：验证码、密码、二维码内容、
+    群众上传的材料永远不进入这个系统（#80 红线）。页面能拿到的只有"去哪做""做什么"
+    "还剩多久"，以及"做完回来点一下"这个动作本身。
+    """
+
+    # 做什么（流程作者写的话，不由模型生成）。
+    what: str
+    # 去哪里（官方页面或设备）。
+    where: str
+    # 还剩多少秒。0 表示"已经到点，下一次操作会转人工"——页面据此收掉入口，
+    # 而不是让用户对着一个早已失效的验证码继续输入。
+    remaining_seconds: int
+    # 已经点过「我已完成」、正在复检。页面此时只显示进度，不再给重复入口。
+    awaiting_check: bool
+
+
+def _user_action_view(task: Task, step: "object | None") -> "UserActionView | None":
+    """从任务与当前步骤投影出操作指引。不是用户操作节点就返回 None。"""
+
+    spec = getattr(step, "user_action", None)
+    if spec is None:
+        return None
+    remaining = 0
+    if task.user_action_expires_at is not None:
+        remaining = int((task.user_action_expires_at - utc_now()).total_seconds())
+    return UserActionView(
+        what=spec.what,
+        where=spec.where,
+        remaining_seconds=max(0, remaining),
+        awaiting_check=(
+            task.user_action_confirmed_at is not None
+            and task.status is TaskStatus.WAITING_FOR_ACTION
+        ),
+    )
