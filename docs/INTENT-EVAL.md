@@ -142,7 +142,7 @@ IntentSample = {sample_id, category, text}      # 三类：positive / near_miss 
 | `out_of_scope` | 不得被识别到任何流程 | 寒暄与无关请求不许被塞进任何执行参数 |
 
 下限（`domain/intent_sample.py`）：**≥3 条正例 + ≥2 条近似误例**，超范围例建议写但不作为
-前置条件。这两个数字来自骨架自检流程的基线（`demo.generic@1`，3+2+1 条合成样例），
+前置条件。这两个数字来自骨架自检流程的基线（`demo.generic` 当前版本，3+2+1 条合成样例），
 `Settings.intent_eval_min_positive` 等默认值直接引用同一组常量——门禁与 CI 用同一套数字，
 否则"本地过了 CI 不过"只会被当成环境问题。
 

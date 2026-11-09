@@ -42,6 +42,7 @@ from workpanda.harness.lease import (
     StepLeaseStore,
 )
 from workpanda.harness.openai_client import OpenAICompatibleClient
+from workpanda.harness.preflight import ensure_step_tools_available
 from workpanda.harness.redaction import DEFAULT_REDACTOR, NO_REDACTION
 from workpanda.harness.shared_state import SharedStateStore
 from workpanda.harness.trace import InMemoryTraceStore, TraceStore
@@ -610,6 +611,10 @@ def build_container(
                 browser_policy=settings.browser_policy,
                 max_stuck_threads=settings.harness_max_stuck_threads,
             )
+            # 流程里声明的工具必须真的在进程里。缺一个就在启动时停下：放过去的话
+            # 执行步骤会拿着空授权跑完并报 succeeded（见 harness/preflight.py）。
+            # 只核对**已发布**版本——草稿跑不起来不等于装不上。
+            ensure_step_tools_available(registry.published(), tool_registry)
             tool_threads = tool_registry.threads.stats
             model_client = OpenAICompatibleClient(
                 base_url=settings.model_base_url or "",

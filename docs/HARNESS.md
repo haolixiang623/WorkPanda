@@ -1324,3 +1324,48 @@ export WORKPANDA_HARNESS_BUDGET_TTL_SECONDS=300     # 同上，宁长不短
   （第 21 节压测口径），再怀疑后端；
 - `budget_store_unavailable` 与 `budget_max_tool_calls` 是两件事：前者是账记不上，
   后者是额度用完。运维要按不同方向处理（前者查 Redis，后者查流程设计）。
+
+## 23. 装配期工具对账：流程写了什么，进程里就得有什么
+
+流程定义在库里（可能是别人经管理侧建的），工具注册发生在 `default_registry()`。
+两边对不上时**不会报错**，这才是它的危险之处：
+
+1. `HarnessExecutor._grant()` 把"本步骤声明的 tool"与"已注册工具"取交集，交集为空
+   仍然照跑——模型依旧被调用；
+2. `_unverified_success()` 里的 `if not grant.names: return False` 本意是"这一步原本
+   就没有工具，只能依赖模型自述"，落到这里却变成"工具名写错了也放行"；
+3. 于是一次**一个工具都没跑过**的执行以 `succeeded` 收尾，留痕里只是少了几行
+   `tool_calls`。事后从结果里看不出来，从 trace 里也看不出异常。
+
+旧版自检流程 `demo.generic@1` 就是这种形状：`tool="model_echo"`——一个只存在于
+`ScriptedExecutor` 口头约定里的名字。它只在脚本化执行器下"跑得通"，而那个分支不跑
+模型循环，所以任何工具名都能通过。真实 harness 下它跑出的是模型自述。
+
+### 现在的做法
+
+`harness/preflight.py` 只做纯计算（不 import 模型客户端、不碰网络），装配层在真实
+harness 分支上调用：
+
+```python
+ensure_step_tools_available(registry.published(), tool_registry)
+```
+
+有缺口就抛 `UnavailableStepTool`，消息里带"哪一版哪一步写了哪个工具"和"当前注册了
+哪些"，**进程直接起不来**。起不来好过看起来跑通了。
+
+### 边界
+
+- 只核对**已发布**版本：草稿跑不起来不等于装不上；
+- 不核对收集/转人工步骤（它们本来就没有工具）；
+- **发布时不核对**：管理侧此刻把工具名写错仍然能发布成功，直到下次重启才被拦下。
+  这是本轮已知缺口，补它需要把工具注册表接进发布门禁（`FlowReleaseService` 目前
+  不认识工具），属于下一轮的事；
+- 只有真实 harness 分支会跑这道闸门：注入执行器的场景由调用方负责。
+
+### 自检流程的版本史
+
+- `demo.generic@1`：`tool="model_echo"`，上述缺陷的现场，已不再发布（版本不可变，
+  老库里仍留着它）；
+- `demo.generic@2`：改用内置 `sys_clock`（真注册、只读、无副作用），指令里要求
+  "把工具返回的时间原样写进 evidence"。`tests/test_step_tool_wiring.py` 钉住两件事：
+  声明的工具必须都注册过；真执行器下跑完整流程时工具**真的被调用**。

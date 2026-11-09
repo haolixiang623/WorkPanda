@@ -47,6 +47,7 @@ from workpanda.domain.intent_sample import (
     IntentSample,
     IntentSampleCategory,
 )
+from workpanda.infrastructure.demo_flows import DEMO_FLOW_VERSION
 from workpanda.infrastructure.memory_store import InMemoryFlowStore
 from workpanda.infrastructure.replay_cases import InMemoryReplayCaseStore
 from workpanda.infrastructure.sqlite_flow_store import SqliteFlowStore
@@ -511,7 +512,7 @@ def test_bootstrap_wires_gate_and_demo_baseline_passes() -> None:
         assert container.release is not None
         assert container.release.intent_gate is not None
 
-        report = container.release.check_intents("demo.generic", "1")
+        report = container.release.check_intents("demo.generic", DEMO_FLOW_VERSION)
 
         assert report is not None
         assert report.misroute_count == 0
@@ -539,7 +540,7 @@ def test_gate_can_be_switched_off_explicitly() -> None:
     try:
         assert container.release is not None
         assert container.release.intent_gate is None
-        assert container.release.check_intents("demo.generic", "1") is None
+        assert container.release.check_intents("demo.generic", DEMO_FLOW_VERSION) is None
     finally:
         container.close()
 
@@ -640,10 +641,10 @@ def test_replay_script_publish_accepts_demo_flow(workdir: Path) -> None:
     finally:
         store.close()
 
-    completed = _publish_via_script(db, "demo.generic", "1")
+    completed = _publish_via_script(db, "demo.generic", DEMO_FLOW_VERSION)
 
     assert completed.returncode == 0, completed.stderr
-    assert "已发布 demo.generic@1" in completed.stdout
+    assert f"已发布 demo.generic@{DEMO_FLOW_VERSION}" in completed.stdout
 
 
 # ---------- 管理侧配置台：门禁拦下要给可自救的 409 ----------
