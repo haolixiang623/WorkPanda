@@ -286,6 +286,7 @@ const STEP_TEMPLATE = `
   <div class="field"><label>instruction</label><input data-key="instruction" data-loc="steps.IDX.instruction" /></div>
   <div class="field"><label>tool</label><input data-key="tool" data-loc="steps.IDX.tool" /></div>
   <div class="field"><label>confirm_message</label><input data-key="confirm_message" data-loc="steps.IDX.confirm_message" /></div>
+  <div class="field"><label>结论文案（群众可见正文的行名，仅 execute）</label><input data-key="answer_label" data-loc="steps.IDX.answer_label" /></div>
   <div class="field"><label>需确认</label><input type="checkbox" data-key="requires_confirmation" data-loc="steps.IDX.requires_confirmation" /></div>
   <div class="field"><label></label><button type="button" data-remove="1" class="danger">删除</button></div>
 `;
@@ -355,6 +356,7 @@ function readStep(row) {
         instruction: optional("instruction"),
         tool: optional("tool"),
         confirm_message: optional("confirm_message"),
+        answer_label: optional("answer_label"),
         requires_confirmation: checkbox?.checked ?? false,
     };
 }

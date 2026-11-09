@@ -105,12 +105,20 @@ uvicorn workpanda.main:app --app-dir src --port 8000
 2. 澄清屏说的是通用句「请补充提示的内容」，没用流程作者写的 `prompt`（「请补充需要办理的主题。」）；
 3. 每次访问都有一条 `/favicon.ico` 404：页面挂在 `/web`，根路径的图标永远打不到。
 
-**仍未修的一项**（需要先定契约）：办结后页面把 `result` 里 harness 的执行元数据逐条印出来
-（`trace_id`、`tool`、`step_id`、`model_calls`、`tokens`、`duration_ms`、`stop_reason`、`risk`），
-外加模型原文 `text`。这些是运行器写的，不是流程作者的措辞，群众看不懂，`trace_id` 也不该
-出现在群众页。`resultRows()` 目前只跳过 `_` 前缀与非标量，注释里「键名是否好懂由流程作者
-负责」这个假设对 harness 输出来说不成立。修它要动 `TaskView.result` 的语义（剥掉平台元数据
-还是改成白名单），得先定下来再改。
+**已收口的一项**（原记作"仍未修"）：办结后页面曾把 `result` 里 harness 的执行元数据
+逐条印出来（`trace_id`、`tool`、`step_id`、`model_calls`、`tokens`、`duration_ms`、
+`stop_reason`、`risk`），外加模型原文 `text`；而真正的结论埋在 `verification` 这个
+对象里被 `resultRows()` 跳过，一个字都显示不出来。
+
+修法没有动 `resultRows()`——它本来就是"只显示作者声明过的东西"，缺的是**声明机制**。
+现在链路上补了三层（见 `docs/HARNESS.md` 第 24 节）：
+
+1. 模型结果契约新增 `answer`（给群众读的结论本身，与 `evidence` 依据分开）；
+2. 执行器把它放进 `output["answer"]`，其余元数据留在 `output` 里供 trace / 回放使用；
+3. 步骤声明 `StepDefinition.answer_label` 才会被放行进 `task.result`，`Runner.citizen_result()`
+   是唯一出口——白名单，不是黑名单。
+
+没声明 `answer_label` 的流程仍按旧行为原样返回（兼容），但那是过渡态，不是推荐做法。
 
 ## 不做的事
 

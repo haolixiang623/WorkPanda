@@ -312,6 +312,12 @@ class HarnessExecutor(Executor):
 
         if outcome is ExecutionOutcome.SUCCEEDED:
             detail = {**detail, "tool_evidence": self._tool_evidence(result)}
+            answer = detail.get("answer")
+            if isinstance(answer, str) and answer:
+                # 群众可见正文放在 output 顶层，与 `verification`（依据）和平台元数据
+                # 分开。它是这一步骤的**业务结论**，也是唯一会被 Runner 放行到办结页的
+                # 东西；放行还要再过一道 `StepDefinition.answer_label`。
+                output["answer"] = self._redact(answer)
 
         output["verification"] = self._redact(detail)
         succeeded = outcome is ExecutionOutcome.SUCCEEDED

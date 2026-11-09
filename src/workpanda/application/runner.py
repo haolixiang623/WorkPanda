@@ -298,7 +298,7 @@ class FlowRunner:
         expected_status: TaskStatus,
     ) -> Task | None:
         if result.outcome is ExecutionOutcome.SUCCEEDED:
-            task.result = result.output
+            task.result = citizen_result(step, result.output)
             return None
 
         # 失败与未确认同样要留痕：事后必须能回答"当时模型说了什么、依据是什么"，
@@ -390,6 +390,33 @@ class FlowRunner:
         交回库里的权威状态。
         """
         return self._commit_result(task, events, expected_status)
+
+
+def citizen_result(step: StepDefinition, output: dict[str, Any]) -> dict[str, Any]:
+    """把执行器的原始输出收成**办结页能显示的东西**。
+
+    执行器的 `output` 里混着两类完全不同的东西：群众要读的结论，和平台自己的运行
+    痕迹（trace、步骤标识、工具调用、token 数）。后者印到办结页上，群众看不懂，
+    `trace_id` 更不该露面。
+
+    所以放行规则是**白名单**：只有流程作者在步骤上声明过 `answer_label` 的那一段
+    正文才会出去，其余一概不进 `task.result`。声明了标签却没拿到正文时退回
+    `summary`（模型至少说了做了什么），两者都没有就给出空结果——空着比堆元数据好。
+
+    未声明 `answer_label` 的流程保持原样返回，那是兼容旧流程的行为，不是推荐做法：
+    它会把平台元数据一并带出去，这正是群众页已知的那条缺陷。
+    """
+
+    if not step.answer_label:
+        return output
+
+    answer = output.get("answer")
+    if not (isinstance(answer, str) and answer.strip()):
+        verification = output.get("verification")
+        summary = verification.get("summary") if isinstance(verification, dict) else None
+        answer = summary if isinstance(summary, str) else ""
+    answer = answer.strip()
+    return {step.answer_label: answer} if answer else {}
 
 
 def _diagnostics(result: ExecutionResult) -> dict[str, Any]:

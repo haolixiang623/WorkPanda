@@ -25,6 +25,7 @@ from workpanda.harness.browser.policy import BrowserPolicy
 from workpanda.harness.browser.session import BrowserSessions
 from workpanda.harness.browser.tools import browser_tools
 from workpanda.harness.models import RiskLevel, ToolSpec
+from workpanda.harness.policy import PolicyChecklistTool
 from workpanda.harness.tools import (
     DEFAULT_MAX_STUCK_THREADS,
     ToolContext,
@@ -187,6 +188,10 @@ def default_registry(
 
     registry = ToolRegistry(max_stuck_threads=max_stuck_threads)
     registry.register(SystemClockTool())
+    # 内置口径查询：纯本地字典、不触网、无副作用，因此不需要白名单也不该被开关关掉。
+    # 它"无条件注册"是安全的，但**能不能在某一步调用**仍由步骤授权决定——注册只代表
+    # 具备能力，不代表任何事项都能用。
+    registry.register(PolicyChecklistTool())
 
     closers: list[Callable[[], None]] = []
     # 未配置白名单时不注册 http 工具：默认不可用比默认全开更安全。

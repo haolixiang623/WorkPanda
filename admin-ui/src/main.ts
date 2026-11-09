@@ -31,6 +31,11 @@ interface StepInput {
   instruction?: string;
   tool?: string;
   confirm_message?: string;
+  /**
+   * 群众可见正文的行名（仅 execute 步骤有意义）。留空＝办结页不给正文；
+   * 若不填，执行器返回的平台元数据（trace、工具调用）也不会被顶上来充数。
+   */
+  answer_label?: string;
   requires_confirmation: boolean;
   /**
    * 字段内部名 → 群众可见的中文名。缺一个，群众页就把内部字段名印上去
@@ -514,6 +519,7 @@ const STEP_TEMPLATE = `
   <div class="field"><label>instruction</label><input data-key="instruction" data-loc="steps.IDX.instruction" /></div>
   <div class="field"><label>tool</label><input data-key="tool" data-loc="steps.IDX.tool" /></div>
   <div class="field"><label>confirm_message</label><input data-key="confirm_message" data-loc="steps.IDX.confirm_message" /></div>
+  <div class="field"><label>结论文案（群众可见正文的行名，仅 execute）</label><input data-key="answer_label" data-loc="steps.IDX.answer_label" /></div>
   <div class="field"><label>需确认</label><input type="checkbox" data-key="requires_confirmation" data-loc="steps.IDX.requires_confirmation" /></div>
   <div class="field"><label></label><button type="button" data-remove="1" class="danger">删除</button></div>
 `;
@@ -590,6 +596,9 @@ function readStep(row: Element): StepInput {
     instruction: optional("instruction"),
     tool: optional("tool"),
     confirm_message: optional("confirm_message"),
+    // 群众可见正文的行名。留空意味着"这个事项办完了也没有一句给群众看的话"，
+    // 所以界面上必须能填——否则作者只能在别处改代码。
+    answer_label: optional("answer_label"),
     requires_confirmation: checkbox?.checked ?? false,
   };
 }

@@ -15,6 +15,10 @@
   可核验结论——"缺依据应当未确认"的契约在"工具压根不存在"这一档上失效了。
 - `2`：改用内置的 `sys_clock`（真注册、只读、无副作用），并把"依据必须来自工具
   返回值"写进指令。老库里的 `1` 不会被覆盖（版本不可变），但也不再发布它。
+- `3`：执行步骤声明 `answer_label`，办结页只显示这一段正文。此前办结页拿到的是执行器
+  的整个 `output`——`trace_id`、`step_id`、`tokens` 逐条印在群众脸上，而真正的结论
+  埋在 `verification` 这个对象里被跳过。**这是内容变化（步骤多了字段），所以要新版本，
+  不能在 `2` 上改**：同 `(flow_id, version)` 不可覆盖，是回滚能成立的前提。
 """
 
 from typing import Final
@@ -24,7 +28,7 @@ from workpanda.domain.intent import IntentRule
 from workpanda.domain.intent_sample import IntentSample, IntentSampleCategory
 
 # 当前要发布的版本。测试与运维脚本引用它，避免把版本号散落成字面量。
-DEMO_FLOW_VERSION: Final[str] = "2"
+DEMO_FLOW_VERSION: Final[str] = "3"
 
 # 自检流程的意图样例。正例要能被路由到本流程的**这一版**；近似误例与超范围例
 # 必须一条都路由不出去——否则"自检"这个关键词就太宽了，真实事项上线后会把别的话
@@ -108,9 +112,11 @@ DEMO_FLOW = FlowDefinition(
             instruction=(
                 "调用 sys_clock 工具读取当前时间，把工具返回的时间字符串原样写进 "
                 "evidence；不要自己推算时间，也不要用参数 subject 顶替依据。"
+                "在 answer 里用一句话说明自检已完成，并附上工具返回的时间。"
             ),
             requires_confirmation=True,
             confirm_message="即将提交以下信息，请确认。",
+            answer_label="自检结论",
         ),
     ),
     intent_samples=DEMO_INTENT_SAMPLES,

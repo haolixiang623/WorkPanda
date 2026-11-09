@@ -138,6 +138,15 @@ pydantic 先挡字段形状（422 带 `loc`），再由 `flow_field_errors()` �
   `intent_rules.<i>.slot_patterns.<field>`。
 - 服务端校验独立成立：界面补齐了版本字段，直接打 API 写错版本照样 422。
 
+**第三处空档（输出侧，随首个试点事项一起补）**：模型的结论没有"给群众看的通道"。
+结果契约里只有 `outcome / summary / evidence`，而群众页只渲染 `task.result` 里的标量，
+`verification` 是对象会被跳过——结论一个字都不显示，`trace_id` 反倒印在页面上。
+
+现在步骤行多了「结论文案」输入口，对应 `StepDefinition.answer_label`：填了它，办结页
+才显示执行步骤返回的正文（模型契约里的 `answer`），平台元数据一条都不出去；不填就
+没有正文。它只允许出现在 `execute` 步骤上，别的步骤声明了会在保存时 422——正文只由
+执行步骤产出，别处声明了那一行永远空白。见 `docs/HARNESS.md` 第 24 节。
+
 回归 `tests/test_admin_ui_draft_fields.py`（10 项）：界面提交体从建草稿一路到"群众只说
 一句话就落进这个事项"（含槽位抽取与中文标签投影）、规则外的句子不被捞进来、表单覆盖性
 （可写步骤字段缺输入口即红）、编译产物接线、坏正则与空正则的字段级拒绝、能用的正则不误拦。
@@ -231,6 +240,13 @@ pydantic 先挡字段形状（422 带 `loc`），再由 `flow_field_errors()` �
 6. **人工走查未完成**：自动化覆盖的是接口契约与权限；真实浏览器里完成一次
    「建草稿 → 回放 → 发布 → 回滚」并核对群众侧表现，仍需在试点由人执行。
 7. **多级审批、多人协作与评论**：Issue 明确列为非目标，本轮未实现。
+8. **`answer_label` 只决定"放不放行"，不校验正文内容**：填了它，办结页就显示执行步骤
+   返回的 `answer`；正文里写什么由流程的 `instruction` 约束（首个试点事项在指令里明确
+   禁止"你可以申请"这类资格结论）。管理侧不做正文审核——那是流程作者的职责，硬拦只会
+   逼作者换个说法绕过去。
+9. **试点事项默认不上线**：`enable_pilot_flows` 默认 `False`，第一个真实事项
+   （灵活就业社保补贴·材料清单自查，见 `docs/PILOT-FLEX-SUBSIDY.md`）要显式打开。上线
+   时间属于运营决策，代码不代做决定。
 
 ## 7. 验证证据
 
@@ -242,7 +258,11 @@ pydantic 先挡字段形状（422 带 `loc`），再由 `flow_field_errors()` �
 - A2 新增 `tests/test_admin_ui_draft_fields.py` 10 项：界面建出的流程被一句话命中并带中文
   字段名、规则外的句子不被捞进来、表单覆盖性（漏一个字段输入口即红）、编译产物接线、
   坏正则 / 空正则 / 指向别的版本的规则三类字段级拒绝，以及能用正则的对照组。
-- 远端两项 CI（Python 检查、文档与敏感信息基础检查）在 PR head 与 main 均为 success。
+- 输出侧接线新增 `answer_label`：同一文件断言界面提交体带着它进草稿、编译产物里含
+  `answer_label:`；`tests/test_pilot_flex_subsidy.py` 27 项覆盖口径可追溯、不判断资格、
+  一句话命中、相邻事项不被捞走、办结页只拿到声明过的那一段正文。
+- 远端 CI 三项（Python 检查、浏览器执行器检查、文档与敏感信息基础检查）在 PR head 与
+  main 均为 success。
 - 前端 `tsc --strict --noEmitOnError` 编译通过，产物 `admin-ui/dist/main.js` 与
   `admin-ui/dist/sample_check.js` 已提交。
 
