@@ -62,6 +62,7 @@ from workpanda.infrastructure.memory_store import (
     InMemoryFlowStore,
     InMemoryTaskStore,
 )
+from workpanda.infrastructure.pilot_flows import pilot_flows
 from workpanda.infrastructure.rate_limit import TokenBucketLimiter
 from workpanda.infrastructure.redis_client import RedisClient
 from workpanda.infrastructure.redis_shared_state import (
@@ -339,7 +340,22 @@ def seed_demo_flows(store: FlowStore, *, enabled: bool) -> None:
     写成一个明确表示"装配期同步"的名字，事后能一眼看出它不是一次人工发布。
     """
 
-    for flow in demo_flows():
+    _seed(store, demo_flows(), enabled=enabled)
+
+
+def seed_pilot_flows(store: FlowStore, *, enabled: bool) -> None:
+    """把真实试点事项同步到库里。
+
+    与自检流程用同一套播种语义（见 `seed_demo_flows`），刻意不合并成"一次播种所有
+    流程"：两者开关不同、生命周期不同——自检流程在正式接入后必须关掉，试点事项却是
+    要开着的。合并之后每次改一个开关都得小心别连带影响另一个。
+    """
+
+    _seed(store, pilot_flows(), enabled=enabled)
+
+
+def _seed(store: FlowStore, flows: list[FlowDefinition], *, enabled: bool) -> None:
+    for flow in flows:
         if not enabled:
             store.disable(flow.flow_id, actor=SEED_ACTOR)
             continue
@@ -497,6 +513,7 @@ def build_container(
         flow_store, flow_closers = build_flow_store(settings)
         closers.extend(flow_closers)
         seed_demo_flows(flow_store, enabled=settings.enable_demo_flow)
+        seed_pilot_flows(flow_store, enabled=settings.enable_pilot_flows)
         registry = FlowRegistry.from_store(flow_store)
     replay_cases, replay_closers = build_replay_case_store(settings)
     closers.extend(replay_closers)

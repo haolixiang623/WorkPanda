@@ -1369,3 +1369,55 @@ ensure_step_tools_available(registry.published(), tool_registry)
 - `demo.generic@2`：改用内置 `sys_clock`（真注册、只读、无副作用），指令里要求
   "把工具返回的时间原样写进 evidence"。`tests/test_step_tool_wiring.py` 钉住两件事：
   声明的工具必须都注册过；真执行器下跑完整流程时工具**真的被调用**。
+
+## 24. 输出分层：群众只看得到流程作者声明过的那一段
+
+第 23 节收的是一条**输入侧**的洞（步骤声明了不存在的工具）。输出侧还有一条同样
+形状的：结论出不去，元数据反倒全出去了。
+
+### 失效链
+
+1. 执行器的 `output` 是一锅混合物：`trace_id`、`step_id`、`tool_calls`、
+   `model_calls`、`tokens`、`duration_ms`、`stop_reason`、模型原文 `text`，以及
+   `verification`（里面才是 `summary` 与 `evidence`）；
+2. `Runner._apply_result` 把这锅东西整个赋给 `task.result`；
+3. 群众页的 `resultRows()` 只渲染**标量**、跳过 `_` 前缀。于是 `verification` 因为
+   是对象被跳过——**结论一个字都不显示**；而 `trace_id` 这类全是标量，**一条条印在
+   群众脸上**。
+
+更根本的一条：模型的结果契约里只有 `outcome / summary / evidence`，**没有任何一个
+字段是"给群众读的正文"**。所以无论模型写得多好，都没有正规通道能落到页面上。
+
+### 现在的做法
+
+三层，各管一段：
+
+| 层 | 字段 | 约束 |
+|---|---|---|
+| 模型契约 | `answer` | 群众要读的**结论本身**；与 `evidence`（依据）不得互相顶替；上限 2000 字 |
+| 执行器 | `output["answer"]` | 只放脱敏后的正文，其余元数据留在 `output` 里不动（trace / 回放要用） |
+| 应用层 | `StepDefinition.answer_label` | **白名单**：声明了标签才把正文放进 `task.result`，其余一概不出去 |
+
+`Runner.citizen_result()` 是唯一的出口：
+
+- 声明了 `answer_label` → `task.result == {标签: 正文}`，元数据一条不进；
+- 正文缺失 → 退回 `verification.summary`（模型至少说了做了什么）；
+- 两者都没有 → `{}`，**空着好过拿元数据充数**；
+- 没声明 `answer_label` → 原样返回。这是兼容旧流程的行为，不是推荐做法。
+
+`flow_field_errors()` 同时禁掉"非执行步骤声明 `answer_label`"：正文只由执行步骤
+产出，别的步骤声明了也没人往里写值，那一行会**永远空白**——正是最难查的一类失效。
+
+### 边界
+
+- `answer_label` 只影响**办结页**，不影响留痕；`evidence` 仍然完整进 trace；
+- 它不校验正文内容，只决定放不放行。正文里写什么归流程指令管（例如试点事项明确
+  禁止"你可以申请"这类资格结论）；
+- 群众页 `resultRows()` 本身**没有改**：它本来就是"只显示作者声明过的东西"，
+  这次是把声明机制补上，而不是给它加过滤规则。
+
+### 已修掉的一条旧账
+
+`web/README.md` 里"仍未修的一项"（元数据上群众页 + 结论不显示）到此收口。
+自检流程为此升到 `demo.generic@3`：步骤多了 `answer_label`，属于内容变化，
+按版本不可变原则只能新发一版。

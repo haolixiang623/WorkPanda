@@ -50,6 +50,13 @@ class StepDefinition(BaseModel):
     # "办理事项"只有流程作者知道）。所以标签归作者，页面只负责取。
     # 留空时页面退回显示字段名本身——诚实但不好看，好过猜错。
     field_labels: dict[str, str] = Field(default_factory=dict)
+    # 群众可见正文的行名。只有执行步骤会产出正文（模型契约里的 `answer`），所以
+    # 这个标签也只对执行步骤有意义；声明了它，办结页才会显示这一段。
+    #
+    # 为什么标签归作者而不是平台：平台不知道这段正文在业务上叫什么（"办理结果"还是
+    # "所需材料"），猜一个就会把话说到别的事项上去。留空表示"本步骤没有面向群众的
+    # 正文"，此时执行器的平台元数据也不会被顶上来充数。
+    answer_label: str | None = Field(default=None, max_length=100)
 
 
 class FlowDefinition(BaseModel):
@@ -373,6 +380,18 @@ def flow_field_errors(flow: FlowDefinition) -> list[FlowFieldError]:
                         loc=("steps", index, "requires_confirmation"),
                         message=(
                             f"step {step.step_id!r} may only require confirmation when executing"
+                        ),
+                    )
+                )
+            # 正文只由执行步骤产出。别的步骤声明了标签也不会有人往里写值，
+            # 于是"页面上应该有一行"变成永远空白——这正是最难查的一类失效，
+            # 所以在保存时就拒掉，而不是等办结后才发现。
+            if step.answer_label:
+                errors.append(
+                    FlowFieldError(
+                        loc=("steps", index, "answer_label"),
+                        message=(
+                            f"step {step.step_id!r} may only declare answer_label when executing"
                         ),
                     )
                 )

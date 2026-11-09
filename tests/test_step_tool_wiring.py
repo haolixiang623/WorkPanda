@@ -49,6 +49,7 @@ SUCCESS = json.dumps(
     {
         "outcome": "succeeded",
         "summary": "已读取系统时间",
+        "answer": "自检已完成：时间来自 sys_clock 的返回值。",
         "evidence": "sys_clock 返回 utc=2026-01-01T00:00:00+00:00",
     },
     ensure_ascii=False,
@@ -296,8 +297,13 @@ def test_demo_flow_completes_through_the_real_executor() -> None:
         )
 
         assert task.status is TaskStatus.COMPLETED
-        assert [rec["name"] for rec in task.result["tool_calls"]] == [step.tool]
-        assert task.result["verification"]["tool_evidence"]
+        # 办结页只拿得到流程作者声明过的那一段正文：`answer_label` 是唯一的出口，
+        # 平台元数据（trace、工具调用、token）一律不往外递。
+        assert task.result == {step.answer_label: "自检已完成：时间来自 sys_clock 的返回值。"}
+        assert "tool_calls" not in task.result
+        assert "trace_id" not in task.result
+        assert "verification" not in task.result
+        assert list(task.result) == [step.answer_label]
     finally:
         container.close()
         for close in closers:

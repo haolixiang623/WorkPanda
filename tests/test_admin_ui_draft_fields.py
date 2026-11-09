@@ -54,6 +54,7 @@ UI_DRAFT: dict = {
             "tool": "replay_submit",
             "requires_confirmation": True,
             "confirm_message": "即将生成清单，请确认。",
+            "answer_label": "材料清单自查结果",
         },
     ],
     "intent_samples": [
@@ -109,6 +110,8 @@ def test_ui_created_flow_routes_a_sentence_and_keeps_chinese_labels() -> None:
         # 两处接线的最直接证据：服务端没有丢掉它们。
         assert created["steps"][0]["field_labels"] == {"subject": "办理主题"}
         assert created["intent_rules"][0]["intent_id"] == "ui.subsidy.list"
+        # 第三处接线：正文行名。没有它，这个事项办完了也说不出一句话给群众。
+        assert created["steps"][1]["answer_label"] == "材料清单自查结果"
 
         case = client.post(
             "/api/admin/flows/ui.subsidy/versions/1/cases",
@@ -185,6 +188,7 @@ EDITABLE_STEP_FIELDS = (
     "instruction",
     "tool",
     "confirm_message",
+    "answer_label",
     "requires_confirmation",
 )
 
@@ -219,6 +223,7 @@ def test_compiled_bundle_carries_the_new_fields() -> None:
 
     assert "field_labels:" in bundle
     assert "intent_rules:" in bundle
+    assert "answer_label:" in bundle
     assert "parseSlotPatterns" in bundle or "slot_patterns" in bundle
     assert 'id="rules"' in page
     assert 'id="add-rule"' in page
