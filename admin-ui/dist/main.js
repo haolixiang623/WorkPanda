@@ -39,10 +39,16 @@ function clearInvalid() {
 function markInvalid(fields) {
     clearInvalid();
     for (const field of fields) {
-        const key = field.loc.filter((part) => part !== "body").join(".");
-        document.querySelectorAll(`[data-loc="${key}"]`).forEach((node) => {
-            node.classList.add("invalid");
-        });
+        const parts = field.loc.filter((part) => part !== "body");
+        while (parts.length > 0) {
+            const key = parts.join(".");
+            const nodes = document.querySelectorAll(`[data-loc="${key}"]`);
+            if (nodes.length > 0) {
+                nodes.forEach((node) => node.classList.add("invalid"));
+                break;
+            }
+            parts.pop();
+        }
     }
 }
 function detailText(payload) {
@@ -225,6 +231,49 @@ async function refreshFlows() {
     renderFlows(flows);
     showMessage("ok", `已读取 ${flows.length} 个版本。`);
 }
+function parsePairs(raw) {
+    const out = {};
+    for (const chunk of raw.split(/[,，\n]/)) {
+        const text = chunk.trim();
+        if (text === "") {
+            continue;
+        }
+        const at = text.indexOf("=");
+        const key = (at === -1 ? text : text.slice(0, at)).trim();
+        if (key === "") {
+            continue;
+        }
+        out[key] = at === -1 ? "" : text.slice(at + 1).trim();
+    }
+    return out;
+}
+function formatPairs(pairs) {
+    return Object.entries(pairs ?? {})
+        .map(([key, label]) => `${key}=${label}`)
+        .join("，");
+}
+function parseSlotPatterns(raw) {
+    const out = {};
+    for (const chunk of raw.split("\n")) {
+        const text = chunk.trim();
+        if (text === "") {
+            continue;
+        }
+        const at = text.indexOf("=");
+        const field = (at === -1 ? text : text.slice(0, at)).trim();
+        if (field === "") {
+            continue;
+        }
+        const pattern = at === -1 ? "" : text.slice(at + 1).trim();
+        (out[field] ?? (out[field] = [])).push(pattern);
+    }
+    return out;
+}
+function formatSlotPatterns(patterns) {
+    return Object.entries(patterns ?? {})
+        .flatMap(([field, items]) => items.map((item) => `${field}=${item}`))
+        .join("\n");
+}
 const STEP_TEMPLATE = `
   <div class="field"><label>step_id</label><input data-key="step_id" data-loc="steps.IDX.step_id" /></div>
   <div class="field"><label>类型</label><select data-key="kind" data-loc="steps.IDX.kind">
@@ -232,6 +281,7 @@ const STEP_TEMPLATE = `
     <option value="handoff">handoff</option></select></div>
   <div class="field"><label>标题</label><input data-key="title" data-loc="steps.IDX.title" /></div>
   <div class="field"><label>必填字段（逗号分隔）</label><input data-key="required_fields" data-loc="steps.IDX.required_fields" /></div>
+  <div class="field"><label>字段中文名（字段=标签，逗号分隔）</label><input data-key="field_labels" data-loc="steps.IDX.field_labels" /></div>
   <div class="field"><label>prompt</label><input data-key="prompt" data-loc="steps.IDX.prompt" /></div>
   <div class="field"><label>instruction</label><input data-key="instruction" data-loc="steps.IDX.instruction" /></div>
   <div class="field"><label>tool</label><input data-key="tool" data-loc="steps.IDX.tool" /></div>
@@ -268,6 +318,9 @@ function addStepRow(initial) {
             else if (Array.isArray(raw)) {
                 input.value = raw.join(",");
             }
+            else if (typeof raw === "object" && raw !== null) {
+                input.value = formatPairs(raw);
+            }
             else if (raw !== null && raw !== undefined) {
                 input.value = String(raw);
             }
@@ -297,12 +350,79 @@ function readStep(row) {
             .split(/[,，]/)
             .map((item) => item.trim())
             .filter((item) => item !== ""),
+        field_labels: parsePairs(read("field_labels")),
         prompt: optional("prompt"),
         instruction: optional("instruction"),
         tool: optional("tool"),
         confirm_message: optional("confirm_message"),
         requires_confirmation: checkbox?.checked ?? false,
     };
+}
+const RULE_TEMPLATE = `
+  <div class="field"><label>intent_id</label><input data-key="intent_id" data-loc="intent_rules.IDX.intent_id" /></div>
+  <div class="field"><label>关键词（逗号分隔）</label><input data-key="keywords" data-loc="intent_rules.IDX.keywords" /></div>
+  <div class="field"><label>槽位抽取（每行 字段=正则，可留空）</label><textarea data-key="slot_patterns" rows="2" data-loc="intent_rules.IDX.slot_patterns"></textarea></div>
+  <div class="field"><label></label><button type="button" data-remove="1" class="danger">删除</button></div>
+`;
+function renumberRules() {
+    document.querySelectorAll("#rules .rule").forEach((row, index) => {
+        row.querySelectorAll("[data-loc]").forEach((input) => {
+            const key = input.dataset.loc?.split(".").pop() ?? "";
+            input.dataset.loc = `intent_rules.${index}.${key}`;
+        });
+    });
+}
+function addRuleRow(initial) {
+    const row = document.createElement("div");
+    row.className = "rule";
+    row.innerHTML = RULE_TEMPLATE.replace(/IDX/g, "__NEW__");
+    const index = el("rules").children.length;
+    row.querySelectorAll("[data-loc]").forEach((input) => {
+        const key = input.dataset.loc?.split(".").pop() ?? "";
+        input.dataset.loc = `intent_rules.${index}.${key}`;
+    });
+    const fill = (key) => row.querySelector(`[data-key="${key}"]`);
+    if (initial?.intent_id !== undefined) {
+        const input = fill("intent_id");
+        if (input !== null) {
+            input.value = initial.intent_id;
+        }
+    }
+    if (initial?.keywords !== undefined) {
+        const input = fill("keywords");
+        if (input !== null) {
+            input.value = initial.keywords.join(",");
+        }
+    }
+    if (initial?.slot_patterns !== undefined) {
+        const input = fill("slot_patterns");
+        if (input !== null) {
+            input.value = formatSlotPatterns(initial.slot_patterns);
+        }
+    }
+    row.querySelector("[data-remove]")?.addEventListener("click", () => {
+        row.remove();
+        renumberRules();
+    });
+    el("rules").append(row);
+}
+function readRule(row) {
+    const read = (key) => {
+        const input = row.querySelector(`[data-key="${key}"]`);
+        return input === null ? "" : input.value;
+    };
+    return {
+        intent_id: read("intent_id").trim(),
+        keywords: splitList(read("keywords")),
+        slot_patterns: parseSlotPatterns(read("slot_patterns")),
+    };
+}
+function loadRules(rules) {
+    el("rules").replaceChildren();
+    for (const rule of rules) {
+        addRuleRow(rule);
+    }
+    renumberRules();
 }
 const SAMPLE_TEMPLATE = `
   <div class="field"><label>sample_id</label><input data-key="sample_id" data-loc="intent_samples.IDX.sample_id" /></div>
@@ -388,12 +508,19 @@ function loadSamples(samples) {
     refreshSampleGate();
 }
 function readDraft() {
+    const flowId = value("draft-flow");
+    const version = value("draft-version");
     return {
-        flow_id: value("draft-flow"),
-        version: value("draft-version"),
+        flow_id: flowId,
+        version: version,
         title: value("draft-title"),
         steps: Array.from(document.querySelectorAll("#steps .step")).map(readStep),
         intent_samples: Array.from(document.querySelectorAll("#samples .sample")).map(readSample),
+        intent_rules: Array.from(document.querySelectorAll("#rules .rule")).map((row) => ({
+            ...readRule(row),
+            flow_id: flowId,
+            flow_version: version,
+        })),
     };
 }
 async function saveDraft() {
@@ -424,6 +551,7 @@ async function loadIntoDraft(flow) {
         addStepRow(step);
     }
     loadSamples(detail.flow.intent_samples ?? []);
+    loadRules(detail.flow.intent_rules ?? []);
     showMessage("ok", `已载入 ${escapeHtml(flow.flow_id)}@${escapeHtml(flow.version)}；另存请填写新版本号。`);
 }
 function versionPath() {
@@ -610,13 +738,18 @@ function actionTargetForCases() {
 el("add-step").addEventListener("click", () => {
     addStepRow();
 });
+el("add-rule").addEventListener("click", () => {
+    addRuleRow();
+    renumberRules();
+});
 el("clear-draft").addEventListener("click", () => {
     for (const id of ["draft-flow", "draft-version", "draft-title"]) {
         el(id).value = "";
     }
     el("steps").replaceChildren();
     addStepRow();
+    el("rules").replaceChildren();
     resetSamples();
     clearInvalid();
-    showMessage("ok", "表单已清空（含意图样例）。");
+    showMessage("ok", "表单已清空（含识别规则与意图样例）。");
 });

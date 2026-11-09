@@ -32,6 +32,22 @@ interface StepInput {
   tool?: string;
   confirm_message?: string;
   requires_confirmation: boolean;
+  /**
+   * 字段内部名 → 群众可见的中文名。缺一个，群众页就把内部字段名印上去
+   * （`subject`、`contact`），机制在、只是作者没接线。
+   */
+  field_labels?: Record<string, string>;
+}
+
+/**
+ * 识别规则。`flow_id` / `flow_version` 刻意不由界面填写：规则只能指向自己所属的
+ * 那一版，写错就会出现"识别命中了、建任务却报未发布"（#73）。保存时按上面
+ * flow_id / version 输入框的值补齐。
+ */
+interface IntentRuleInput {
+  intent_id: string;
+  keywords: string[];
+  slot_patterns: Record<string, string[]>;
 }
 
 interface FlowDraft {
@@ -40,6 +56,7 @@ interface FlowDraft {
   title: string;
   steps: StepInput[];
   intent_samples: SampleInput[];
+  intent_rules: Array<IntentRuleInput & { flow_id: string; flow_version: string }>;
 }
 
 interface FlowSummary {
@@ -189,14 +206,26 @@ function clearInvalid(): void {
   document.querySelectorAll(".invalid").forEach((node) => node.classList.remove("invalid"));
 }
 
-/** 把服务端给的 loc 映射到表单输入框。FastAPI 的 422 会带一层 "body" 前缀。 */
+/**
+ * 把服务端给的 loc 映射到表单输入框。FastAPI 的 422 会带一层 "body" 前缀。
+ *
+ * 逐段回退：服务端的 loc 常常比输入框更细（`steps.0.field_labels.subject`
+ * 对应的是整行那个「字段=标签」输入框）。只做精确匹配的话，这类错误一条都标不红，
+ * 管理员只能从消息区的长文本里找位置。
+ */
 function markInvalid(fields: FieldProblem[]): void {
   clearInvalid();
   for (const field of fields) {
-    const key = field.loc.filter((part) => part !== "body").join(".");
-    document.querySelectorAll<HTMLElement>(`[data-loc="${key}"]`).forEach((node) => {
-      node.classList.add("invalid");
-    });
+    const parts = field.loc.filter((part) => part !== "body");
+    while (parts.length > 0) {
+      const key = parts.join(".");
+      const nodes = document.querySelectorAll<HTMLElement>(`[data-loc="${key}"]`);
+      if (nodes.length > 0) {
+        nodes.forEach((node) => node.classList.add("invalid"));
+        break;
+      }
+      parts.pop();
+    }
   }
 }
 
@@ -418,6 +447,61 @@ async function refreshFlows(): Promise<void> {
 
 // ---------- 草稿表单 ----------
 
+/**
+ * `字段=值` 成对录入（逗号或换行分隔）。
+ *
+ * 缺 `=` 的那一项**不会**被静默丢掉，而是原样当成"只有字段名、没有值"。丢掉才是
+ * 更糟的失效方式：管理员以为填上了，群众页照旧印内部字段名。原样留下，服务端
+ * 的 `field_labels` 定位校验会把它报在具体输入框上。
+ */
+function parsePairs(raw: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const chunk of raw.split(/[,，\n]/)) {
+    const text = chunk.trim();
+    if (text === "") {
+      continue;
+    }
+    const at = text.indexOf("=");
+    const key = (at === -1 ? text : text.slice(0, at)).trim();
+    if (key === "") {
+      continue;
+    }
+    out[key] = at === -1 ? "" : text.slice(at + 1).trim();
+  }
+  return out;
+}
+
+function formatPairs(pairs: Record<string, string> | undefined): string {
+  return Object.entries(pairs ?? {})
+    .map(([key, label]) => `${key}=${label}`)
+    .join("，");
+}
+
+/** 每行一条 `字段=正则`；同一字段写多行即为多条候选模式，按书写顺序尝试。 */
+function parseSlotPatterns(raw: string): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const chunk of raw.split("\n")) {
+    const text = chunk.trim();
+    if (text === "") {
+      continue;
+    }
+    const at = text.indexOf("=");
+    const field = (at === -1 ? text : text.slice(0, at)).trim();
+    if (field === "") {
+      continue;
+    }
+    const pattern = at === -1 ? "" : text.slice(at + 1).trim();
+    (out[field] ??= []).push(pattern);
+  }
+  return out;
+}
+
+function formatSlotPatterns(patterns: Record<string, string[]> | undefined): string {
+  return Object.entries(patterns ?? {})
+    .flatMap(([field, items]) => items.map((item) => `${field}=${item}`))
+    .join("\n");
+}
+
 const STEP_TEMPLATE = `
   <div class="field"><label>step_id</label><input data-key="step_id" data-loc="steps.IDX.step_id" /></div>
   <div class="field"><label>类型</label><select data-key="kind" data-loc="steps.IDX.kind">
@@ -425,6 +509,7 @@ const STEP_TEMPLATE = `
     <option value="handoff">handoff</option></select></div>
   <div class="field"><label>标题</label><input data-key="title" data-loc="steps.IDX.title" /></div>
   <div class="field"><label>必填字段（逗号分隔）</label><input data-key="required_fields" data-loc="steps.IDX.required_fields" /></div>
+  <div class="field"><label>字段中文名（字段=标签，逗号分隔）</label><input data-key="field_labels" data-loc="steps.IDX.field_labels" /></div>
   <div class="field"><label>prompt</label><input data-key="prompt" data-loc="steps.IDX.prompt" /></div>
   <div class="field"><label>instruction</label><input data-key="instruction" data-loc="steps.IDX.instruction" /></div>
   <div class="field"><label>tool</label><input data-key="tool" data-loc="steps.IDX.tool" /></div>
@@ -463,6 +548,9 @@ function addStepRow(initial?: Partial<StepInput>): void {
         input.checked = Boolean(raw);
       } else if (Array.isArray(raw)) {
         input.value = raw.join(",");
+      } else if (typeof raw === "object" && raw !== null) {
+        // `field_labels` 载入时要还原成「字段=标签」，不能 String(obj) 成 [object Object]。
+        input.value = formatPairs(raw as Record<string, string>);
       } else if (raw !== null && raw !== undefined) {
         input.value = String(raw);
       }
@@ -477,9 +565,9 @@ function addStepRow(initial?: Partial<StepInput>): void {
 
 function readStep(row: Element): StepInput {
   const read = (key: string): string => {
-    const input = row.querySelector<HTMLInputElement | HTMLSelectElement>(
-      `[data-key="${key}"]`,
-    );
+    const input = row.querySelector<
+      HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement
+    >(`[data-key="${key}"]`);
     return input === null ? "" : input.value.trim();
   };
   const optional = (key: string): string | undefined => {
@@ -497,12 +585,94 @@ function readStep(row: Element): StepInput {
       .split(/[,，]/)
       .map((item) => item.trim())
       .filter((item) => item !== ""),
+    field_labels: parsePairs(read("field_labels")),
     prompt: optional("prompt"),
     instruction: optional("instruction"),
     tool: optional("tool"),
     confirm_message: optional("confirm_message"),
     requires_confirmation: checkbox?.checked ?? false,
   };
+}
+
+// ---------- 识别规则：一句话能不能命中所属事项 ----------
+//
+// 之前界面没有这一块，于是「管理侧建出来的流程」只能由接口显式指定 flow_id 创建：
+// 群众说"我要办灵活就业补贴"，路由一个都命中不了。规则只在这里录入，`flow_id`
+// 与 `flow_version` 保存时按上方输入框补齐——让界面去填这两个值，等于把 #73
+// （识别命中却报未发布）重新交给手抄。
+
+const RULE_TEMPLATE = `
+  <div class="field"><label>intent_id</label><input data-key="intent_id" data-loc="intent_rules.IDX.intent_id" /></div>
+  <div class="field"><label>关键词（逗号分隔）</label><input data-key="keywords" data-loc="intent_rules.IDX.keywords" /></div>
+  <div class="field"><label>槽位抽取（每行 字段=正则，可留空）</label><textarea data-key="slot_patterns" rows="2" data-loc="intent_rules.IDX.slot_patterns"></textarea></div>
+  <div class="field"><label></label><button type="button" data-remove="1" class="danger">删除</button></div>
+`;
+
+function renumberRules(): void {
+  document.querySelectorAll<HTMLElement>("#rules .rule").forEach((row, index) => {
+    row.querySelectorAll<HTMLElement>("[data-loc]").forEach((input) => {
+      const key = input.dataset.loc?.split(".").pop() ?? "";
+      input.dataset.loc = `intent_rules.${index}.${key}`;
+    });
+  });
+}
+
+function addRuleRow(initial?: Partial<IntentRuleInput>): void {
+  const row = document.createElement("div");
+  row.className = "rule";
+  row.innerHTML = RULE_TEMPLATE.replace(/IDX/g, "__NEW__");
+  const index = el<HTMLDivElement>("rules").children.length;
+  row.querySelectorAll<HTMLElement>("[data-loc]").forEach((input) => {
+    const key = input.dataset.loc?.split(".").pop() ?? "";
+    input.dataset.loc = `intent_rules.${index}.${key}`;
+  });
+  const fill = (key: string): HTMLInputElement | HTMLTextAreaElement | null =>
+    row.querySelector<HTMLInputElement | HTMLTextAreaElement>(`[data-key="${key}"]`);
+  if (initial?.intent_id !== undefined) {
+    const input = fill("intent_id");
+    if (input !== null) {
+      input.value = initial.intent_id;
+    }
+  }
+  if (initial?.keywords !== undefined) {
+    const input = fill("keywords");
+    if (input !== null) {
+      input.value = initial.keywords.join(",");
+    }
+  }
+  if (initial?.slot_patterns !== undefined) {
+    const input = fill("slot_patterns");
+    if (input !== null) {
+      input.value = formatSlotPatterns(initial.slot_patterns);
+    }
+  }
+  row.querySelector<HTMLButtonElement>("[data-remove]")?.addEventListener("click", () => {
+    row.remove();
+    renumberRules();
+  });
+  el<HTMLDivElement>("rules").append(row);
+}
+
+function readRule(row: Element): IntentRuleInput {
+  const read = (key: string): string => {
+    const input = row.querySelector<HTMLInputElement | HTMLTextAreaElement>(
+      `[data-key="${key}"]`,
+    );
+    return input === null ? "" : input.value;
+  };
+  return {
+    intent_id: read("intent_id").trim(),
+    keywords: splitList(read("keywords")),
+    slot_patterns: parseSlotPatterns(read("slot_patterns")),
+  };
+}
+
+function loadRules(rules: IntentRuleInput[]): void {
+  el<HTMLDivElement>("rules").replaceChildren();
+  for (const rule of rules) {
+    addRuleRow(rule);
+  }
+  renumberRules();
 }
 
 // ---------- 意图样例：动态列表与本地预检 ----------
@@ -604,12 +774,20 @@ function loadSamples(samples: SampleInput[]): void {
 }
 
 function readDraft(): FlowDraft {
+  const flowId = value("draft-flow");
+  const version = value("draft-version");
   return {
-    flow_id: value("draft-flow"),
-    version: value("draft-version"),
+    flow_id: flowId,
+    version: version,
     title: value("draft-title"),
     steps: Array.from(document.querySelectorAll("#steps .step")).map(readStep),
     intent_samples: Array.from(document.querySelectorAll("#samples .sample")).map(readSample),
+    // 规则只能指向自己所属的那一版：两个字段由上面的输入框补齐，界面不给单独入口。
+    intent_rules: Array.from(document.querySelectorAll("#rules .rule")).map((row) => ({
+      ...readRule(row),
+      flow_id: flowId,
+      flow_version: version,
+    })),
   };
 }
 
@@ -646,6 +824,7 @@ async function loadIntoDraft(flow: FlowSummary): Promise<void> {
     addStepRow(step as unknown as Partial<StepInput>);
   }
   loadSamples(detail.flow.intent_samples ?? []);
+  loadRules(detail.flow.intent_rules ?? []);
   showMessage("ok", `已载入 ${escapeHtml(flow.flow_id)}@${escapeHtml(flow.version)}；另存请填写新版本号。`);
 }
 
@@ -887,13 +1066,18 @@ function actionTargetForCases(): { flow_id: string; version: string } {
 el<HTMLButtonElement>("add-step").addEventListener("click", () => {
   addStepRow();
 });
+el<HTMLButtonElement>("add-rule").addEventListener("click", () => {
+  addRuleRow();
+  renumberRules();
+});
 el<HTMLButtonElement>("clear-draft").addEventListener("click", () => {
   for (const id of ["draft-flow", "draft-version", "draft-title"]) {
     el<HTMLInputElement>(id).value = "";
   }
   el<HTMLDivElement>("steps").replaceChildren();
   addStepRow();
+  el<HTMLDivElement>("rules").replaceChildren();
   resetSamples();
   clearInvalid();
-  showMessage("ok", "表单已清空（含意图样例）。");
+  showMessage("ok", "表单已清空（含识别规则与意图样例）。");
 });
