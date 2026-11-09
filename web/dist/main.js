@@ -1,4 +1,4 @@
-import { answerRequest, canSubmit, confirmRequest, connectionNotice, fieldOf, screenOf, transcriptOf, } from "./state_view.js";
+import { answerRequest, canSubmit, confirmRequest, connectionNotice, fieldOf, finishedRequest, screenOf, transcriptOf, } from "./state_view.js";
 const SESSION_HEADER = "X-WorkPanda-Session";
 const SESSION_KEY = "workpanda.session";
 const TASK_KEY = "workpanda.task";
@@ -258,7 +258,13 @@ async function dispatch(kind, field) {
     }
     if (view === null)
         return;
-    if (kind === "answer" || kind === "i_finished") {
+    if (kind === "i_finished") {
+        view = await request(`/api/tasks/${view.task_id}/answers`, finishedRequest());
+        editing = null;
+        keepText = "";
+        return;
+    }
+    if (kind === "answer") {
         if (field === undefined)
             return;
         view = await request(`/api/tasks/${view.task_id}/answers`, answerRequest(field));
@@ -437,11 +443,8 @@ function panel(screen) {
             box.appendChild(impact);
         }
     }
-    if (screen.state === "user_action_required") {
+    if (screen.state === "awaiting_action") {
         box.appendChild(guideBox(screen));
-        if (screen.field !== null) {
-            box.appendChild(fieldForm(screen.field));
-        }
     }
     if (screen.state === "completed" && screen.summary.length > 0) {
         box.appendChild(summaryList(screen, false));
@@ -572,7 +575,11 @@ function actionBar(screen) {
     return row;
 }
 function onClick(action, screen) {
-    if (action.kind === "answer" || action.kind === "i_finished") {
+    if (action.kind === "i_finished") {
+        void perform("i_finished");
+        return;
+    }
+    if (action.kind === "answer") {
         submitField(screen.field?.name);
         return;
     }

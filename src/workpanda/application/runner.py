@@ -10,6 +10,7 @@
 """
 
 from collections.abc import Sequence
+from datetime import timedelta
 from typing import Any
 
 from workpanda.application.ports import (
@@ -29,6 +30,7 @@ from workpanda.domain.repository import (
     TaskStore,
 )
 from workpanda.domain.state_machine import ensure_transition
+from workpanda.harness.redaction import redact_text
 
 
 def new_confirmation(task: Task, *, step_id: str, ttl_seconds: int) -> Confirmation:
@@ -129,7 +131,7 @@ class FlowRunner:
             return authoritative
         expected_status = authoritative.status
         self._move(task, TaskStatus.RUNNING)
-        step = flow.step(task.current_step) if task.current_step else flow.next_step(None)
+        step = self._resume_point(flow, task)
 
         while step is not None:
             task.current_step = step.step_id
@@ -138,6 +140,16 @@ class FlowRunner:
             paused = self._run_step(task, flow, step, expected_status)
             if paused is not None:
                 return paused
+
+            # 复检已经把本步骤与它复检的那一步一起记为完成，并直接给出了下一步。
+            # 这里不能再记一遍（会重复 STEP_COMPLETED），也不能用 `next_step`
+            # 推——那会把复检步骤本身当成没跑过再跑一次。
+            if task.resume_step_sid is not None:
+                following_sid = task.resume_step_sid
+                task.resume_step_sid = None
+                task.current_step = following_sid
+                step = flow.step(following_sid) if following_sid else None
+                continue
 
             # 执行器刚跑完就可能已被取消。先确认状态还属于自己，避免在已取消
             # 的任务后面补一串"又完成了一步"的噪声事件；真正的仲裁仍在末尾
@@ -167,6 +179,20 @@ class FlowRunner:
             expected_status,
         )
 
+    def _resume_point(self, flow: FlowDefinition, task: Task) -> StepDefinition | None:
+        """这一轮该从哪一步开始。
+
+        原则上就是 `current_step` 本身：澄清、确认、执行、用户操作都会回到自己
+        那一步重跑，由各自的处理函数判断"这一次要不要继续等"。
+
+        只有一种情况需要往回看：`current_step` 是一个已经点过「我已完成」的
+        user_action 步骤——那一轮要跑的是**复检**，而它仍然由 `_user_action` 处理
+        （失败、超时、不可复检都要走它那套结论）。所以这里不做跳转，只保证
+        状态被翻回 `RUNNING`，其余交给 `_user_action` 自己判断。
+        """
+
+        return flow.step(task.current_step) if task.current_step else flow.next_step(None)
+
     def _run_step(
         self,
         task: Task,
@@ -178,9 +204,194 @@ class FlowRunner:
 
         if step.kind is StepKind.COLLECT:
             return self._collect(task, step, expected_status)
+        if step.kind is StepKind.USER_ACTION:
+            return self._user_action(task, flow, step, expected_status)
         if step.kind is StepKind.EXECUTE:
             return self._execute(task, flow, step, expected_status)
         return self._handoff(task, step, "flow_requested_handoff", expected_status)
+
+    def _user_action(
+        self,
+        task: Task,
+        flow: FlowDefinition,
+        step: StepDefinition,
+        expected_status: TaskStatus,
+    ) -> Task | None:
+        """等用户本人在别处做完一件事，回来点「我已完成」。
+
+        这一段有三条不容商量的规矩，正好对应 #80 的三条红线：
+
+        1. **不代做**：服务端只把"去哪 / 做什么 / 多久过期"告诉用户，不替用户
+           输验证码、不替他扫码、不代传他的材料，也不接收这些东西。所以本方法
+           从头到尾没有任何"读取用户填了什么"的代码——它们根本无处可填。
+        2. **不签发凭证**：「我已完成」进 `task.user_action_confirmed_at`，这个字段
+           不参与任何执行准入判断。准入只看下面的复检结果，与确认凭证
+           （`confirmations`）毫无关系。
+        3. **不以"用户说完成了"当结论**：复检交给 `check_step` 指向的那一步去跑，
+           跑出什么就是什么。没有 `check_step` 就不跑，直接转人工——宁可承认
+           这一步做不了，也不能替用户宣布成功。
+
+        两个进入点：
+        - 首次进入：还没有到期时刻 → 写一个到期时刻，发 `USER_ACTION_REQUIRED`
+          （带三要素），进 `WAITING_FOR_ACTION` 等用户。
+        - 用户点过之后（`current_step` 就是本步、状态已被服务层翻回 `RUNNING`）：
+          跑复检。已过期则由状态机拒绝这条边，落到"超时转人工"。
+        """
+
+        spec = step.user_action
+        if spec is None:  # pragma: no cover - 由 `flow_field_errors` 在保存时拦住
+            return self._handoff(task, step, "user_action_undefined", expected_status)
+
+        if task.user_action_confirmed_at is None:
+            return self._pause_for_user_action(task, step, expected_status)
+
+        # 到这里说明用户点过「我已完成」：这一轮是**复检**，不是第二遍等待。
+        return self._recheck_user_action(task, flow, step, expected_status)
+
+    def _pause_for_user_action(
+        self,
+        task: Task,
+        step: StepDefinition,
+        expected_status: TaskStatus,
+    ) -> Task:
+        """把"请你去做这件事"挂成一个待办，并把到期时刻一起落盘。
+
+        到期时刻与暂停同批写：分两次写就会出现"任务已经暂停、但没人知道它
+        该在什么时候转人工"，而这类任务只会一直挂着，谁也不会被通知。
+        """
+
+        spec = step.user_action
+        assert spec is not None  # 由 `_user_action` 保证
+        now = utc_now()
+        expires_at = now + timedelta(seconds=spec.expires_in_seconds)
+        task.pending_fields = []
+        task.user_action_expires_at = expires_at
+        task.user_action_confirmed_at = None
+        self._move(task, TaskStatus.WAITING_FOR_ACTION)
+        return self._commit_pause(
+            task,
+            [
+                PendingEvent(
+                    type=EventType.USER_ACTION_REQUIRED,
+                    status=task.status,
+                    data={
+                        "step_id": step.step_id,
+                        # 三要素原样给出：页面照着显示，不自己编地址与倒计时。
+                        "what": redact_text(spec.what),
+                        "where": redact_text(spec.where),
+                        "expires_in_seconds": spec.expires_in_seconds,
+                        "expires_at": expires_at.isoformat(),
+                        # 有没有可自动复检的依据，决定了用户点完之后是"等结果"
+                        # 还是"转人工"。这一条必须让页面能说出来。
+                        "auto_check": spec.check_step is not None,
+                    },
+                )
+            ],
+            expected_status,
+        )
+
+    def _recheck_user_action(
+        self,
+        task: Task,
+        flow: FlowDefinition,
+        step: StepDefinition,
+        expected_status: TaskStatus,
+    ) -> Task | None:
+        """复检用户的这次操作。成功返回 None（流程继续），否则返回终态/暂停态。
+
+        复检**借用目标步骤的执行语义**（`_run_unchecked`），但把它从流程推进里
+        单独取出来跑：这样复检失败不会顺手把任务推进一步，成功也不会跳过后面的
+        步骤——下一次 `advance` 仍从 `current_step` 的下一步开始。
+        """
+
+        spec = step.user_action
+        assert spec is not None  # 由 `_user_action` 保证
+        if spec.check_step is None:
+            # 没有可自动复检的依据。不猜、不宣布成功：如实转人工，并保留已完成
+            # 的步骤，好让接手的人知道从哪儿接着做。
+            return self._handoff(task, step, "user_action_not_checkable", expected_status)
+
+        check_step = flow.step(spec.check_step)
+        if check_step is None:  # pragma: no cover - 由 `flow_field_errors` 在保存时拦住
+            return self._handoff(task, step, "user_action_check_step_missing", expected_status)
+
+        expired_at_pause = task.user_action_expires_at is not None and (
+            task.user_action_expires_at <= utc_now()
+        )
+        self.emit(
+            task,
+            EventType.USER_ACTION_COMPLETED,
+            # 只记"点过一次"这件事实，以及复检查的是哪一步。**不含**用户在那一步
+            # 输入的任何内容——那些内容不在本系统里，也无从记录。
+            {"step_id": step.step_id, "check_step": check_step.step_id},
+        )
+
+        if expired_at_pause:
+            # 用户点得太晚。这里不走"再等一轮"：等到超时的验证码/二维码早已失效，
+            # 继续让他在页面上重试只会反复失败。转人工，并把原因说清楚。
+            task.failure_code = "user_action_expired"
+            task.failure_message = "用户操作已超时，需要人工确认后继续。"
+            return self._handoff(task, step, "user_action_expired", expected_status)
+
+        outcome = self._run_unchecked(task, flow, check_step, expected_status)
+        if outcome is not None:
+            # 复检本身产生了终态（失败 / 未确认 / 转人工）：原样交回，绝不改写成成功。
+            return outcome
+
+        # 复检通过：user_action 与被复检的那一步都算走完了。
+        #
+        # `completed_steps` 要在这里补，不能留给主循环：主循环只会把 `current_step`
+        # 记成完成，而这次它记的是 user_action 那一步，复检步骤会漏掉——转人工时
+        # 接手的人就看不到"复检已经跑过且通过了"。
+        for finished in (step.step_id, check_step.step_id):
+            if finished not in task.completed_steps:
+                task.completed_steps.append(finished)
+            self.emit(task, EventType.STEP_COMPLETED, {"step_id": finished})
+
+        # 清掉本次操作留下的痕迹，并告诉主循环"从这里接着跑"——复检步骤已经跑完，
+        # 主循环不能再把它当普通步骤重跑一遍，也不能把 user_action 再问一遍。
+        task.user_action_expires_at = None
+        task.user_action_confirmed_at = None
+        following = flow.next_step(check_step.step_id)
+        task.resume_step_sid = following.step_id if following else ""
+        return None
+
+    def _run_unchecked(
+        self,
+        task: Task,
+        flow: FlowDefinition,
+        step: StepDefinition,
+        expected_status: TaskStatus,
+    ) -> Task | None:
+        """跑一个步骤但**不**把它记成完成，也不推进 `current_step`。
+
+        复检专用。与 `_execute` 的区别只有一处：不要求确认凭证。这不是放松门禁
+        ——复检是**只读核实**（登录成没成、材料在不在），它的结论不会替用户提交
+        任何东西；真正有副作用的提交步骤仍需各自走确认。
+        """
+
+        if step.kind is StepKind.COLLECT:
+            # 复检一个收集步骤没有意义：收集等的是用户填字段，不是外部状态。
+            # 这种情况按"复检不成立"处理，交给调用方转人工。
+            return self._handoff(task, step, "user_action_check_not_executable", expected_status)
+        if step.kind is not StepKind.EXECUTE:
+            return self._handoff(task, step, "user_action_check_not_executable", expected_status)
+
+        result = self.executor.execute(
+            ExecutionRequest(
+                task_id=task.task_id,
+                flow_id=flow.flow_id,
+                flow_version=flow.version,
+                step_id=step.step_id,
+                tool=step.tool or "",
+                instruction=step.instruction,
+                arguments=dict(task.slots),
+            )
+        )
+        current = self.store.get(task.task_id)
+        if current.status is not expected_status:
+            return current
+        return self._apply_result(task, step, result, expected_status)
 
     def _collect(
         self, task: Task, step: StepDefinition, expected_status: TaskStatus

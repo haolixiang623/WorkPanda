@@ -35,7 +35,7 @@ from workpanda.domain.presentation import (
 from workpanda.infrastructure.adapters import ScriptedExecutor
 
 # 文案或映射改动时递增，PR 里要说明"评的是哪一版"。
-UI_COPY_VERSION = "2026-11-08.1"
+UI_COPY_VERSION = "2026-11-09.1"
 
 SUBJECT = "session-a"
 
@@ -89,7 +89,7 @@ def start(container: Container, **overrides) -> TaskView:
 
 
 def test_copy_version_is_pinned() -> None:
-    assert UI_COPY_VERSION == "2026-11-08.1"
+    assert UI_COPY_VERSION == "2026-11-09.1"
 
 
 def test_every_task_status_has_exactly_one_ui_state() -> None:

@@ -29,7 +29,46 @@ class FlowStatus(StrEnum):
 class StepKind(StrEnum):
     COLLECT = "collect"
     EXECUTE = "execute"
+    # 只有本人能做的事：图形验证码、扫码、在自己浏览器里上传附件。
+    #
+    # 它和 `collect` 的区别是关于**谁能写**：collect 等的是"系统能收下的字段"
+    # （电话、地址），收到就写进 `task.slots`；user_action 等的是"系统根本不
+    # 该知道的东西"（验证码、密码、二维码扫描动作、群众的材料文件），所以
+    # 这一步既不收字段、也没有值可存——只有"用户说已完成"这一条信号，收到后
+    # 由服务端去外部界面**复检**，以复检结果为准。
+    USER_ACTION = "user_action"
     HANDOFF = "handoff"
+
+
+class UserActionSpec(BaseModel):
+    """一个"需要用户本人操作"节点的说明。
+
+    三要素（去哪 / 做什么 / 多久过期）在这里，而不是由页面或模型临时编：
+    「多久过期」尤其不能猜——编一个倒计时出来，用户会在二维码早已失效之后
+    继续对着屏幕等。
+
+    刻意**没有**"验证码值""密码""二维码内容"这类字段：这一步的整个设计前提
+    是这些东西永远不进入系统。少一个字段，就少一条要定留存期限、脱敏策略和
+    删除流程的路径。
+    """
+
+    # 用户要去做什么（操作目标）。不得索取凭证、不得要求把验证码告诉系统。
+    what: str = Field(min_length=1, max_length=300)
+    # 去哪里：官方页面的地址或设备（例如"手机上的 xx App"）。
+    where: str = Field(min_length=1, max_length=300)
+    # 这次操作多久有效。到点未完成就转人工，不让任务无限期挂着。
+    expires_in_seconds: int = Field(default=180, ge=30, le=3600)
+    # 用户点「我已完成」之后用来核实的那次执行/读取的步骤号。
+    #
+    # 为什么必须显式写出来、而不是由本步骤自己带工具：复检要读的是**外部系统
+    # 此刻的真实状态**（登录成没成、材料传没传），它是一次执行；而 user_action
+    # 步骤本身一旦能声明工具，就会变成"点一下按钮就等于执行完毕"——那正是
+    # 「我已完成」被当成办理结果的那个错误。所以复检单独成步，且必须是
+    # `execute` 或 `collect` 的前一步。
+    #
+    # 留空表示"没有可自动复检的依据"，此时本节点只能转人工：宁可承认做不了，
+    # 也不能拿"用户说已完成"当结论。
+    check_step: str | None = Field(default=None, max_length=128)
 
 
 class StepDefinition(BaseModel):
@@ -67,6 +106,8 @@ class StepDefinition(BaseModel):
     # 默认空表示"本步骤没有需要打码的字段"，此时页面明文回显。这个默认值因此是
     # 一个显式取舍：宁可作者看得到自己的错，也不让平台替作者判定敏感级。
     sensitive_fields: tuple[str, ...] = ()
+    # 只有 `kind=user_action` 的步骤能声明它，由 `flow_field_errors()` 强制。
+    user_action: UserActionSpec | None = None
 
 
 class FlowDefinition(BaseModel):
@@ -407,6 +448,7 @@ def flow_field_errors(flow: FlowDefinition) -> list[FlowFieldError]:
                 )
         errors.extend(_field_label_errors(flow, index, step))
         errors.extend(_sensitive_field_errors(index, step))
+        errors.extend(_user_action_errors(flow, index, step))
 
     errors.extend(_intent_sample_errors(flow))
     errors.extend(_intent_rule_errors(flow))
@@ -426,6 +468,75 @@ def validate_flow(flow: FlowDefinition) -> None:
     errors = flow_field_errors(flow)
     if errors:
         raise ValueError(errors[0].message)
+
+
+def _user_action_errors(
+    flow: FlowDefinition, index: int, step: StepDefinition
+) -> list[FlowFieldError]:
+    """「需要用户操作」节点的三条自洽约束。
+
+    这三条都在防同一种失效——**暂停变成一个可以被跳过的空档**：
+
+    1. 只有 `user_action` 步骤能声明 `user_action`。别的步骤声明了不会有任何
+       东西去暂停，页面却会显示"请某人去做某事"，然后流程自己往下走。
+    2. `user_action` 步骤**不能**声明 `required_fields`。一旦能收字段，验证码、
+       密码就会顺着"用户填了什么"流进 `task.slots`——而这一步的全部意义是
+       这些东西永远不进系统。
+    3. `check_step` 必须指向本流程里**排在本步骤之后**的步骤。指向前面的步骤
+       等于复检一个已经发生过的事，指到流程外就是永远读不到结果；两种都会让
+       "复检"退化成一句空话。
+    """
+
+    errors: list[FlowFieldError] = []
+
+    if step.kind is not StepKind.USER_ACTION:
+        if step.user_action is not None:
+            errors.append(
+                FlowFieldError(
+                    loc=("steps", index, "user_action"),
+                    message=(
+                        f"step {step.step_id!r} may only declare user_action "
+                        "when kind is user_action"
+                    ),
+                )
+            )
+        return errors
+
+    if step.user_action is None:
+        errors.append(
+            FlowFieldError(
+                loc=("steps", index, "user_action"),
+                message=f"user_action step {step.step_id!r} must describe the action",
+            )
+        )
+        return errors
+
+    if step.required_fields:
+        errors.append(
+            FlowFieldError(
+                loc=("steps", index, "required_fields"),
+                message=(
+                    f"user_action step {step.step_id!r} must not collect fields: "
+                    "what the user types on the external page never enters this system"
+                ),
+            )
+        )
+
+    check_step = step.user_action.check_step
+    if check_step is not None:
+        later = {candidate.step_id for candidate in flow.steps[index + 1 :]}
+        if check_step not in later:
+            errors.append(
+                FlowFieldError(
+                    loc=("steps", index, "user_action", "check_step"),
+                    message=(
+                        f"step {step.step_id!r} checks {check_step!r}, "
+                        "which is not a later step of this flow"
+                    ),
+                )
+            )
+
+    return errors
 
 
 def _field_label_errors(

@@ -9,10 +9,12 @@
  * - 不改 `TaskView`，只做取舍与排序。派生规则全部可被 Node 直接回归
  *   （`tests/test_web_ui.py` 加载的就是编译产物 `dist/state_view.js`）。
  *
- * 文案也来自服务端（`ui_title` / `ui_hint`），页面不维护第二张"11 个状态怎么说"
- * 的表：多一份措辞就多一次"结果待确认被写成已办结"的机会。唯一的例外是
- * `user_action_required`（见下），服务端还没有对应的状态，页面只能用步骤作者
- * 写的原文顶上，且**不编造**去哪儿、多久过期。
+ * 文案也来自服务端（`ui_title` / `ui_hint`），页面不维护第二张"12 个状态怎么说"
+ * 的表：多一份措辞就多一次"结果待确认被写成已办结"的机会。页面只负责原样显示。
+ *
+ * 「需要用户本人操作」这一屏（`awaiting_action`）的三要素与剩余时间同样来自
+ * 服务端（`user_action`，Issue #80）。页面**不编**去哪儿、也不编倒计时：编一个
+ * 出来，用户会在二维码早已失效之后继续对着屏幕等。
  */
 
 /** 服务端 `UiState` 的封闭集合（`domain/presentation.py`）。 */
@@ -22,6 +24,7 @@ export const UI_STATES = [
   "processing",
   "needs_clarification",
   "awaiting_input",
+  "awaiting_action",
   "awaiting_confirmation",
   "completed",
   "failed",
@@ -32,8 +35,16 @@ export const UI_STATES = [
 
 export type UiState = (typeof UI_STATES)[number];
 
-/** 页面的一屏。「需要用户操作」不在服务端状态里，是按服务端事实派生出来的。 */
-export type ScreenState = UiState | "user_action_required";
+/**
+ * 页面的一屏。
+ *
+ * 曾经有一个派生的 `user_action_required`（`awaiting_input` + 无待填字段），那是
+ * #77 在服务端还没有这个状态时的过渡写法。#80 之后服务端有了 `awaiting_action`
+ * 与 `user_action` 字段，派生逻辑**必须删掉**：留着它，一个"服务端说在等填表、
+ * 但字段列表恰好为空"的坏数据就会被页面擅自解释成"请去做件事"，而页面并没有
+ * 依据这么说。
+ */
+export type ScreenState = UiState;
 
 export type Connection = "live" | "reconnecting" | "offline";
 
@@ -72,10 +83,23 @@ export interface TaskView {
   result: Record<string, unknown> | null;
   failure_code: string | null;
   failure_message: string | null;
+  /** 当前步骤在等用户本人操作时的三要素与剩余时间（#80）。其余时候为 null。 */
+  user_action: UserActionGuide | null;
+  /** 服务端说此刻能不能点「我已完成」。页面不自己判断。 */
+  i_finished_allowed: boolean;
   ui_state: string;
   ui_title: string;
   ui_hint: string;
   updated_at: string;
+}
+
+/** 服务端下发的用户操作指引。刻意只有这四项：没有地方放验证码、密码、二维码内容。 */
+export interface UserActionGuide {
+  what: string;
+  where: string;
+  remaining_seconds: number;
+  /** 已经点过「我已完成」、正在复检。此时不再给重复入口。 */
+  awaiting_check: boolean;
 }
 
 export interface Field {
@@ -220,21 +244,16 @@ export function canSubmit(field: Field | null): boolean {
 /**
  * 服务端 `ui_state` → 页面状态。**唯一的派生点。**
  *
- * 两处刻意的判断：
- * 1. `awaiting_input` 但服务端没列任何待填字段 = "在等用户，但不是等填表"，
- *    也就是 DESIGN §3.1 的「需要用户操作」。服务端还没有这个状态（P3 会在事件层
- *    补），页面按已有事实把它显示成"请到办理页面操作 + 我已完成"，而不是显示成
- *    一张空白表单。
- * 2. 认不出的 `ui_state`（服务端先上线了新状态）一律落到「状态待确认」：宁可
- *    少说，也不能落到「已完成」。
+ * 只做一件事：把认不出的 `ui_state`（服务端先上线了新状态）落到「状态待确认」。
+ * 宁可少说，也不能落到「已完成」——那是唯一一种"猜错就出事"的方向。
+ *
+ * 刻意**没有**任何基于 `pending_fields` 之类的二次推断：服务端给了 `awaiting_action`
+ * 就显示等待操作，给了 `awaiting_input` 就显示填表。页面替服务端"纠正"状态，
+ * 就等于在界面上长出了第二套判定口径。
  */
 export function screenStateOf(view: TaskView): ScreenState {
   const declared = UI_STATES.find((state) => state === view.ui_state);
-  if (declared === undefined) return "outcome_unconfirmed";
-  if (declared === "awaiting_input" && view.pending_fields.length === 0) {
-    return "user_action_required";
-  }
-  return declared;
+  return declared ?? "outcome_unconfirmed";
 }
 
 export function screenOf(view: TaskView | null): Screen {
@@ -274,28 +293,32 @@ export function screenOf(view: TaskView | null): Screen {
       return { ...base, summary, impact: view.confirm_message, actions };
     }
 
-    case "user_action_required": {
-      const field = nextField(view);
+    case "awaiting_action": {
+      // 三要素与剩余时间全部来自服务端（`user_action`）。服务端没给就如实说
+      // "按办理页面上的提示操作"，绝不用步骤标题拼一个看起来像地址的东西。
+      const guide = view.user_action;
+      const expired = guide !== null && guide.remaining_seconds <= 0;
+      const checking = guide !== null && guide.awaiting_check;
+
+      const actions: Action[] = [];
+      if (!expired && !checking) actions.push(I_FINISHED);
+      actions.push(CANCEL);
+
       return {
         ...base,
-        // 服务端还没建模这个状态（P3 补事件）：标题用页面自己的说法，
-        // 指引只重复流程作者写的步骤名与提示，不编造地址与倒计时。
-        title: "需要您本人操作",
-        hint: "请在办理页面完成操作，完成后回到这里继续。",
-        field,
+        field: null,
+        summary: collected(view),
         guide: {
-          what: view.current_step_title ?? "按页面提示完成操作",
-          where: view.current_step_prompt ?? "请按办理页面上的提示操作",
-          expires: "有效期以办理页面上的提示为准",
+          what: guide === null ? (view.current_step_title ?? "按页面提示完成操作") : guide.what,
+          where: guide === null ? "请按办理页面上的提示操作" : guide.where,
+          expires: expiresText(guide),
         },
-        // 「我已完成」只走 `/answers`，永不签发确认凭证。今天这一屏的 field 必然
-        // 为空（派生条件本身就是"没有待填字段"），所以按钮不启用并写明原因：
-        // 点下去必然 422，那比"暂时不能点"更让人困惑。等 P3 的事件带上要提交的
-        // 字段，同一条通道就是一次普通回答。
-        actions: [I_FINISHED, CANCEL],
-        blockedReason:
-          field === null
-            ? "当前没有需要提交的内容；在办理页面完成后，本页会自动更新。"
+        actions,
+        // 不启用按钮时**写明为什么**，而不是留一个点了就 422 的按钮。
+        blockedReason: expired
+          ? "这次操作已经超过有效期，需要转人工协助；请不要重复尝试。"
+          : checking
+            ? "正在核实您刚才的操作，请稍候。"
             : null,
       };
     }
@@ -323,6 +346,35 @@ export function screenOf(view: TaskView | null): Screen {
       return { ...base, actions: [START] };
   }
 }
+
+/**
+ * 「有效期」怎么说是服务端算好的，页面只做一句话。
+ *
+ * 这里不引入任何新的时间来源：`remaining_seconds` 是服务端在这次响应里给的
+ * 剩余量，页面只是把它写成人话。所以这一层依然**读不到时钟**（有回归守着）。
+ */
+function expiresText(guide: UserActionGuide | null): string {
+  if (guide === null) return "有效期以办理页面上的提示为准";
+  if (guide.remaining_seconds <= 0) return "已超过有效期";
+  const minutes = Math.floor(guide.remaining_seconds / 60);
+  if (minutes < 1) return "请在接下来的一分钟内完成";
+  return `请在接下来的 ${minutes} 分钟内完成`;
+}
+
+/**
+ * 「我已完成」的请求体。**只有 values**，没有任何 `step_id`/`accepted`。
+ *
+ * 这一句就是 D3 红线的落点：它走的仍是 `/answers`，与"补一个字段"同一条通道，
+ * 所以它在结构上**不可能**被当成确认凭证。服务端认出这个键之后只做两件事：
+ * 翻状态、跑复检——复检说了算，「我已完成」本身不产生任何结论。
+ */
+export function finishedRequest(): AnswerRequest {
+  return { values: { [I_FINISHED_KEY]: I_FINISHED_VALUE } };
+}
+
+/** 与 `application/task_service.py` 的 `FINISHED_SIGNAL_KEY/VALUE` 保持一致。 */
+const I_FINISHED_KEY = "i_finished";
+const I_FINISHED_VALUE = "done";
 
 /**
  * 请求体构造。刻意只导出这两个：群众侧能写服务端的动作只有"回答"和"确认"，
@@ -492,7 +544,7 @@ export function transcriptOf(view: TaskView | null): Message[] {
 
   if (
     state === "awaiting_input" ||
-    state === "user_action_required" ||
+    state === "awaiting_action" ||
     state === "received" ||
     state === "processing"
   ) {
@@ -513,24 +565,27 @@ export function transcriptOf(view: TaskView | null): Message[] {
         role: "assistant",
         text: field.label,
       });
-    } else if (state === "user_action_required") {
+    } else if (state === "awaiting_action") {
+      // 三要素来自服务端（`user_action`）。服务端没给就如实说"按页面提示操作"，
+      // 绝不拿步骤标题拼一个看起来像地址的东西（Issue #80）。
+      const guide = view.user_action;
       messages.push({
         id: `guide:${stepOf(view)}:what`,
         kind: "guide",
         role: "assistant",
-        text: `这一步需要您本人操作：${view.current_step_title ?? "请按页面提示完成操作"}。`,
+        text: `这一步需要您本人操作：${guide === null ? "请按页面提示完成操作" : guide.what}。`,
       });
       messages.push({
         id: `guide:${stepOf(view)}:where`,
         kind: "guide",
         role: "assistant",
-        text: view.current_step_prompt ?? "请按办理页面上的提示操作。",
+        text: guide === null ? "请按办理页面上的提示操作。" : `在哪里做：${guide.where}。`,
       });
       messages.push({
         id: `guide:${stepOf(view)}:expires`,
         kind: "guide",
         role: "assistant",
-        text: "有效期以办理页面上的提示为准。",
+        text: guide === null ? "有效期以办理页面上的提示为准。" : `${expiresText(guide)}。`,
       });
     } else if (state === "received" || state === "processing") {
       messages.push({

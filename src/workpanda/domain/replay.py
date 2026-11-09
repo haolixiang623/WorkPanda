@@ -61,6 +61,12 @@ class ReplayFindingCode(StrEnum):
     CASE_FLOW_MISMATCH = "case_flow_mismatch"
     CASE_UNKNOWN_FIELD = "case_unknown_field"
     CASE_MISSING_FIELDS = "case_missing_fields"
+    # 用例走到了"需要用户本人操作"的节点。回放**不能**替用户做这件事（也不该
+    # 假装做了），所以这是一个"回放测不到这里"的结论，不是流程回归。
+    #
+    # 单独一个码而不是并进 `CASE_MISSING_FIELDS`：后者会让人去改用例补字段，
+    # 而这一屏根本没有字段可补——照着报错去找字段，只会找上一个不存在的入口。
+    CASE_USER_ACTION_REQUIRED = "case_user_action_required"
     UNAUTHORIZED_TOOL = "unauthorized_tool"
     STEP_MISSING = "step_missing"
     STEP_UNEXPECTED = "step_unexpected"

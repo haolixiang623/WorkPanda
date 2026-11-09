@@ -133,6 +133,9 @@ class _Observation:
     pending_fields: tuple[str, ...]
     steps: tuple[ReplayStepResult, ...]
     tools: tuple[ReplayToolCall, ...]
+    # 停在哪儿。只在"卡在等待态"的结论里用到——回放测不到时，报出是哪一步
+    # 测不到，人才能决定是改用例还是去真实走查。
+    current_step: str | None = None
 
 
 class FlowReplay:
@@ -261,6 +264,28 @@ class FlowReplay:
                         detail=f"回放异常结束：{detail}；没有结论，不判通过。",
                     ),
                 ),
+                duration_ms=_elapsed_ms(started),
+            )
+
+        if observation.terminal is TaskStatus.WAITING_FOR_ACTION:
+            # 走到了"需要用户本人操作"的节点。回放既不能替他输验证码/扫码/传材料，
+            # 也不该拿"回放说点完了"当结论——那正是 #80 要防的那类虚假办结。
+            # 所以如实给出"回放测不到这里"，让人改用真实走查覆盖这一段。
+            return ReplayCaseResult(
+                case_id=case.case_id,
+                verdict=ReplayVerdict.INVALID,
+                findings=(
+                    ReplayFinding(
+                        code=ReplayFindingCode.CASE_USER_ACTION_REQUIRED,
+                        detail=(
+                            "用例走到了需要本人操作的节点，回放不代做也不代判："
+                            f"{observation.current_step or '（未给出步骤名）'}"
+                        ),
+                    ),
+                ),
+                steps=observation.steps,
+                tools=observation.tools,
+                terminal=observation.terminal.value,
                 duration_ms=_elapsed_ms(started),
             )
 
@@ -420,6 +445,9 @@ def _observe(
         elif event.type in {
             EventType.CLARIFICATION_REQUIRED,
             EventType.CONFIRMATION_REQUIRED,
+            # 用户操作节点同样是"在等人"，不是"走完了"。漏掉它会把这个步骤报成
+            # `incomplete`，看起来像流程卡死，实际是在等用户。
+            EventType.USER_ACTION_REQUIRED,
         }:
             # 暂停只对"本轮还没走完"的步骤成立；确认之后重新 `STEP_STARTED` 会把它
             # 覆盖回 `incomplete`，因此这里直接赋值即可。
@@ -442,6 +470,7 @@ def _observe(
         pending_fields=tuple(task.pending_fields),
         steps=tuple(steps),
         tools=tuple(calls),
+        current_step=task.current_step,
     )
 
 

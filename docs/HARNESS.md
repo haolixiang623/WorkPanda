@@ -55,7 +55,7 @@ harness 只依赖协议，不反向依赖具体存储。
 
 现在装配只有两条：`harness`（真实执行）与脚手架执行器（不跑模型循环，只验证任务链路）。
 
-## 3. 十五条不变式
+## 3. 十六条不变式
 
 1. **最小可见**：模型只能看到本步骤被授权的工具子集，看不到全局注册表。
 2. **四道闸**：白名单 → 限额/重复副作用 → 参数校验 → 限期执行并留痕。任一不通过一律 BLOCKED，绝不"尽力执行"。
@@ -93,6 +93,11 @@ harness 只依赖协议，不反向依赖具体存储。
     从库里读到的状态；不符则整批丢弃并交回库里的权威状态，绝不拿旧快照覆盖，
     也绝不留下一条无主事件。纯过程事件（`STEP_STARTED` / `STEP_COMPLETED`）可以
     即时写、即时推送，因为它们不代表任何"在等谁"的承诺（见第 17 节）。
+16. **「只有本人能做的事」不代做，也不收下它的答案**：验证码、密码、扫码动作、
+    群众材料文件属于"系统根本不该知道的东西"，harness 既不识别也不代传，连**收集**
+    都不做（`user_action` 步骤禁止声明字段）。用户点「我已完成」只表示"我做完了"，
+    不是授权——服务端据此去**复检**，而对「已完成」的确认永远来自复检结果，不是
+    来自那个按钮（见第 25 节）。
 
 ## 4. 三态映射
 
@@ -1421,3 +1426,112 @@ ensure_step_tools_available(registry.published(), tool_registry)
 `web/README.md` 里"仍未修的一项"（元数据上群众页 + 结论不显示）到此收口。
 自检流程为此升到 `demo.generic@3`：步骤多了 `answer_label`，属于内容变化，
 按版本不可变原则只能新发一版。
+
+## 25. 人机协同节点：验证码 / 扫码 / 附件
+
+有些步骤 harness 做不了——不是没写，是**不该**做。图形验证码是反自动化的，扫码要
+本人的手机与本人的账号，附件是群众的材料。前二十节讲的都是"怎么把事做完"，这一节
+讲的是"什么时候必须停下来，把方向盘交出去，再收回来继续"。
+
+### 「用户操作」不是「确认」
+
+这两件事长得很像（都是暂停、都有个按钮），但语义差一整层：
+
+| | 确认（`WAITING_FOR_CONFIRMATION`） | 用户操作（`WAITING_FOR_ACTION`） |
+|---|---|---|
+| 问什么 | 要不要照这个做 | 这件事只有你能做，做完告诉我 |
+| 答案是什么 | 一份**授权** | 用户自己的**动作** |
+| 服务端产出 | 绑定参数摘要的一次性凭证 | **什么都不签发** |
+| 下一步 | 带凭证执行 | 去**复检**一下真做了没有 |
+
+合流会很方便——`WAITING_FOR_USER` 一个状态、一个按钮、一条消息就能覆盖两种——但
+那样「我已完成」就成了一张确认凭证：用户点一下，执行器就可以动手了。确认门禁从此
+形同虚设。所以状态拆成两个，事件也拆成两个：`USER_ACTION_REQUIRED` /
+`USER_ACTION_COMPLETED` 与既有的 `CONFIRMATION_REQUIRED` 互不代用。
+
+### `user_action` 步骤绝不收字段
+
+`StepKind.USER_ACTION` 在 `flow_field_errors()` 里被禁止声明 `required_fields`：
+
+```
+must not collect fields: what the user types on the external page never enters this system
+```
+
+理由很直白。`collect` 收的是"系统需要、也配知道的字段"（电话、地址）；`user_action`
+等的是"系统根本不该知道的东西"（验证码、密码、扫码动作、群众材料）。**一旦能收
+字段，验证码就顺着"用户填了什么"流进 `task.slots`**，再顺着 slots 流进 trace、
+日志、事件、回放。这条禁令是红线 1 的第一道闸。
+
+### 复检必须单独成步
+
+`UserActionSpec.check_step` 只能指向**本流程中排在本步骤之后**的步骤（校验期就拦）：
+
+```yaml
+- step_id: captcha
+  kind: user_action
+  user_action:
+    what: 在办事页面上完成图形验证码
+    where: 办事页面弹出的小窗口
+    expires_in_seconds: 180
+    check_step: verify_login   # 必须排在本步之后
+- step_id: verify_login
+  kind: execute
+  tool: http.fetch
+```
+
+`check_step` **留空** = 没有自动复检依据 → 只能转人工（`user_action_not_checkable`）。
+
+反过来，`user_action` 步骤自己**不能**声明工具。否则"点一下按钮 = 执行完毕"，
+复检这一步就白设计了。
+
+### 运行期三段
+
+1. **暂停**（`Runner._pause_for_user_action`）：算 `expires_at`、清 `pending_fields`、
+   落 `WAITING_FOR_ACTION`，在**同一次条件写**里发 `USER_ACTION_REQUIRED`，载荷含
+   `step_id` / `what` / `where` / `expires_in_seconds` / `expires_at` / `auto_check`。
+   `what` 与 `where` 过 `redact_text`——流程作者可能手滑把手机号写进指引；
+2. **「我已完成」**：走 `POST /answers`，请求体只有一个固定值
+   `{"values": {"i_finished": "done"}}`（`task_service.FINISHED_SIGNAL_KEY`）。结构上
+   装不下 `step_id` / `accepted`，所以**无法**被当成确认请求。服务端只记
+   `user_action_confirmed_at` 并把状态翻回 `RUNNING`，**不签发任何东西**；
+3. **复检**（`Runner._recheck_user_action`）：发 `USER_ACTION_COMPLETED`，跑
+   `check_step`（走 `_run_unchecked`，**不**走确认凭证那条路），然后：
+   - 复检通过 → 本步与复检步各自 `STEP_COMPLETED`，继续后续步骤；
+   - 复检失败 / 结论未知 → 按执行器语义转人工或失败，**不改写成成功**；
+   - 超出 `expires_at` → `user_action_expired` 转人工。
+
+### 红线
+
+| 红线 | 怎么保证 | 回归 |
+|---|---|---|
+| 密码 / 验证码**永不**进 slots、trace、日志、事件 | `user_action` 禁止收字段；事件载荷只有 step_id 与指引 | 注入哨兵值（`Pw-Sentinel-9F3K` / `K7Q2` / `qr-ticket-sentinel-77AX`）后全量扫描落盘产物，零命中 |
+| 扫码**只显示**，不代扫、不代持 | 服务端不保存二维码/ticket，只下发文本指引 | `UserActionView` 字段封闭，无 ticket 字段 |
+| 「我已完成」**不签发凭证** | 走 `/answers` 而非 `/confirm`；`confirmations.issue` 不被调用 | 盯 `issue` 的 monkeypatch 用例；`/confirm` 带 `step_id="i_finished"` 判 409 |
+| 附件**不代传** | 服务端无收文件的端点；页面无 `<input type="file">` | 同上哨兵扫描 |
+
+### 到期与转人工
+
+`expires_at` 落在 `Task` 上（`user_action_expires_at`，SQLite 两列，旧库由
+`_ensure_columns()` 幂等补列）。到期后：
+
+- 群众页把「我已完成」收起来，写明「已超过有效期，需要转人工协助；请不要重复尝试」
+  （`test_expired_action_offers_no_way_forward`）；
+- 即使请求硬发过来，服务端也只转人工，**不报成功、不静默重试**；
+- **已完成的步骤保留**：转人工不是回滚，前面的结果还在。
+
+### 回放怎么对待这一屏
+
+回放**不能**替用户做这件事，也不该假装做了。所以 `run_case` 遇到
+`WAITING_FOR_ACTION` 直接判 `ReplayVerdict.INVALID` + `CASE_USER_ACTION_REQUIRED`，
+detail 里带上 `current_step`。这是一个"回放测不到这里"的结论，**不是**流程回归——
+和 `CASE_MISSING_FIELDS` 分开编号就是为了不让人误读成"流程坏了"。
+
+`USER_ACTION_REQUIRED` 被计入 PAUSED 集合：在等人不是卡死。
+
+### 已知限制
+
+- 到期时刻只在用户点「我已完成」时检查，**没有后台定时器**去主动把过期任务翻成
+  转人工。挂着不动的任务会停在 `WAITING_FOR_ACTION` 直到有人来点或有人处置；
+- 复检只跑一步。需要"多步才能确认"的场景（先跳转再读结果）请把多步封进一个
+  执行步骤里，而不是声明一串 `check_step`；
+- 不做验证码识别 / OCR / 打码平台，不做代持凭据与"代登录"，不做双人复核。
