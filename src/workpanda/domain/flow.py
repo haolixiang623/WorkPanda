@@ -57,6 +57,16 @@ class StepDefinition(BaseModel):
     # "所需材料"），猜一个就会把话说到别的事项上去。留空表示"本步骤没有面向群众的
     # 正文"，此时执行器的平台元数据也不会被顶上来充数。
     answer_label: str | None = Field(default=None, max_length=100)
+    # 回显时需要打码的字段名（可选）。语义同 `field_labels`：只能标注**本步骤**
+    # 声明过的字段，投影到 `TaskView` 时按"这一版声明过的全部字段"合并。
+    #
+    # 为什么标记归作者而不是平台：平台不知道哪个字段是证件号。按名字猜（含 id、
+    # card、phone）既会漏——真实业务里它常叫 `contact`、`holder`——又会错，把
+    # `order_no` 当成敏感。两个方向都失败时，唯一的正确来源是填流程的人。
+    #
+    # 默认空表示"本步骤没有需要打码的字段"，此时页面明文回显。这个默认值因此是
+    # 一个显式取舍：宁可作者看得到自己的错，也不让平台替作者判定敏感级。
+    sensitive_fields: tuple[str, ...] = ()
 
 
 class FlowDefinition(BaseModel):
@@ -396,6 +406,7 @@ def flow_field_errors(flow: FlowDefinition) -> list[FlowFieldError]:
                     )
                 )
         errors.extend(_field_label_errors(flow, index, step))
+        errors.extend(_sensitive_field_errors(index, step))
 
     errors.extend(_intent_sample_errors(flow))
     errors.extend(_intent_rule_errors(flow))
@@ -443,6 +454,33 @@ def _field_label_errors(
                 FlowFieldError(
                     loc=("steps", index, "field_labels", name),
                     message=f"step {step.step_id!r} has a blank label for {name!r}",
+                )
+            )
+    return errors
+
+
+def _sensitive_field_errors(index: int, step: StepDefinition) -> list[FlowFieldError]:
+    """敏感标记只能指向这一步骤声明过的字段。
+
+    标错字段既不会报错、也不影响任何校验，只是那个字段永远不打码——而作者写下
+    这一行时已经认为"这件事处理过了"。这种"看起来生效、实际没生效"比完全不声明
+    更难发现：不声明的人还会自己看一眼明文回显，标错的人连看都不会看。
+
+    刻意**不**校验反方向（`required_fields` 里有敏感字段却没标记）：那需要一张
+    敏感词表，而"哪些词算敏感"是业务口径，不是代码能替运营定的。这也意味着
+    默认值是"不打码"，由作者显式承担。
+    """
+
+    errors: list[FlowFieldError] = []
+    for name in step.sensitive_fields:
+        if name not in step.required_fields:
+            errors.append(
+                FlowFieldError(
+                    loc=("steps", index, "sensitive_fields", name),
+                    message=(
+                        f"step {step.step_id!r} marks {name!r} as sensitive, "
+                        "which is not one of its required_fields"
+                    ),
                 )
             )
     return errors

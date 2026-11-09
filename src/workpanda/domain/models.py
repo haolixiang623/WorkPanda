@@ -134,6 +134,11 @@ class TaskView(BaseModel):
     conversation_id: str
     flow_id: str
     flow_version: str
+    # 事项名（流程版本的 `title`）。群众侧开场要说"您要办的是哪件事"，而
+    # `current_step_title` 是步骤名（"收集报修信息"），不是事项名（"报修"）。
+    # 页面唯一的替代品是复述群众原话，但 `Task` 根本不保存 `input_text`——
+    # 那句话在任何地方都取不回来。版本缺失时为 None，页面退回不显示，不猜。
+    flow_title: str | None = None
     status: TaskStatus
     current_step: str | None
     # 当前步骤的作者文案（来自流程版本，不是模型生成的）。页面直接展示，不改写。
@@ -148,6 +153,12 @@ class TaskView(BaseModel):
     # 页面不需要第二套规则。同一字段在多个步骤里给了不同标签时，先出现的明确
     # 标签优先，不让后一个步骤把前一个的说法改掉。
     field_labels: dict[str, str] = Field(default_factory=dict)
+    # 需要打码的字段名，覆盖这一版流程声明过的全部字段（语义同 `field_labels`：
+    # 逐步骤声明，按版本合并，先声明者在前）。页面据此决定回显时打不打码，
+    # **不维护自己的字段名黑名单**——按名字猜"哪个像身份证"必然两头落空：猜漏了
+    # 明文常驻屏幕，猜错了把订单号涂掉。未声明时为空列表，页面明文回显；那是
+    # 流程作者的显式取舍，平台不替他断定敏感级。
+    sensitive_fields: list[str] = Field(default_factory=list)
     # 已收集的字段值。确认摘要要能核对"到底提交什么"，所以必须给到客户端；
     # 但也只给当前任务自己的值，不跨任务、不跨会话。
     slots: dict[str, str] = Field(default_factory=dict)
@@ -204,6 +215,7 @@ class TaskView(BaseModel):
             flow = flows.find(task.flow_id, task.flow_version)
         step = None if flow is None or task.current_step is None else flow.step(task.current_step)
         labels: dict[str, str] = {}
+        sensitive: list[str] = []
         if flow is not None:
             for candidate in flow.steps:
                 for name in candidate.required_fields:
@@ -212,11 +224,18 @@ class TaskView(BaseModel):
                         labels[name] = label
                     else:
                         labels.setdefault(name, name)
+                # 同一字段被多个步骤标记时只留一条：页面问的是"这个名字要不要打码"，
+                # 不是"被声明了几次"。用列表而不是集合，是因为页面的输出要与服务端
+                # 的声明顺序一致（测试要能断言具体顺序，而不是一个无序集合）。
+                for name in candidate.sensitive_fields:
+                    if name not in sensitive:
+                        sensitive.append(name)
         return cls(
             task_id=task.task_id,
             conversation_id=task.conversation_id,
             flow_id=task.flow_id,
             flow_version=task.flow_version,
+            flow_title=None if flow is None else flow.title,
             status=task.status,
             current_step=task.current_step,
             current_step_title=None if step is None else step.title,
@@ -225,6 +244,7 @@ class TaskView(BaseModel):
             completed_steps=list(task.completed_steps),
             pending_fields=task.pending_fields,
             field_labels=labels,
+            sensitive_fields=sensitive,
             slots=dict(task.slots),
             result=task.result,
             failure_code=task.failure_code,

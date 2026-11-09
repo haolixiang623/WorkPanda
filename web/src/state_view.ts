@@ -52,6 +52,8 @@ export interface TaskView {
   conversation_id: string;
   flow_id: string;
   flow_version: string;
+  /** 事项名（`FlowDefinition.title`）。版本缺失时为 `null`，页面不显示，也不猜。 */
+  flow_title: string | null;
   status: string;
   current_step: string | null;
   current_step_title: string | null;
@@ -60,6 +62,12 @@ export interface TaskView {
   completed_steps: string[];
   pending_fields: string[];
   field_labels: Record<string, string>;
+  /**
+   * 回显时要打码的字段名，**由流程作者声明**。页面不维护字段名黑名单：
+   * 按名字猜"哪个像身份证"既会漏（真实业务里常叫 `contact`）又会错。
+   * 没有声明就是明文——这个默认值由作者承担，不是页面替他判定。
+   */
+  sensitive_fields: string[];
   slots: Record<string, string>;
   result: Record<string, unknown> | null;
   failure_code: string | null;
@@ -341,4 +349,262 @@ export function connectionNotice(connection: Connection): ConnectionNotice | nul
     return { level: "reconnecting", text: "连接中断，正在重新连接；任务可能仍在继续。" };
   }
   return { level: "offline", text: "无法连接服务端，请检查网络后重试。" };
+}
+
+// ---------- 对话记录 ----------
+
+/**
+ * 一条对话消息。`id` 由 `(状态, 步骤, 字段)` 决定，**跨次渲染稳定**：它是 DOM 复用的
+ * 依据，也是"重渲染不重播"的依据（见 `main.ts` 的 `streamEl`）。
+ */
+export interface Message {
+  id: string;
+  kind: MessageKind;
+  /** 助手侧的人设：开场、追问、结论。用户侧只有 `user_answer`。 */
+  role: "assistant" | "user";
+  /** 原样展示的正文。敏感字段的值在这里**已经是打码后的**。 */
+  text: string;
+}
+
+export type MessageKind =
+  /** 开场：您要办的是哪件事。 */
+  | "opening"
+  /** 服务端状态文案（`ui_title` / `ui_hint`），以及步骤作者的 `prompt`。 */
+  | "assistant"
+  /** 追问某个字段。`text` 是字段标签，`pending` 说明还没填。 */
+  | "field_question"
+  /** 群众已经答过的字段。`text` 永远是打码后的值。 */
+  | "user_answer"
+  /** 确认页：将要执行什么、影响是什么。 */
+  | "confirmation"
+  /** 办结结果的行。 */
+  | "result"
+  /** 终态的非成功措辞（失败 / 待确认 / 转人工 / 取消）。 */
+  | "status"
+  /** 「需要用户操作」的指引。 */
+  | "guide";
+
+/**
+ * 打码。长度 ≥ 12 保留前 6 后 4，长度 6–11 保留后 4，`<= 4` 全掩码；中间一律掩掉。
+ *
+ * 阈值来自原型评审时那一屏：身份证 18 位要保住前 6 位（行政区划）与后 4 位，
+ * 便于本人核对；手机号 11 位保住后 4 位——把它整串掩掉虽然"更安全"，但群众
+ * 就无从确认自己填的是不是自己那一部。
+ *
+ * 刻意不是"每个字符都按比例掩"：条纹越多越像真值，越容易被截图后拼回去。
+ */
+export function maskValue(value: string): string {
+  const chars = [...value];
+  if (chars.length <= 4) return "*".repeat(chars.length);
+  const tail = 4;
+  const head = chars.length >= 12 ? 6 : 0;
+  return (
+    chars.slice(0, head).join("") +
+    "*".repeat(chars.length - head - tail) +
+    chars.slice(-tail).join("")
+  );
+}
+
+function isSensitive(view: TaskView, name: string): boolean {
+  return view.sensitive_fields.indexOf(name) >= 0;
+}
+
+/**
+ * 打码后的值。**这是页面唯一一处把字段值转成可显示文本的地方**：
+ * 只要所有回显都从这里过，就不可能出现"某条消息忘了打码"。
+ */
+export function displayValue(view: TaskView, name: string): string {
+  const value = view.slots[name] ?? "";
+  if (value === "") return "";
+  return isSensitive(view, name) ? maskValue(value) : value;
+}
+
+function stepOf(view: TaskView): string {
+  return view.current_step ?? "-";
+}
+
+/**
+ * 由服务端视图派生整条对话记录。**不累积本地数组。**
+ *
+ * 为什么必须是纯派生：SSE 提醒、断线重连、刷新都会让派生跑很多次。页面自己记着
+ * "我说过什么"，就会在重连后重复一遍、在刷新后全丢——而"页面自己记着进度"正是
+ * 这套架构一直在防的东西。所以两次调用同一视图，输出必须深度相等。
+ *
+ * 刻意没有的东西：
+ * - 没有时间戳（页面无时针，见 `test_projection_layer_cannot_see_time`）；
+ * - 没有"正在输入"（那是按等待推断状态）；
+ * - 没有原始自然语言（`TaskView` 里根本没有 `input_text`，也拿不到）。
+ */
+export function transcriptOf(view: TaskView | null): Message[] {
+  const messages: Message[] = [];
+  if (view === null) {
+    messages.push({
+      id: "opening:idle",
+      kind: "opening",
+      role: "assistant",
+      text: "请用一句话说您要办什么，我再一步步问清楚。",
+    });
+    return messages;
+  }
+
+  const state = screenStateOf(view);
+
+  // 开场：事项名来自流程作者。缺失时不说"您要办的是：undefined"，只给状态文案。
+  if (view.flow_title !== null && view.flow_title !== "") {
+    messages.push({
+      id: "opening:flow",
+      kind: "opening",
+      role: "assistant",
+      text: `您要办的是：${view.flow_title}。`,
+    });
+  }
+
+  // 澄清阶段没有任务，服务端连字段都没列：只出一条"没听清"，不发任何追问。
+  if (state === "needs_clarification") {
+    messages.push({
+      id: "clarify:ask",
+      kind: "assistant",
+      role: "assistant",
+      text: view.ui_hint,
+    });
+    return messages;
+  }
+
+  // 已答字段的问答对，顺序听服务端的 `slots`。已完成走到确认页也不丢——
+  // 群众要能回头看自己前面答了什么。
+  for (const name of Object.keys(view.slots)) {
+    const shown = displayValue(view, name);
+    if (shown === "") continue;
+    const label = labelOf(view, name);
+    messages.push({
+      id: `q:${stepOf(view)}:${name}`,
+      kind: "field_question",
+      role: "assistant",
+      text: label,
+    });
+    messages.push({
+      id: `a:${stepOf(view)}:${name}`,
+      kind: "user_answer",
+      role: "user",
+      text: shown,
+    });
+  }
+
+  if (
+    state === "awaiting_input" ||
+    state === "user_action_required" ||
+    state === "received" ||
+    state === "processing"
+  ) {
+    // 当前要填的字段：`pending_fields` 的第一个，与 `screenOf` 同源。
+    const field = nextField(view);
+    if (field !== null && state === "awaiting_input") {
+      if (view.current_step_prompt !== null && view.current_step_prompt !== "") {
+        messages.push({
+          id: `prompt:${stepOf(view)}`,
+          kind: "assistant",
+          role: "assistant",
+          text: view.current_step_prompt,
+        });
+      }
+      messages.push({
+        id: `q:${stepOf(view)}:${field.name}:open`,
+        kind: "field_question",
+        role: "assistant",
+        text: field.label,
+      });
+    } else if (state === "user_action_required") {
+      messages.push({
+        id: `guide:${stepOf(view)}:what`,
+        kind: "guide",
+        role: "assistant",
+        text: `这一步需要您本人操作：${view.current_step_title ?? "请按页面提示完成操作"}。`,
+      });
+      messages.push({
+        id: `guide:${stepOf(view)}:where`,
+        kind: "guide",
+        role: "assistant",
+        text: view.current_step_prompt ?? "请按办理页面上的提示操作。",
+      });
+      messages.push({
+        id: `guide:${stepOf(view)}:expires`,
+        kind: "guide",
+        role: "assistant",
+        text: "有效期以办理页面上的提示为准。",
+      });
+    } else if (state === "received" || state === "processing") {
+      messages.push({
+        id: `status:${state}`,
+        kind: "status",
+        role: "assistant",
+        text: view.ui_hint,
+      });
+    }
+  }
+
+  if (state === "awaiting_confirmation") {
+    const rows = collected(view).map((row) => `${row.label}：${displayValue(view, row.name)}`);
+    messages.push({
+      id: "confirm:summary",
+      kind: "confirmation",
+      role: "assistant",
+      text:
+        rows.length === 0
+          ? "请确认是否提交。"
+          : `请核对以下内容：${rows.join("；")}。`,
+    });
+    if (view.current_step_title !== null && view.current_step_title !== "") {
+      messages.push({
+        id: "confirm:action",
+        kind: "confirmation",
+        role: "assistant",
+        text: `将要执行：${view.current_step_title}。`,
+      });
+    }
+    if (view.confirm_message !== null && view.confirm_message !== "") {
+      messages.push({
+        id: "confirm:impact",
+        kind: "confirmation",
+        role: "assistant",
+        text: view.confirm_message,
+      });
+    }
+  }
+
+  if (state === "completed") {
+    for (const row of resultRows(view.result)) {
+      messages.push({
+        id: `result:${row.name}`,
+        kind: "result",
+        role: "assistant",
+        text: `${row.label}：${row.value}`,
+      });
+    }
+    // 结果行之后**不再追加**任何"进行中"性质的尾巴：办完了就是办完了。
+    messages.push({
+      id: "status:completed",
+      kind: "status",
+      role: "assistant",
+      text: view.ui_title,
+    });
+    return messages;
+  }
+
+  if (
+    state === "failed" ||
+    state === "outcome_unconfirmed" ||
+    state === "handoff" ||
+    state === "cancelled"
+  ) {
+    // 服务端文案本身就是非成功措辞（`domain/presentation.py` 定的），页面不改写、
+    // 也不补一句"请重新提交"——"结果待确认"时那等于引导重复提交。
+    messages.push({
+      id: `status:${state}`,
+      kind: "status",
+      role: "assistant",
+      text: view.ui_title,
+    });
+  }
+
+  return messages;
 }

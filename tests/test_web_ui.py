@@ -357,6 +357,7 @@ const base = {
   conversation_id: "c1",
   flow_id: "web.repair",
   flow_version: "1",
+  flow_title: "报修",
   status: "waiting_for_user",
   current_step: "collect",
   current_step_title: "收集报修信息",
@@ -365,6 +366,7 @@ const base = {
   completed_steps: ["collect"],
   pending_fields: ["subject"],
   field_labels: { subject: "报修事项", contact: "联系电话" },
+  sensitive_fields: ["contact"],
   slots: { subject: "厨房水管漏水", contact: "13800000000" },
   result: { receipt_no: "R-1", _internal: "x", detail: { nested: 1 } },
   failure_code: null,
@@ -436,6 +438,60 @@ out.requests.resultRows = mod.resultRows(
 out.notices.live = mod.connectionNotice("live");
 out.notices.reconnecting = mod.connectionNotice("reconnecting");
 out.notices.offline = mod.connectionNotice("offline");
+
+// ---------- 对话记录（B2） ----------
+
+const flat = (messages) =>
+  messages.map((message) => [message.kind, message.role, message.text]);
+
+out.transcript = {};
+for (const state of mod.UI_STATES) {
+  out.transcript[state] = flat(
+    mod.transcriptOf(
+      view({
+        ui_state: state,
+        ui_title: "标题:" + state,
+        ui_hint: "提示:" + state,
+        // 澄清态服务端还没建任务：没有字段、没有槽位。
+        ...(state === "needs_clarification"
+          ? { pending_fields: [], slots: {}, current_step: null, current_step_title: null }
+          : {}),
+      }),
+    ),
+  );
+}
+out.transcript.unknown_state = flat(mod.transcriptOf(view({ ui_state: "brand_new_state" })));
+out.transcript.no_task = flat(mod.transcriptOf(null));
+out.transcript.no_flow_title = flat(mod.transcriptOf(view({ flow_title: null })));
+
+// 幂等：同一视图派生两次必须深度相等（证明没有内部计数器）。
+const twice = view({ ui_state: "awaiting_confirmation" });
+out.transcript.idempotent =
+  JSON.stringify(mod.transcriptOf(twice)) === JSON.stringify(mod.transcriptOf(twice));
+
+// id 不许重复——重复的 id 会让 DOM 复用把两条消息合成一条。
+const ids = mod.transcriptOf(view({ ui_state: "awaiting_confirmation" })).map((m) => m.id);
+out.transcript.ids = ids;
+out.transcript.idsUnique = new Set(ids).size === ids.length;
+// 调用十次，条数不增长。
+let last = 0;
+for (let i = 0; i < 10; i += 1) last = mod.transcriptOf(twice).length;
+out.transcript.stableLength = last === ids.length;
+
+// 打码：同一份视图，声明与不声明 sensitive_fields 的差别。
+out.mask = {
+  long: mod.maskValue("320501199001011234"),
+  phone: mod.maskValue("13800000000"),
+  short: mod.maskValue("abc"),
+  empty: mod.maskValue(""),
+  declared: mod.displayValue(view({}), "contact"),
+  undeclared: mod.displayValue(view({ sensitive_fields: [] }), "contact"),
+  plain: mod.displayValue(view({}), "subject"),
+  // 敏感值不得以明文出现在**任何**消息里。
+  leaks: flat(mod.transcriptOf(view({ ui_state: "awaiting_confirmation" })))
+    .flat()
+    .filter((cell) => typeof cell === "string" && cell.indexOf("13800000000") >= 0),
+};
 
 console.log(JSON.stringify(out));
 """
@@ -593,6 +649,131 @@ def test_disconnection_is_a_banner_not_a_task_state() -> None:
     assert probe["notices"]["offline"]["level"] == "offline"
 
 
+# ---------- 对话记录（B2）：由 TaskView 派生，不累积本地数组 ----------
+
+
+def test_transcript_starts_by_naming_the_service() -> None:
+    """开场要说"您要办的是哪件事"。
+
+    页面唯一的替代品是复述群众原话，而 `Task` 根本不保存 `input_text`——那句话
+    在任何地方都取不回来。所以事项名只能由服务端下发（B1），缺失时不显示而不是
+    印一个 `undefined`。
+    """
+
+    probe = _run_probe()
+    first = probe["transcript"]["awaiting_input"][0]
+    assert first[0] == "opening"
+    assert first[2] == "您要办的是：报修。"
+
+    # 版本缺失（`flow_title: null`）时，开场退化成服务端状态提示这一条，
+    # 不出现"您要办的是：undefined"。
+    without = probe["transcript"]["no_flow_title"]
+    assert all("您要办的是" not in text for _, _, text in without)
+    assert "undefined" not in " ".join(text for _, _, text in without)
+
+
+def test_transcript_asks_one_labelled_field_and_echoes_answers() -> None:
+    """问答对用作者给的中文名，顺序听服务端的 `slots`。"""
+
+    probe = _run_probe()
+    messages = probe["transcript"]["awaiting_input"]
+    kinds = [kind for kind, _, _ in messages]
+    assert kinds[0] == "opening"
+    # 已答的 subject 是一问一答；contact 在 `slots` 里也有值，因此同样成对出现。
+    assert kinds.count("field_question") == 3  # subject + contact + 当前待填的 subject
+    assert kinds.count("user_answer") == 2
+    questions = [text for kind, _, text in messages if kind == "field_question"]
+    assert "报修事项" in questions
+    assert "联系电话" in questions
+    # 当前待填的那个字段用的也是标签，不是字段名。
+    assert questions[-1] == "报修事项"
+
+
+def test_transcript_masks_sensitive_values_everywhere() -> None:
+    """敏感字段的明文**不得**出现在任何一条消息里。
+
+    页面不维护字段名黑名单：打码只看 `sensitive_fields`。这条用例连"消息文本里
+    有没有残留"一起查，堵的是"某条消息绕过了 `displayValue`"。
+    """
+
+    probe = _run_probe()
+    assert probe["mask"]["leaks"] == []
+    assert probe["mask"]["declared"] != "13800000000"
+    assert probe["mask"]["declared"].endswith("0000")
+    # 未声明就明文。这是作者显式承担的默认值，不是页面在猜。
+    assert probe["mask"]["undeclared"] == "13800000000"
+    assert probe["mask"]["plain"] == "厨房水管漏水"
+    # 长度 ≥ 12 保 6 头 4 尾；6–11 位只保后 4 位；4 位以内整串掩掉。
+    assert probe["mask"]["long"] == "320501********1234"
+    assert probe["mask"]["phone"] == "*******0000"
+    assert probe["mask"]["short"] == "***"
+    assert probe["mask"]["empty"] == ""
+
+
+def test_transcript_is_idempotent_and_ids_are_stable() -> None:
+    """派生幂等、id 不重复、条数不随调用次数增长。
+
+    这三条合起来证明"页面没有自己记着进度"：本地累积的典型症状正是重连后消息
+    翻倍、刷新后全丢。
+    """
+
+    probe = _run_probe()
+    assert probe["transcript"]["idempotent"] is True
+    assert probe["transcript"]["idsUnique"] is True
+    assert probe["transcript"]["stableLength"] is True
+
+
+def test_clarification_transcript_asks_no_field_questions() -> None:
+    """没听清要办什么时问不出任何字段。
+
+    此时服务端**没有建任务**，`pending_fields` 与 `slots` 都是空的，所以除了开场
+    （事项名来自上一句话命中的流程版本）之外只有一条"没听清"的助手消息，一条
+    `field_question` 都不该有——问了也没有地方收答案。
+    """
+
+    probe = _run_probe()
+    messages = probe["transcript"]["needs_clarification"]
+    kinds = [kind for kind, _, _ in messages]
+    assert kinds == ["opening", "assistant"]
+    assert messages[-1][2] == "提示:needs_clarification"
+    assert "field_question" not in kinds
+    assert "user_answer" not in kinds
+
+
+def test_terminal_transcripts_say_what_actually_happened() -> None:
+    """终态用服务端文案，且不再追加任何"进行中"的尾巴。"""
+
+    probe = _run_probe()
+
+    completed = probe["transcript"]["completed"]
+    assert [kind for kind, _, _ in completed][-1] == "status"
+    assert "进行中" not in " ".join(text for _, _, text in completed)
+
+    unconfirmed = " ".join(text for _, _, text in probe["transcript"]["outcome_unconfirmed"])
+    assert "标题:outcome_unconfirmed" in unconfirmed
+    # "结果待确认"时**不能**出现重新提交类措辞。
+    assert "重新提交" not in unconfirmed
+    assert "请重新" not in unconfirmed
+
+    handoff = " ".join(text for _, _, text in probe["transcript"]["handoff"])
+    assert "标题:handoff" in handoff
+
+
+def test_no_task_transcript_invites_a_description() -> None:
+    """没有任务时也是一句"说您要办什么"，而不是空白页。"""
+
+    probe = _run_probe()
+    assert [kind for kind, _, _ in probe["transcript"]["no_task"]] == ["opening"]
+
+
+def test_unknown_state_transcript_never_claims_success() -> None:
+    """认不出的状态：派生落到"待确认"，不许有结果行。"""
+
+    probe = _run_probe()
+    kinds = [kind for kind, _, _ in probe["transcript"]["unknown_state"]]
+    assert "result" not in kinds
+
+
 # ---------- 源码纪律 ----------
 
 _TIME_APIS = re.compile(
@@ -654,13 +835,36 @@ def test_page_nodes_exist_for_every_lookup() -> None:
     page = (WEB_DIR / "index.html").read_text(encoding="utf-8")
     looked_up = set(re.findall(r'must\("([^"]+)"\)', main_ts))
     looked_up |= set(re.findall(r'getElementById\("([^"]+)"\)', main_ts))
-    assert "app" in looked_up and "connection" in looked_up, looked_up
+    # B3 之后的骨架：消息流、操作面板、常驻输入框三段。
+    assert {"stream", "panel", "composer"} <= looked_up, looked_up
+    assert "connection" in looked_up
     for node_id in sorted(looked_up):
-        # 动态创建的节点（输入框）在渲染时才有，不要求出现在骨架里。
-        if node_id in {"field-input", "composer"}:
+        # 动态创建的节点（输入框、消息）在渲染时才有，不要求出现在骨架里。
+        if node_id in {"field-input", "composer-text", "composer-send"}:
             assert f'id = "{node_id}"' in main_ts
             continue
         assert f'id="{node_id}"' in page, f"# {node_id} 不在 index.html 里"
+    # 旧骨架的 `#app` 已拆成两段：留着它只会让人以为页面还是整块重建。
+    assert 'id="app"' not in page
+
+
+def test_stream_is_appended_from_the_server_view_not_accumulated() -> None:
+    """消息流只由 `transcriptOf` 派生，页面不持有本地数组。
+
+    这条是 B2/B3 的共同底线：只要出现一个 module 级的消息数组，SSE 提醒与重连
+    就会让它翻倍，而刷新就会让它全丢——两种症状都是"页面自己记着进度"。
+    """
+
+    main_ts = (WEB_DIR / "src" / "main.ts").read_text(encoding="utf-8")
+    assert "transcriptOf(view)" in main_ts
+    # 模块级不存消息：`syncStream` 的入参是派生结果，不是一份攒下来的历史。
+    assert not re.search(r"^(let|const) \w+(: Message\[\])? = \[\]", main_ts, re.M)
+    assert ".push(" not in main_ts.split("function syncStream")[0]
+    # 输入框常驻：`#composer` 在骨架里，渲染函数只切换禁用态，不重建它。
+    page = (WEB_DIR / "index.html").read_text(encoding="utf-8")
+    assert 'id="composer"' in page
+    assert "panelEl.replaceChildren" in main_ts
+    assert "streamEl.replaceChildren" not in main_ts
 
 
 def test_compiled_bundle_is_in_sync_with_source() -> None:
