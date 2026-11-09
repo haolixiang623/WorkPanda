@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from tests.fake_redis import FakeRedisServer
-from tests.support import TEST_FLOWS
+from tests.support import TEST_FLOWS, harness_flow
 from workpanda.api.security import SESSION_HEADER
 from workpanda.bootstrap import build_container
 from workpanda.capacity import (
@@ -390,7 +390,7 @@ def test_harness_enabled_reports_tool_thread_ledger() -> None:
             model_base_url="http://127.0.0.1:9/v1",
             model_api_key="not-a-real-key-for-tests",
         ),
-        flows=TEST_FLOWS,
+        flows=[harness_flow()],
     )
     try:
         body = collect_capacity(container).model_dump()

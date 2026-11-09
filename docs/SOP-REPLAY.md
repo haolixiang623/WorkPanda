@@ -131,7 +131,7 @@ python3 scripts/replay_flow.py --flow demo.generic --version 2 --publish \
   "slots": {"subject": "自检"},
   "expect": {
     "steps": ["collect_input", "execute_demo"],
-    "tools": ["model_echo"],
+    "tools": ["sys_clock"],
     "terminal": "outcome_unconfirmed"
   },
   "note": "最小正常路径"

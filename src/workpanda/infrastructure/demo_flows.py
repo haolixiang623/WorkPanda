@@ -5,11 +5,26 @@
 
 这里的意图样例同时是**发布门禁的基线**：条数下限（3 条正例 / 2 条近似误例）就是按
 这个流程定的。样例全部是合成话术，不含任何真实群众信息。
+
+版本史：
+
+- `1`：执行步骤声明 `tool="model_echo"`——一个只存在于脚本化执行器口头约定里的
+  名字，装配层从不注册它。于是真实 harness 下 `_grant()` 的授权交集为空：模型
+  照样被调用、照样回一段 `succeeded`，但**一个工具都没跑过**。而
+  `_unverified_success()` 在"本步骤没有可用工具"时直接放行，这段自述就被当成
+  可核验结论——"缺依据应当未确认"的契约在"工具压根不存在"这一档上失效了。
+- `2`：改用内置的 `sys_clock`（真注册、只读、无副作用），并把"依据必须来自工具
+  返回值"写进指令。老库里的 `1` 不会被覆盖（版本不可变），但也不再发布它。
 """
+
+from typing import Final
 
 from workpanda.domain.flow import FlowDefinition, FlowStatus, StepDefinition, StepKind
 from workpanda.domain.intent import IntentRule
 from workpanda.domain.intent_sample import IntentSample, IntentSampleCategory
+
+# 当前要发布的版本。测试与运维脚本引用它，避免把版本号散落成字面量。
+DEMO_FLOW_VERSION: Final[str] = "2"
 
 # 自检流程的意图样例。正例要能被路由到本流程的**这一版**；近似误例与超范围例
 # 必须一条都路由不出去——否则"自检"这个关键词就太宽了，真实事项上线后会把别的话
@@ -56,7 +71,8 @@ DEMO_INTENT_RULES: tuple[IntentRule, ...] = (
     IntentRule(
         intent_id="demo.generic.selfcheck",
         flow_id="demo.generic",
-        flow_version="1",
+        # 必须指向**本版**：规则随版本走，发布这一版等于同时换掉识别口径（#73）。
+        flow_version=DEMO_FLOW_VERSION,
         keywords=("自检", "演示"),
         slot_patterns={
             "subject": (
@@ -69,7 +85,7 @@ DEMO_INTENT_RULES: tuple[IntentRule, ...] = (
 
 DEMO_FLOW = FlowDefinition(
     flow_id="demo.generic",
-    version="1",
+    version=DEMO_FLOW_VERSION,
     title="骨架自检流程",
     status=FlowStatus.PUBLISHED,
     steps=(
@@ -86,11 +102,12 @@ DEMO_FLOW = FlowDefinition(
         StepDefinition(
             step_id="execute_demo",
             kind=StepKind.EXECUTE,
-            title="模型回显自检",
-            tool="model_echo",
+            title="工具链路自检",
+            # 必须是装配层真的注册过的工具名，否则授权交集为空（见模块文档的版本史）。
+            tool="sys_clock",
             instruction=(
-                "把参数 subject 的值原样返回，不要改写；"
-                "并在 evidence 中给出你实际返回的内容，作为可核验依据。"
+                "调用 sys_clock 工具读取当前时间，把工具返回的时间字符串原样写进 "
+                "evidence；不要自己推算时间，也不要用参数 subject 顶替依据。"
             ),
             requires_confirmation=True,
             confirm_message="即将提交以下信息，请确认。",

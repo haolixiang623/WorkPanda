@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.support import TEST_FLOWS
+from tests.support import TEST_FLOWS, harness_flow
 from workpanda.api.security import SESSION_HEADER
 from workpanda.bootstrap import build_container
 from workpanda.config import Settings
@@ -295,7 +295,8 @@ def test_ops_tool_runtime_reports_the_ledger_when_harness_is_in_use() -> None:
             model_base_url="http://127.0.0.1:9/v1",
             model_api_key="sk-test-not-a-real-key",
         ),
-        flows=TEST_FLOWS,
+        # 真 harness 分支只核对"声明的工具是否注册"，所以这里给一个真工具名的流程。
+        flows=[harness_flow()],
     )
     client = TestClient(create_app(container=container))
     client.headers.update({SESSION_HEADER: container.signer.issue()})
