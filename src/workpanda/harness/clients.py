@@ -18,7 +18,11 @@ from workpanda.harness.models import (
 
 
 class ModelTimeout(Exception):
-    """模型调用超时。可能已产生副作用，不得当失败重试。"""
+    """模型调用超时：连接已建立、请求已发出。可能已产生副作用，不得当失败重试。
+
+    「连接还没建立就超时」不属于这一类——那时请求一个字节都没发出去，重试是
+    安全的，由客户端映射成可重试的 `ModelError("connect_timeout")`。
+    """
 
 
 class ModelError(Exception):

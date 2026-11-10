@@ -28,6 +28,12 @@ from workpanda.harness.models import (
 MAX_TOOL_NAME = 64
 MAX_CALL_ID = 128
 
+# 连接阶段（TCP + TLS 握手）的独立上限，与一次调用的总预算 `timeout_seconds` 分开。
+# 分得开是必要的：总预算 120s 的时候不该让"握手"也占满 120s，否则一个连不上的
+# 端点会把整步时间耗光；但也不能太紧——实测出境链路到百炼约有一半的握手要在
+# 10s 以上才完成，把它们统统判死等于每次抖动都丢一个任务。
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 30.0
+
 
 class OpenAICompatibleClient:
     def __init__(
@@ -46,8 +52,9 @@ class OpenAICompatibleClient:
         self._model = model
         self._temperature = temperature
         # 内网地址若被系统代理拦截，需要显式关闭 trust_env。
+        self._connect_timeout = min(DEFAULT_CONNECT_TIMEOUT_SECONDS, timeout_seconds)
         self._client = client or httpx.Client(
-            timeout=httpx.Timeout(timeout_seconds, connect=min(10.0, timeout_seconds)),
+            timeout=httpx.Timeout(timeout_seconds, connect=self._connect_timeout),
             trust_env=trust_env,
         )
         self._owns_client = client is None
@@ -82,7 +89,19 @@ class OpenAICompatibleClient:
                 json=payload,
                 headers={"Authorization": f"Bearer {self._api_key}"},
             )
+        except httpx.ConnectTimeout as exc:
+            # 连接阶段超时**不是**调用超时：请求一个字节都没发出去，服务端不可能
+            # 已经开始处理，重试不会重复产生任何东西。把它混进 `ModelTimeout`
+            # （不重试）的代价很具体：TLS 握手抖一下，整条任务就在 connect 上限
+            # 被判死，而 `model_retries` 与 120s 总预算一次都没用上。
+            raise ModelError(
+                "connect_timeout",
+                f"连接模型服务超时：{self._connect_timeout:.0f}s 内未建立连接",
+                retryable=True,
+            ) from exc
         except httpx.TimeoutException as exc:
+            # 读写阶段超时则按"结果未知"处理：请求已经发出去了，服务端可能正在算，
+            # 也可能已经算完。这时重试只会让同一份算力花两遍，交给人工看。
             raise ModelTimeout("模型调用超时") from exc
         except httpx.HTTPError as exc:
             # 连接被重置、TLS 抖动这类传输失败通常是瞬时的，值得再试一次；
