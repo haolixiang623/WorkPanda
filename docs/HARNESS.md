@@ -115,12 +115,26 @@ harness 只依赖协议，不反向依赖具体存储。
 | 步数 / 调用次数 / token / 耗时超限 | `unconfirmed` | `budget_max_steps` / `budget_max_tool_calls` / `budget_max_tokens` / `budget_deadline` |
 | 存在断点但不允许续跑 | `unconfirmed` | `checkpoint_not_resumable` / `checkpoint_expired` / `checkpoint_mismatch` |
 | 步骤已被另一执行者占用（或占用状态不明） | `unconfirmed` | `checkpoint_busy`（`stop_reason=refused`，不调模型/工具） |
-| 模型超时 | `unconfirmed` | `model_timeout` |
+| 连接模型服务超时（请求一个字节都没发出去） | `unconfirmed` | `connect_timeout`（可重试） |
+| 模型调用超时（请求已发出，结果未知） | `unconfirmed` | `model_timeout`（不重试） |
 | 模型服务错误（4xx/5xx、传输失败） | `unconfirmed` | `http_xxx` / `transport_error` |
 | 连续空回复 | `unconfirmed` | `empty_model_response` |
 | 执行被取消（边界生效） | `unconfirmed` | `cancelled` |
 
 原则：**只有确定成功才报成功；不确定一律"待确认"并转人工。**
+
+两类超时不要混，它们的可重试性正好相反：
+
+- **`connect_timeout`**：连接还没建立，请求根本没发出去，服务端不可能已经开始处理，
+  所以标记 `retryable`，由执行循环按剩余预算决定重不重试（默认 1 次、退避 0.5s）。
+  连接上限默认 **30s**，与总预算分开——总预算 120s 时不该让握手也占满 120s，
+  但也不能太紧，出境链路握手偶尔要十几秒。
+- **`model_timeout`**：连接已建立、请求已发出，服务端可能正在算也可能算完了。
+  这时重试等于同一份算力花两遍，且结果仍不确定，所以**不重试**，直接转人工。
+
+注意出口有代理/网关时的错位：走代理时 TCP 是连到本机代理的（秒连），目标连不上时
+客户端看到的是读超时而不是连接超时，于是落到 `model_timeout`、不重试。
+排查"连不上模型"时先分清是哪一类，别拿连接上限去调读超时。
 
 结论解析（`contract.py`）单独守两件事：
 

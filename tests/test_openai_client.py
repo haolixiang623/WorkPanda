@@ -11,7 +11,12 @@ import pytest
 
 from workpanda.harness.clients import ModelError, ModelTimeout
 from workpanda.harness.models import HarnessMessage, MessageRole, ToolCall, ToolSpec
-from workpanda.harness.openai_client import MAX_CALL_ID, MAX_TOOL_NAME, OpenAICompatibleClient
+from workpanda.harness.openai_client import (
+    DEFAULT_CONNECT_TIMEOUT_SECONDS,
+    MAX_CALL_ID,
+    MAX_TOOL_NAME,
+    OpenAICompatibleClient,
+)
 
 SPEC = ToolSpec(
     name="test_echo",
@@ -265,6 +270,56 @@ def test_transport_error_is_retryable_but_timeout_is_not() -> None:
     # 连接抖动值得再试一次；超时需要人工看，不能靠重试掩盖。
     assert transport.value.code == "transport_error"
     assert transport.value.retryable is True
+
+
+def test_connect_timeout_is_retryable_unlike_read_timeout() -> None:
+    """`ConnectTimeout` 是 `TimeoutException` 的子类，但两者必须分开报。
+
+    连接阶段超时意味着请求根本没发出去，重试不会重复产生任何东西；把它和
+    读写超时一起映射成 `ModelTimeout`（不重试）时，握手抖一下整条任务就判死，
+    `model_retries` 与总预算一次都用不上——实测出境链路约有一半的握手会超时。
+    """
+
+    def handshake_stalled(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("tls handshake stalled", request=request)
+
+    def response_stalled(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("no bytes after request", request=request)
+
+    with pytest.raises(ModelError) as connect:
+        client_with(handshake_stalled).complete(messages=[], tools=[])
+    with pytest.raises(ModelTimeout):
+        client_with(response_stalled).complete(messages=[], tools=[])
+
+    assert connect.value.code == "connect_timeout"
+    # 可重试是关键：执行循环只重试 `retryable` 的 ModelError，
+    # 标记为 False 等于这条修复白做。
+    assert connect.value.retryable is True
+
+
+def test_connect_timeout_has_its_own_budget_independent_of_total() -> None:
+    """连接上限不得随总预算一起膨胀：连不上的端点不该把整步时间耗光。"""
+
+    client = OpenAICompatibleClient(
+        base_url="http://model.local/v1/",
+        api_key="sk-test",
+        model="test-model",
+        timeout_seconds=120.0,
+    )
+    timeout = client._client.timeout  # noqa: SLF001 - 断言传输层真实配置
+
+    assert timeout.connect == DEFAULT_CONNECT_TIMEOUT_SECONDS
+    assert timeout.read == 120.0
+    # 总预算比连接上限还短时，连接上限必须跟着收，不能反过来把总预算撑大。
+    tight = OpenAICompatibleClient(
+        base_url="http://model.local/v1/",
+        api_key="sk-test",
+        model="test-model",
+        timeout_seconds=5.0,
+    )
+    assert tight._client.timeout.connect == 5.0  # noqa: SLF001
+    client.close()
+    tight.close()
 
 
 def test_timeout_maps_to_model_timeout() -> None:
