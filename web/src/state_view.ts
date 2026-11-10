@@ -324,7 +324,12 @@ export function screenOf(view: TaskView | null): Screen {
     }
 
     case "completed":
-      return { ...base, summary: resultRows(view.result), actions: [RESTART], terminal: true };
+      // **结果不在这里**：结论由对话流的 `result` 消息承载。
+      //
+      // 两处都印是真实踩过的坑：demo 流程的结论只有一行，看不出来；换成真实模型
+      // 的三段式答案（300+ 字）后，同一段话在 390px 的手机屏上出现两遍，群众要
+      // 读两次、滚两次。面板只留状态、提示与动作。
+      return { ...base, summary: [], actions: [RESTART], terminal: true };
 
     case "failed":
       // 失败原因不直接印 `failure_message`：那是工具/模型侧的原话。可确认的事实
@@ -345,6 +350,28 @@ export function screenOf(view: TaskView | null): Screen {
     case "idle":
       return { ...base, actions: [START] };
   }
+}
+
+/**
+ * 这一屏的操作区到底有没有东西可显示。
+ *
+ * 没有就不要渲染那块卡片——空卡片在手机上就是一块白板，群众会以为"这里应该有
+ * 内容但没加载出来"。实测出现在 `outcome_unconfirmed`（既没有可点的动作，也不
+ * 该有）和 `handoff`：两者的正确表现都是"只有一句状态说明"，多了那块白框反而
+ * 让人以为页面坏了。
+ *
+ * 判据与 `panel()` 里真正会塞进去的东西一一对应，不靠状态名硬编码：将来给某个
+ * 终态加一个按钮或一行摘要，这里自动跟着变。
+ */
+export function panelHasContent(screen: Screen): boolean {
+  return (
+    screen.field !== null ||
+    screen.summary.length > 0 ||
+    screen.impact !== null ||
+    screen.guide !== null ||
+    screen.actions.length > 0 ||
+    screen.blockedReason !== null
+  );
 }
 
 /**

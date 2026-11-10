@@ -140,7 +140,7 @@ export function screenOf(view) {
             };
         }
         case "completed":
-            return { ...base, summary: resultRows(view.result), actions: [RESTART], terminal: true };
+            return { ...base, summary: [], actions: [RESTART], terminal: true };
         case "failed":
             return { ...base, actions: [RESTART], terminal: true };
         case "outcome_unconfirmed":
@@ -152,6 +152,14 @@ export function screenOf(view) {
         case "idle":
             return { ...base, actions: [START] };
     }
+}
+export function panelHasContent(screen) {
+    return (screen.field !== null ||
+        screen.summary.length > 0 ||
+        screen.impact !== null ||
+        screen.guide !== null ||
+        screen.actions.length > 0 ||
+        screen.blockedReason !== null);
 }
 function expiresText(guide) {
     if (guide === null)

@@ -20,6 +20,7 @@ import {
   connectionNotice,
   fieldOf,
   finishedRequest,
+  panelHasContent,
   screenOf,
   transcriptOf,
   type Action,
@@ -472,7 +473,9 @@ function render(): void {
   // 消息流由服务端视图派生，页面不累积任何数组。
   syncStream(transcriptOf(view));
 
-  panelEl.replaceChildren(statusCard(screen), panel(screen));
+  panelEl.replaceChildren(statusCard(screen));
+  // 没有可显示的内容就不给这块卡片：空卡片在手机上是块白板，看着像页面坏了。
+  if (panelHasContent(screen)) panelEl.appendChild(panel(screen));
   renderComposer(screen);
 }
 
@@ -539,9 +542,8 @@ function panel(screen: Screen): HTMLElement {
     box.appendChild(guideBox(screen));
   }
 
-  if (screen.state === "completed" && screen.summary.length > 0) {
-    box.appendChild(summaryList(screen, false));
-  }
+  // 办结屏**不在这里印结论**：`transcriptOf` 已经把它作为 `result` 消息放进对话流。
+  // 两处都印的后果实测过——真实模型的三段式答案 300+ 字，在 390px 屏上出现两遍。
 
   if (screen.state === "failed" && view !== null && view.failure_code !== null) {
     // 失败原因不印 `failure_message`（那是工具/模型侧原话）。这里给的是"可以去哪里
@@ -564,12 +566,12 @@ function panel(screen: Screen): HTMLElement {
  * 敲的字，焦点也不会每收一条 SSE 提醒就丢一次。
  *
  * "现在不能输入"不是一个按钮的禁用态，而是一句话：群众要能看出为什么打不了字，
- * 而不是对着一个灰框发呆。所以禁用时把原因写进占位符。
+ * 而不是对着一个灰框发呆。所以禁用时把原因写进**标签**（每个状态都有话说），
+ * 占位符只在真有下一步可指的时候指路——终态下没有下一步，空着比写句空话强。
  */
 function renderComposer(screen: Screen): void {
   const active =
     (screen.state === "idle" || screen.state === "needs_clarification") && !busy;
-  const area = document.getElementById("composer-text");
 
   if (composerEl.childElementCount === 0) {
     const label = el("label", "", "请描述您要办理的事情");
@@ -600,20 +602,36 @@ function renderComposer(screen: Screen): void {
   if (active) {
     (composerEl.firstElementChild as HTMLElement).textContent = "请描述您要办理的事情";
   } else {
+    // 说"上面"不是笔误：要填的表单在 `#panel` 里，而输入区是页面最后一块，
+    // 表单永远在它上方。原来这里写的是"请在下方补充这一项"，群众照着往下翻，
+    // 下面除了页脚什么都没有。
     (composerEl.firstElementChild as HTMLElement).textContent = `现在不用您打字：${
-      screen.state === "awaiting_input" ? "请在下方补充这一项。" : screen.hint
+      screen.state === "awaiting_input" ? "请在页面上方的表单里填写。" : screen.hint
     }`;
   }
 
   const text = document.getElementById("composer-text");
   if (text instanceof HTMLTextAreaElement) {
     text.disabled = !active;
+    // 占位符只在真有下一步可指的时候指路。终态（办结、待确认、转人工）下面既没有
+    // 表单也没有按钮，写"请用下面的表单继续"是句空话——原因已经写在上面那行标签里。
     text.placeholder = active
       ? "例如：我想给家里老人办一下高龄补贴"
-      : "这一步请用下面的表单或按钮继续。";
-    // 只在值真的不同时才写：否则每收一条事件都会把光标顶到末尾。
-    if (text.value !== keepText && active) text.value = keepText;
-    if (!active && text.value === "") text.value = "";
+      : screen.state === "awaiting_input"
+        ? "请填写上面的表单"
+        : "";
+    if (active) {
+      // 只在值真的不同时才写：否则每收一条事件都会把光标顶到末尾。
+      if (text.value !== keepText) text.value = keepText;
+    } else if (!busy && text.value !== "") {
+      // 用不了的时候把框清空。留着上一句话，那块置灰的框看着像"我这句话还没发出去"，
+      // 群众会去反复点旁边同样置灰的「发送」；而"为什么打不了字"已经写在标签与
+      // 占位符里了，不需要再靠残留的正文暗示。
+      //
+      // `busy` 例外：动作用户正在发、结果还没回来那一下先别清——万一失败，草稿要原样
+      // 回到框里，先清后填会闪一下。
+      text.value = "";
+    }
   }
   const send = document.getElementById("composer-send");
   if (send instanceof HTMLButtonElement) send.disabled = !active;

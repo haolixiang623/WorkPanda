@@ -520,6 +520,7 @@ const shape = (screen) => ({
   actions: screen.actions.map((action) => action.kind),
   blocked: screen.blockedReason !== null,
   terminal: screen.terminal,
+  hasPanel: mod.panelHasContent(screen),
 });
 
 const out = { states: {}, requests: {}, notices: {} };
@@ -881,6 +882,55 @@ def test_cancel_and_handoff_render_as_non_success() -> None:
     assert probe["states"]["cancelled"]["actions"] == ["restart"]
     assert probe["states"]["handoff"]["terminal"] is True
     assert probe["states"]["failed"]["actions"] == ["restart"]
+
+
+def test_empty_action_panel_is_not_drawn_at_all() -> None:
+    """操作区没东西可显示时，整块卡片不画——空卡片在手机上就是一块白板。
+
+    `outcome_unconfirmed` 的 DOM 曾经是
+    `<section class="card panel"><div class="actions"></div></section>`：没有动作时
+    `actionBar()` 只剩一个空 `div`，渲染成一块白框，看着像"这里本该有内容但没加载
+    出来"。`handoff` 同理（两者本来就不该给按钮）。
+
+    判据不按状态名硬编码，而是与 `panel()` 真正会塞进卡片的那几样东西一一对应：
+    将来给某个终态加一个按钮或一行摘要，这里自动跟着变。
+    """
+
+    probe = _run_probe()
+    states = probe["states"]
+    assert states["outcome_unconfirmed"]["hasPanel"] is False
+    assert states["handoff"]["hasPanel"] is False
+    # 落回"结果待确认"的未知状态同样不该有那块框。
+    assert states["unknown_state"]["hasPanel"] is False
+    # 别的屏都有话要说，不能被这条规则误伤成空白页。
+    for state in (
+        "idle",
+        "needs_clarification",
+        "awaiting_input",
+        "awaiting_confirmation",
+        "completed",
+        "failed",
+        "cancelled",
+    ):
+        assert states[state]["hasPanel"] is True, state
+
+
+def test_completed_screen_leaves_the_result_to_the_transcript() -> None:
+    """办结屏不在面板里再印一遍结论——结论只归对话流。
+
+    `transcriptOf` 已经把 `result` 逐行放进了对话流；`screenOf` 的 `completed` 分支
+    再返回一份 `summary`，`panel()` 就会把同一段话原样印第二遍。demo 流程的结论只有
+    一行，看不出问题；换成真实模型的三段式答案（300+ 字）之后，390px 手机屏上同一
+    段话出现两次，群众要读两遍、滚两遍。
+    """
+
+    probe = _run_probe()
+    assert probe["states"]["completed"]["summary"] == []
+    # 结论不能因此消失：必须还在对话流里，而且只出现一次。
+    results = [
+        text for kind, _, text in probe["transcript"]["completed"] if kind == "result"
+    ]
+    assert results == ["receipt_no：R-1"], results
 
 
 def test_disconnection_is_a_banner_not_a_task_state() -> None:

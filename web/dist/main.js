@@ -1,4 +1,4 @@
-import { answerRequest, canSubmit, confirmRequest, connectionNotice, fieldOf, finishedRequest, screenOf, transcriptOf, } from "./state_view.js";
+import { answerRequest, canSubmit, confirmRequest, connectionNotice, fieldOf, finishedRequest, panelHasContent, screenOf, transcriptOf, } from "./state_view.js";
 const SESSION_HEADER = "X-WorkPanda-Session";
 const SESSION_KEY = "workpanda.session";
 const TASK_KEY = "workpanda.task";
@@ -388,7 +388,9 @@ function render() {
     if (screen.state !== "awaiting_confirmation")
         editing = null;
     syncStream(transcriptOf(view));
-    panelEl.replaceChildren(statusCard(screen), panel(screen));
+    panelEl.replaceChildren(statusCard(screen));
+    if (panelHasContent(screen))
+        panelEl.appendChild(panel(screen));
     renderComposer(screen);
 }
 function renderConnection() {
@@ -446,9 +448,6 @@ function panel(screen) {
     if (screen.state === "awaiting_action") {
         box.appendChild(guideBox(screen));
     }
-    if (screen.state === "completed" && screen.summary.length > 0) {
-        box.appendChild(summaryList(screen, false));
-    }
     if (screen.state === "failed" && view !== null && view.failure_code !== null) {
         box.appendChild(el("p", "muted", "如需要进一步说明，请携带受理编号联系办理单位。"));
     }
@@ -460,7 +459,6 @@ function panel(screen) {
 }
 function renderComposer(screen) {
     const active = (screen.state === "idle" || screen.state === "needs_clarification") && !busy;
-    const area = document.getElementById("composer-text");
     if (composerEl.childElementCount === 0) {
         const label = el("label", "", "请描述您要办理的事情");
         label.setAttribute("for", "composer-text");
@@ -491,18 +489,23 @@ function renderComposer(screen) {
         composerEl.firstElementChild.textContent = "请描述您要办理的事情";
     }
     else {
-        composerEl.firstElementChild.textContent = `现在不用您打字：${screen.state === "awaiting_input" ? "请在下方补充这一项。" : screen.hint}`;
+        composerEl.firstElementChild.textContent = `现在不用您打字：${screen.state === "awaiting_input" ? "请在页面上方的表单里填写。" : screen.hint}`;
     }
     const text = document.getElementById("composer-text");
     if (text instanceof HTMLTextAreaElement) {
         text.disabled = !active;
         text.placeholder = active
             ? "例如：我想给家里老人办一下高龄补贴"
-            : "这一步请用下面的表单或按钮继续。";
-        if (text.value !== keepText && active)
-            text.value = keepText;
-        if (!active && text.value === "")
+            : screen.state === "awaiting_input"
+                ? "请填写上面的表单"
+                : "";
+        if (active) {
+            if (text.value !== keepText)
+                text.value = keepText;
+        }
+        else if (!busy && text.value !== "") {
             text.value = "";
+        }
     }
     const send = document.getElementById("composer-send");
     if (send instanceof HTMLButtonElement)
